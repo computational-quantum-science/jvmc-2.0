@@ -13,6 +13,7 @@ import jVMC
 import jVMC.global_defs as global_defs
 from jVMC.nets.initializers import init_fn_args
 from jVMC.util.symmetries import LatticeSymmetry
+from jVMC.global_defs import DT_SAMPLES
 
 from typing import Union
 
@@ -34,7 +35,7 @@ class RNNCellStack(nn.Module):
     """
 
     cells: list
-    dtype: type = global_defs.tReal
+    dtype: type = global_defs.DT_PARAMS_REAL
     actFun: callable = nn.elu
     initFun: callable = jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform")
 
@@ -107,10 +108,10 @@ class RNN1DGeneral(nn.Module):
             ValueError("Complex parameters for LSTM/GRU not yet implemented.")
 
         if self.realValuedParams:
-            self.dtype = global_defs.tReal
+            self.dtype = global_defs.DT_PARAMS_REAL
             self.initFunction = jax.nn.initializers.variance_scaling(scale=self.initScale, mode="fan_avg", distribution="uniform", dtype=self.dtype)
         else:
-            self.dtype = global_defs.tCpx
+            self.dtype = global_defs.DT_PARAMS_CPX
             self.initFunction = jVMC.nets.initializers.cplx_variance_scaling 
 
         if isinstance(self.cell, str):
@@ -154,18 +155,14 @@ class RNN1DGeneral(nn.Module):
         logProb = self.log_coeffs_to_log_probs(self.outputDense(out))
         logProb = jnp.sum(logProb * x, axis=-1)
         return (newCarry, x), jnp.nan_to_num(logProb, nan=-35)
-
-    def sample(self, batchSize, key):
-        def generate_sample(key):
-            myKeys = jax.random.split(key, self.L)
-            _, sample = self.rnn_cell_sample(
-                (self.zero_carry, jnp.zeros(self.inputDim)),
-                (myKeys)
-            )
-            return sample[1]
-
-        keys = jax.random.split(key, batchSize)
-        return jax.vmap(generate_sample)(keys)
+    
+    def sample(self, key):
+        myKeys = jax.random.split(key, self.L)
+        _, sample = self.rnn_cell_sample(
+            (self.zero_carry, jnp.zeros(self.inputDim)),
+            (myKeys)
+        )
+        return sample[1]
 
     @partial(nn.transforms.scan,
              variable_broadcast='params',
@@ -173,7 +170,7 @@ class RNN1DGeneral(nn.Module):
     def rnn_cell_sample(self, carry, x):
         newCarry, out = self.rnnCell(carry[0], carry[1])
         logCoeffs = self.log_coeffs_to_log_probs(self.outputDense(out))
-        sampleOut = jax.random.categorical(x, jnp.real(logCoeffs) / self.logProbFactor)
+        sampleOut = jax.random.categorical(x, jnp.real(logCoeffs) / self.logProbFactor).astype(DT_SAMPLES)
         return (newCarry, jax.nn.one_hot(sampleOut, self.inputDim)), (jnp.nan_to_num(logCoeffs, nan=-35), sampleOut)
 
 
@@ -182,7 +179,7 @@ class GRUCell(nn.Module):
 
     @nn.compact
     def __call__(self, carry, state):
-        current_carry, newR = nn.GRUCell(features=self.features, **init_fn_args(param_dtype=global_defs.tReal, recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.tReal)))(carry, state)
+        current_carry, newR = nn.GRUCell(features=self.features, **init_fn_args(param_dtype=global_defs.DT_PARAMS_REAL, recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.DT_PARAMS_REAL)))(carry, state)
         return current_carry, newR[0]
 
 
@@ -191,7 +188,7 @@ class LSTMCell(nn.Module):
 
     @nn.compact
     def __call__(self, carry, state):
-        current_carry, newR = nn.OptimizedLSTMCell(features=self.features, **init_fn_args(param_dtype=global_defs.tReal, recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.tReal)))(carry, state)
+        current_carry, newR = nn.OptimizedLSTMCell(features=self.features, **init_fn_args(param_dtype=global_defs.DT_PARAMS_REAL, recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.DT_PARAMS_REAL)))(carry, state)
         return jnp.asarray(current_carry), newR
 
 
@@ -213,7 +210,7 @@ class RNNCell(nn.Module):
 
     initFun: callable = jax.nn.initializers.variance_scaling(scale=1e-1, mode="fan_avg", distribution="uniform")
     actFun: callable = nn.elu
-    dtype: type = global_defs.tReal
+    dtype: type = global_defs.DT_PARAMS_REAL
 
     @nn.compact
     def __call__(self, carry, state):

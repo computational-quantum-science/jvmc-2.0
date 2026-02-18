@@ -32,7 +32,7 @@ class CpxRBM(nn.Module):
         layer = nn.Dense(self.numHidden, use_bias=self.bias,
                          **init_fn_args(kernel_init=jVMC.nets.initializers.cplx_init,
                                         bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.tCpx)
+                                        dtype=global_defs.DT_PARAMS_CPX)
                          )
 
         return jnp.sum(act_funs.log_cosh(layer(2 * s.ravel() - 1)))
@@ -58,7 +58,7 @@ class CpxRBM_Nospinflip(nn.Module):
         layer = nn.Dense(self.numHidden, use_bias=self.bias,
                          **init_fn_args(kernel_init=jVMC.nets.initializers.cplx_init,
                                         bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.tCpx)
+                                        dtype=global_defs.DT_PARAMS_CPX)
                          )
 
         return jnp.sum(act_funs.log_cosh(layer(s.ravel())))
@@ -80,9 +80,9 @@ class RBM(nn.Module):
     def __call__(self, s):
 
         layer = nn.Dense(self.numHidden, use_bias=self.bias,
-                         **init_fn_args(kernel_init=jax.nn.initializers.lecun_normal(dtype=global_defs.tReal),
+                         **init_fn_args(kernel_init=jax.nn.initializers.lecun_normal(dtype=global_defs.DT_PARAMS_REAL),
                                         bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.tReal)
+                                        dtype=global_defs.DT_PARAMS_REAL)
                         )
 
         return jnp.sum(jnp.log(jnp.cosh(layer(2 * s - 1))))

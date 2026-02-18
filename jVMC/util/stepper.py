@@ -1,7 +1,4 @@
-import jax
 import jax.numpy as jnp
-import numpy as np
-
 
 class Euler:
     ''' This class implements Euler integration

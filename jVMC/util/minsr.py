@@ -1,20 +1,14 @@
-import jax
 import jax.numpy as jnp
 
-import jVMC.mpi_wrapper as mpi
-import jVMC.global_defs as global_defs
 from jVMC.stats import SampledObs
-
-def realFun(x):
-    return jnp.real(x)
-
-
-def imagFun(x):
-    return 0.5 * (x - jnp.conj(x))
-
+from jVMC.vqs import NQS
+from jVMC.sampler import AbstractMCSampler
+from jVMC.util.output_manager import OutputManager
+from jVMC.operator.base import AbstractOperator
 
 class MinSR:
-    """ This class provides functionality for energy minimization via MinSR.
+    """ 
+    This class provides functionality for energy minimization via MinSR.
 
     See `[arXiv:2302.01941] <https://arxiv.org/abs/2302.01941>`_ for details.
 
@@ -25,62 +19,41 @@ class MinSR:
         * ``diagonalizeOnDevice``: Choose whether to diagonalize :math:`S` on GPU or CPU.
     """
 
-    def __init__(self, sampler, pinvTol=1e-14, diagonalShift=0., diagonalizeOnDevice=True):
+    def __init__(self, sampler: AbstractMCSampler, pinvTol=1e-14, diagonalShift=0., diagonalizeOnDevice=True):
         self.sampler = sampler
         self.pinvTol = pinvTol
         self.diagonalShift = diagonalShift
-
         self.diagonalizeOnDevice = diagonalizeOnDevice
-
         self.metaData = None
+        self.Eloc0 = None
 
-    def set_pinv_tol(self, tol):
+    @property
+    def energy(self) -> SampledObs:
+        return self.Eloc0
 
-        self.pinvTol = tol
-
-    def get_metadata(self):
-
-        return self.metaData
-
-    def get_energy_variance(self):
-
-        return self.ElocVar0
-
-    def get_energy_mean(self):
-
-        return jnp.real(self.ElocMean0)
-
-    def solve(self, eloc, gradients, holomorphic):
+    def solve(self, Eloc: SampledObs, gradients: SampledObs, holomorphic):
         """
         Uses the techique proposed in arXiv:2302.01941 to compute the updates.
         Efficient only if number of samples :math:`\\ll` number of parameters.
         """
-
         if holomorphic:
-            T = gradients.tangent_kernel()
+            T = gradients.tangent_kernel
             T_inv = jnp.linalg.pinv(T, rtol=self.pinvTol, hermitian=True)
+            return - gradients._normalized_obs.conj().T @ T_inv @ Eloc._normalized_obs.squeeze()
 
-            eloc_all = mpi.gather(eloc._data).reshape((-1,))
-            gradients_all = mpi.gather(gradients._data)
-            update = - gradients_all.conj().T @ T_inv @ eloc_all
+        gradients_all = jnp.concatenate([jnp.real(gradients._normalized_obs), jnp.imag(gradients._normalized_obs)])
+        Eloc_all = jnp.concatenate([jnp.real(Eloc._normalized_obs), jnp.imag(Eloc._normalized_obs)]).squeeze()
 
-        else:
-            gradients_all = mpi.gather(gradients._data)
-            gradients_all = jnp.concatenate([jnp.real(gradients_all), jnp.imag(gradients_all)], axis=0)
+        T = gradients_all @ gradients_all.T
+        T = T + self.diagonalShift * jnp.eye(T.shape[-1])
+        T_inv = jnp.linalg.pinv(T, rtol=self.pinvTol, hermitian=True)
 
-            T = gradients_all @ gradients_all.T
-            T += self.diagonalShift * jnp.eye(T.shape[-1])
-            T_inv = jnp.linalg.pinv(T, rcond=self.pinvTol, hermitian=True) # in newer versions of jax, rtol is prefered over rcond
+        return - gradients_all.T @ T_inv @ Eloc_all
 
-            eloc_all = mpi.gather(eloc._data).reshape((-1,))
-            eloc_all = jnp.concatenate([jnp.real(eloc_all), jnp.imag(eloc_all)], axis=0)
-
-            update = - gradients_all.T @ T_inv @ eloc_all
-
-        return update
-
-    def __call__(self, netParameters, t, *, psi, hamiltonian, **rhsArgs):
-        """ For given network parameters computes an update step using the MinSR method.
+    def __call__(self, netParameters, t, *, psi: NQS, hamiltonian: AbstractOperator,
+                 numSamples=None, outp: None | OutputManager = None, intStep=None):
+        """ 
+        For given network parameters computes an update step using the MinSR method.
 
         This function returns :math:`\\dot\\theta=\\bar O^\\dagger (\\bar O\\bar O^\\dagger + \\lambda\\mathbb{I})^{-1}\\bar E_{loc}`
         (see `[arXiv:2302.01941] <https://arxiv.org/abs/2302.01941>`_ for details). 
@@ -105,61 +78,45 @@ class MinSR:
         Returns:
             The solution of the MinSR equation, :math:`\\dot\\theta=\\bar O^\\dagger (\\bar O\\bar O^\\dagger)^{-1}\\bar E_{loc}`.
         """
+        tmpParameters = psi.parameters
+        psi.parameters = netParameters
 
-        tmpParameters = psi.get_parameters()
-        psi.set_parameters(netParameters)
-
-        outp = None
-        if "outp" in rhsArgs:
-            outp = rhsArgs["outp"]
-        self.outp = outp
-
-        numSamples = None
-        if "numSamples" in rhsArgs:
-            numSamples = rhsArgs["numSamples"]
-
-        def start_timing(outp, name):
+        def start_timing(name):
             if outp is not None:
                 outp.start_timing(name)
 
-        def stop_timing(outp, name, waitFor=None):
+        def stop_timing(name, waitFor=None):
             if waitFor is not None:
                 waitFor.block_until_ready()
             if outp is not None:
                 outp.stop_timing(name)
 
         # Get sample
-        start_timing(outp, "sampling")
+        start_timing("sampling")
         sampleConfigs, sampleLogPsi, p = self.sampler.sample(numSamples=numSamples)
-        stop_timing(outp, "sampling", waitFor=sampleConfigs)
+        stop_timing("sampling", waitFor=sampleConfigs)
 
         # Evaluate local energy
-        start_timing(outp, "compute Eloc")
-        Eloc = hamiltonian.get_O_loc(sampleConfigs, psi, sampleLogPsi, t)
-        stop_timing(outp, "compute Eloc", waitFor=Eloc)
-        Eloc = SampledObs( Eloc, p)
+        start_timing("compute Eloc")
+        Eloc = hamiltonian.get_O_loc(sampleConfigs, psi, LogPsiS=sampleLogPsi, t=t)
+        stop_timing("compute Eloc", waitFor=Eloc)
+        self.Eloc = SampledObs(Eloc, p)
 
         # Evaluate gradients
-        start_timing(outp, "compute gradients")
+        start_timing("compute gradients")
         sampleGradients = psi.gradients(sampleConfigs)
-        stop_timing(outp, "compute gradients", waitFor=sampleGradients)
-        sampleGradients = SampledObs( sampleGradients, p)
+        stop_timing("compute gradients", waitFor=sampleGradients)
+        sampleGradients = SampledObs(sampleGradients, p)
 
-        start_timing(outp, "solve MinSR eqn.")
-        update = self.solve(Eloc, sampleGradients, holomorphic=psi.holomorphic)
-        stop_timing(outp, "solve MinSR eqn.")
+        start_timing("solve TDVP eqn.")
+        update = self.solve(self.Eloc, sampleGradients, holomorphic=psi.holomorphic)
+        stop_timing("solve TDVP eqn.")
 
-        if outp is not None:
-            outp.add_timing("MPI communication", mpi.get_communication_time())
+        psi.parameters = tmpParameters
 
-        psi.set_parameters(tmpParameters)
-
-        if "intStep" in rhsArgs:
-            if rhsArgs["intStep"] == 0:
-
-                self.ElocMean0 = Eloc.mean()[0]
-                self.ElocVar0 = Eloc.var()[0]
-
+        if intStep is not None:
+            if intStep == 0:
+                self.Eloc0 = self.Eloc
                 self.metaData = {}
 
         return update

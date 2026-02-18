@@ -30,7 +30,7 @@ class FFN(nn.Module):
         for l in range(len(activationFunctions), len(self.layers) + 1):
             activationFunctions.append(self.actFun[-1])
         
-        init_args = init_fn_args(dtype=global_defs.tReal, 
+        init_args = init_fn_args(dtype=global_defs.DT_PARAMS_REAL, 
                                     kernel_init=jax.nn.initializers.lecun_normal(), 
                                     bias_init=jax.nn.initializers.zeros)
 

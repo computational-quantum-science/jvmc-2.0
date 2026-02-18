@@ -35,7 +35,7 @@ class RNNCellStack(nn.Module):
     """
 
     cells: list
-    dtype: type = global_defs.tReal
+    dtype: type = global_defs.DT_PARAMS_REAL
     initFun: callable = jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform")
     actFun: callable = nn.elu
 
@@ -112,10 +112,10 @@ class RNN2DGeneral(nn.Module):
 
     def setup(self):
         if self.realValuedParams:
-            self.dtype = global_defs.tReal
+            self.dtype = global_defs.DT_PARAMS_REAL
             self.initFunction = jax.nn.initializers.variance_scaling(scale=self.initScale, mode="fan_avg", distribution="uniform", dtype=self.dtype)
         else:
-            self.dtype = global_defs.tCpx
+            self.dtype = global_defs.DT_PARAMS_CPX
             self.initFunction = jVMC.nets.initializers.cplx_variance_scaling
 
         if isinstance(self.cell, str):
@@ -190,25 +190,18 @@ class RNN2DGeneral(nn.Module):
         logCoeff = self.log_coeffs_to_log_probs(out)
         return newCarry, (newCarry, logCoeff)
 
-    def sample(self, batchSize, key):
-        """sampler
-        """
+    def sample(self, key):
         # Scan directions for zigzag path
         direction = np.ones(self.L, dtype=np.int32)
         direction[1::2] = -1
         direction = jnp.asarray(direction)
 
-        def generate_sample(key):
-            myKeys = jax.random.split(key, self.L)
-            _, sample = self.rnn_cell_V_sample(
-                (self.zero_carry, jnp.zeros((self.L, self.inputDim))),
-                (myKeys, direction)
-            )
-            return sample
-
-        keys = jax.random.split(key, batchSize)
-
-        return jax.vmap(generate_sample)(keys)
+        myKeys = jax.random.split(key, self.L)
+        _, sample = self.rnn_cell_V_sample(
+            (self.zero_carry, jnp.zeros((self.L, self.inputDim))),
+            (myKeys, direction)
+        )
+        return sample
 
     @partial(nn.transforms.scan,
              variable_broadcast='params',
@@ -246,11 +239,11 @@ class GRUCell(nn.Module):
     def __call__(self, carryH, carryV, state):
         cellCarryH = nn.Dense(features=carryH.shape[-1],
                               use_bias=True,
-                              param_dtype=global_defs.tReal)
+                              param_dtype=global_defs.DT_PARAMS_REAL)
         cellCarryV = nn.Dense(features=carryV.shape[-1],
                               use_bias=False,
-                              param_dtype=global_defs.tReal)
-        current_carry, newR = nn.GRUCell(features=self.features, param_dtype=global_defs.tReal)(cellCarryH(carryH) + cellCarryV(carryV), state)
+                              param_dtype=global_defs.DT_PARAMS_REAL)
+        current_carry, newR = nn.GRUCell(features=self.features, param_dtype=global_defs.DT_PARAMS_REAL)(cellCarryH(carryH) + cellCarryV(carryV), state)
 
         return current_carry, newR[0]
 
@@ -262,11 +255,11 @@ class LSTMCell(nn.Module):
     def __call__(self, carryH, carryV, state):
         cellCarryH = nn.Dense(features=carryH.shape[-1],
                               use_bias=True,
-                              param_dtype=global_defs.tReal)
+                              param_dtype=global_defs.DT_PARAMS_REAL)
         cellCarryV = nn.Dense(features=carryV.shape[-1],
                               use_bias=False,
-                              param_dtype=global_defs.tReal)
-        current_carry, newR = nn.OptimizedLSTMCell(features=self.features, param_dtype=global_defs.tReal)(cellCarryH(carryH) + cellCarryV(carryV), state)
+                              param_dtype=global_defs.DT_PARAMS_REAL)
+        current_carry, newR = nn.OptimizedLSTMCell(features=self.features, param_dtype=global_defs.DT_PARAMS_REAL)(cellCarryH(carryH) + cellCarryV(carryV), state)
 
         return jnp.asarray(current_carry), newR
 
@@ -288,13 +281,13 @@ class RNNCell(nn.Module):
     """
 
     initFun: callable = jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform")
-    dtype: type = global_defs.tReal
+    dtype: type = global_defs.DT_PARAMS_REAL
     actFun: callable = nn.elu
 
     @nn.compact
     def __call__(self, carryH, carryV, state):
         kernel_init_fun = partial(jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform"),
-                                  dtype=global_defs.tReal)
+                                  dtype=global_defs.DT_PARAMS_REAL)
         cellCarryH = nn.Dense(features=carryH.shape[-1],
                               use_bias=False,
                               **init_fn_args(bias_init=jax.nn.initializers.zeros,

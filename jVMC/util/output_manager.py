@@ -1,11 +1,11 @@
 import h5py
 import numpy as np
 import jax.numpy as jnp
-import jVMC.mpi_wrapper as mpi
 import time
 
 class OutputManager:
-    '''This class provides functionality for I/O and timing.
+    '''
+    This class provides functionality for I/O and timing.
 
     Upon initialization with
     
@@ -17,234 +17,151 @@ class OutputManager:
 
     Furthermore, timings can be recorded using the :code:`start_timing()` and :code:`stop_timing()` member functions. The recorded
     timings can be printed to screen using the :code:`print_timings()` function.
-
-    Finally, the OutputManager provides a :code:`print()` function, that wraps python's standard :code:`print()` to print only
-    on the MPI process with rank 0.
     '''
-
     def __init__(self, dataFileName, group="/", append=False):
-
-        self.fn = dataFileName
-
-        self.currentGroup = "/"
-
-        self.append = 'w'
-        if append:
-            self.append = 'a'
+        self._file_name = dataFileName
+        self._current_group = "/"
+        self._append = 'w' if append else 'a'
 
         self.set_group(group)
-
-        self.timings = {}
+        self._timings = {}
 
     def set_group(self, group):
-
         if group != "/":
-            self.currentGroup = "/" + group
+            self._current_group = "/" + group
 
-        if mpi.rank == 0:
-            with h5py.File(self.fn, self.append) as f:
-                if not self.currentGroup in f:
-                    f.create_group(self.currentGroup)
+        with h5py.File(self._file_name, self._append) as f:
+            if not self._current_group in f:
+                f.create_group(self._current_group)
+        self._append = 'a'
 
-        self.append = 'a'
+    def _write_timeseries(self, group_name, time, **kwargs):
+        full_group_name = self._current_group + "/" + group_name
+        time_path = full_group_name + "/times" 
+
+        with h5py.File(self._file_name, "a") as f:
+            if group_name not in f[self._current_group]:
+                f.create_group(full_group_name)
+
+            if "times" not in f[full_group_name]:
+                f.create_dataset(time_path, (0,), maxshape=(None,), dtype='f8', chunks=True)
+
+            new_len = len(f[time_path]) + 1
+            f[time_path].resize((new_len,))
+            f[time_path][-1] = time
+            self._write_timeseries_recursive(f, full_group_name, kwargs)
+
+    def _write_timeseries_recursive(self, f, full_group_name, data_dict):
+        for key, value in data_dict.items():
+            new_full_group_name = full_group_name + "/" + key
+
+            if isinstance(value, dict):
+                if key not in f[full_group_name]:
+                    f.create_group(new_full_group_name)
+                self._write_timeseries_recursive(f, new_full_group_name, value)
+
+            else:
+                value = self.to_array(value)
+                if key not in f[full_group_name]:
+                    f.create_dataset(new_full_group_name, (0,) + value.shape, maxshape=(None,) + value.shape, dtype='f8', chunks=True)
+                
+                new_len = len(f[new_full_group_name]) + 1
+                f[new_full_group_name].resize((new_len,) + value.shape)
+                f[new_full_group_name][-1] = value
 
     def write_observables(self, time, **kwargs):
-        ''''''
-
-        if mpi.rank == 0:
-
-            with h5py.File(self.fn, "a") as f:
-
-                if not "observables" in f[self.currentGroup]:
-                    f.create_group(self.currentGroup + "/observables")
-
-                if not "times" in f[self.currentGroup + "/observables"]:
-                    f.create_dataset(self.currentGroup + "/observables/times", (0,), maxshape=(None,), dtype='f8', chunks=True)
-
-                newLen = len(f[self.currentGroup + "/observables/times"]) + 1
-                f[self.currentGroup + "/observables/times"].resize((newLen,))
-                f[self.currentGroup + "/observables/times"][-1] = time
-
-                for key, obsDict in kwargs.items():
-
-                    for name, value in obsDict.items():
-
-                        value = self.to_array(value)
-
-                        datasetName = self.currentGroup + "/observables/" + key + "/" + name
-
-                        if not key in f[self.currentGroup + "/observables"]:
-
-                            f.create_group(self.currentGroup + "/observables/" + key)
-
-                        if not name in f[self.currentGroup + "/observables/" + key]:
-
-                            f.create_dataset(datasetName, (0,) + value.shape, maxshape=(None,) + value.shape, dtype='f8', chunks=True)
-
-                        newLen = len(f[datasetName]) + 1
-                        f[datasetName].resize((newLen,) + value.shape)
-                        f[datasetName][-1] = value
+        self._write_timeseries("observables", time, **kwargs)
 
     def write_metadata(self, time, **kwargs):
-
-        if mpi.rank == 0:
-
-            groupname = "metadata"
-
-            with h5py.File(self.fn, "a") as f:
-
-                if not groupname in f[self.currentGroup]:
-                    f.create_group(self.currentGroup + "/" + groupname)
-
-                if not "times" in f[self.currentGroup + "/" + groupname]:
-                    f.create_dataset(self.currentGroup + "/" + groupname + "/times", (0,), maxshape=(None,), dtype='f8', chunks=True)
-
-                newLen = len(f[self.currentGroup + "/" + groupname + "/times"]) + 1
-                f[self.currentGroup + "/" + groupname + "/times"].resize((newLen,))
-                f[self.currentGroup + "/" + groupname + "/times"][-1] = time
-
-                for key, value in kwargs.items():
-
-                    value = self.to_array(value)
-
-                    if not key in f[self.currentGroup + "/" + groupname]:
-
-                        f.create_dataset(self.currentGroup + "/" + groupname + "/" + key, (0,) + value.shape, maxshape=(None,) + value.shape, dtype='f8', chunks=True)
-
-                    newLen = len(f[self.currentGroup + "/" + groupname + "/" + key]) + 1
-                    f[self.currentGroup + "/" + groupname + "/" + key].resize((newLen,) + value.shape)
-                    f[self.currentGroup + "/" + groupname + "/" + key][-1] = value
-
+        self._write_timeseries("metadata", time, **kwargs)
+    
     def write_network_checkpoint(self, time, weights):
+        self._write_timeseries("network_checkpoints", time, checkpoints=weights)
 
-        if mpi.rank == 0:
+    def get_network_checkpoint(self, time=None, idx=None):
+        if time is not None and idx is not None:
+            raise ValueError("Cannot specify both 'time' and 'idx'. Choose one.")
+        if time is None and idx is None:
+            idx = -1
 
-            groupname = "network_checkpoints"
+        full_group_name = self._current_group + "/" + "network_checkpoints"
 
-            with h5py.File(self.fn, "a") as f:
-
-                if not groupname in f[self.currentGroup]:
-                    f.create_group(self.currentGroup + "/" + groupname)
-
-                if not "times" in f[self.currentGroup + "/" + groupname]:
-                    f.create_dataset(self.currentGroup + "/" + groupname + "/times", (0,), maxshape=(None,), dtype='f8', chunks=True)
-
-                newLen = len(f[self.currentGroup + "/" + groupname + "/times"]) + 1
-                f[self.currentGroup + "/" + groupname + "/times"].resize((newLen,))
-                f[self.currentGroup + "/" + groupname + "/times"][-1] = time
-
-                key = "checkpoints"
-                value = weights
-
-                if not key in f[self.currentGroup + "/" + groupname]:
-
-                    f.create_dataset(self.currentGroup + "/" + groupname + "/" + key, (0,) + value.shape, maxshape=(None,) + value.shape, dtype='f8', chunks=True)
-
-                newLen = len(f[self.currentGroup + "/" + groupname + "/" + key]) + 1
-                f[self.currentGroup + "/" + groupname + "/" + key].resize((newLen,) + value.shape)
-                f[self.currentGroup + "/" + groupname + "/" + key][-1] = value
-
-    def get_network_checkpoint(self, time=-1, idx=-1):
-
-        groupname = "network_checkpoints"
-        key = "checkpoints"
-
-        weights = None
-
-        if mpi.rank == 0:
-
-            with h5py.File(self.fn, "r") as f:
-                times = np.array(f[self.currentGroup + "/" + groupname + "/times"])
-
-            if time >= 0:
-                idx = np.argmin(np.abs(times-time))
-
-            with h5py.File(self.fn, "r") as f:
-                weights = f[self.currentGroup + "/" + groupname + "/" + key][idx]
-            time = times[idx]
-
-            mpi.comm.bcast(time)
-
-        else:
-
-            time = mpi.comm.bcast(None)
-
-        weights = mpi.bcast_unknown_size(weights)
+        with h5py.File(self._file_name, "r") as f:
+            times = np.array(f[full_group_name + "/times"])
+            if time is not None:
+                idx = np.argmin(np.abs(times - time))
+            weights = f[full_group_name + "/" + "checkpoints"][idx]
+        time = times[idx]
 
         return time, weights
 
-    def write_error_data(self, name, data, mpiRank=0):
+    def write_error_data(self, name, data):
+        group_name = "error_data"
 
-        if mpi.rank == mpiRank:
+        with h5py.File(self._file_name, "a") as f:
+            if group_name not in f["/"]:
+                f.create_group("/" + group_name)
 
-            groupname = "error_data"
+            f.create_dataset("/" + group_name + "/" + name, data=np.array(data))
 
-            with h5py.File(self.fn, "a") as f:
+    def write_dataset(self, name, data, group_name="/"):
+        with h5py.File(self._file_name, "a") as f:
+            if group_name != "/":
+                if group_name not in f["/"]:
+                    f.create_group("/" + group_name)
 
-                if not groupname in f["/"]:
-                    f.create_group("/" + groupname)
-
-                f.create_dataset("/" + groupname + "/" + name, data=np.array(data))
-
-    def write_dataset(self, name, data, groupname="/", mpiRank=0):
-
-        if mpi.rank == mpiRank:
-
-            with h5py.File(self.fn, "a") as f:
-
-                if not groupname == "/":
-                    if not groupname in f["/"]:
-                        f.create_group("/" + groupname)
-
-                print(data.shape)
-                f.create_dataset("/" + groupname + "/" + name, data=np.array(data))
+            f.create_dataset("/" + group_name + "/" + name, data=np.array(data))
 
     def start_timing(self, name):
+        if name not in self._timings:
+            self._timings[name] = {"total": 0.0, "last_total": 0.0, "newest": 0.0, "count": 0, "init": 0.0}
 
-        if not name in self.timings:
-            self.timings[name] = {"total": 0.0, "last_total": 0.0, "newest": 0.0, "count": 0, "init": 0.0}
-
-        self.timings[name]["init"] = time.perf_counter()
+        self._timings[name]["init"] = time.perf_counter()
 
     def stop_timing(self, name):
-
         toc = time.perf_counter()
 
-        if not name in self.timings:
-            self.timings[name] = {"total": 0.0, "last_total": 0.0, "newest": 0.0, "count": 0, "init": 0.0}
+        if name not in self._timings:
+            self._timings[name] = {"total": 0.0, "last_total": 0.0, "newest": 0.0, "count": 0, "init": 0.0}
 
-        elapsed = toc - self.timings[name]["init"]
+        elapsed = toc - self._timings[name]["init"]
 
-        self.timings[name]["total"] += elapsed
-        self.timings[name]["newest"] = elapsed
-        self.timings[name]["count"] += 1
+        self._timings[name]["total"] += elapsed
+        self._timings[name]["newest"] = elapsed
+        self._timings[name]["count"] += 1
 
     def add_timing(self, name, elapsed):
+        if name not in self._timings:
+            self._timings[name] = {"total": 0.0, "last_total": 0.0, "newest": 0.0, "count": 0, "init": 0.0}
 
-        if not name in self.timings:
-            self.timings[name] = {"total": 0.0, "last_total": 0.0, "newest": 0.0, "count": 0, "init": 0.0}
-
-        self.timings[name]["total"] += elapsed
-        self.timings[name]["newest"] = elapsed
-        self.timings[name]["count"] += 1
+        self._timings[name]["total"] += elapsed
+        self._timings[name]["newest"] = elapsed
+        self._timings[name]["count"] += 1
 
     def print_timings(self, indent=""):
+        print(f"{indent}Recorded timings:", flush=True)
+        
+        for key, item in self._timings.items():
+            print(f"{indent}    • {key}: {item['total'] - item['last_total']}s", flush=True)
 
-        self.print("%sRecorded timings:" % indent)
-        for key, item in self.timings.items():
-            self.print("%s  * %s: %fs" % (indent, key, item["total"] - item["last_total"]))
-
-        for key in self.timings:
-            self.timings[key]["last_total"] = self.timings[key]["total"]
-
-    def print(self, text):
-        if mpi.rank == 0:
-            print(text, flush=True)
-
+        for key in self._timings:
+            self._timings[key]["last_total"] = self._timings[key]["total"]
 
     def to_array(self, x):
-
         if not isinstance(x, (np.ndarray, jnp.ndarray)):
             x = np.array([x])
 
         return x
+    
+    def _recursive_read(self, f):
+        out = {}
+        for key, item in f.items():
+            if isinstance(item, h5py.Dataset):
+                out[key] = item[()]   # read dataset
+            elif isinstance(item, h5py.Group):
+                out[key] = self._recursive_read(item)
+        return out
+    
+    def to_dict(self):
+        with h5py.File(self._file_name, "r") as f:
+            return self._recursive_read(f)

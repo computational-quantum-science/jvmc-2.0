@@ -1,48 +1,47 @@
 import unittest
-
+import tqdm
 import jax.numpy as jnp
 
 import jVMC
 import jVMC.nets as nets
 from jVMC.vqs import NQS
-import jVMC.operator as op
+import jVMC.operator.discrete as op
 import jVMC.sampler as sampler
-
-from jVMC.util import measure, ground_state_search
-
+from jVMC.util import measure
 
 class TestGsSearch(unittest.TestCase):
     def test_gs_search_cpx(self):
         L = 4
         J = -1.0
         hxs = [-1.3, -0.3]
-
         exEs = [-6.10160339, -4.09296160]
+        
+        batch_size = int(2 ** L)
+        learning_rate = 1e-2
+        num_steps = 200
 
         for hx, exE in zip(hxs, exEs):
             # Set up variational wave function
-            rbm = nets.CpxRBM(numHidden=8, bias=False)
-            psi = NQS(rbm, seed=1234)
+            rbm = nets.CpxRBM(numHidden=3, bias=False)
+            psi = NQS(rbm, L, batch_size, seed=1234)
 
             # Set up hamiltonian for ground state search
-            hamiltonianGS = op.BranchFreeOperator()
+            H = 0
             for l in range(L):
-                hamiltonianGS.add(op.scal_opstr(J, (op.Sz(l), op.Sz((l + 1) % L))))
-                hamiltonianGS.add(op.scal_opstr(hx, (op.Sx(l), )))
+                H += J * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) + hx * op.SigmaX(l)
 
             # Set up exact sampler
-            exactSampler = sampler.ExactSampler(psi, L)
+            exact_sampler = sampler.ExactSampler(psi, 2)
 
-            tdvpEquation = jVMC.util.MinSR(exactSampler, pinvTol=1e-6, diagonalShift=0.)
+            tdvp_equation = jVMC.util.MinSR(exact_sampler, pinvTol=1e-6, diagonalShift=1e-3)
+            stepper = jVMC.util.Euler(timeStep=learning_rate)
 
-            # Perform ground state search to get initial state
-            ground_state_search(psi, hamiltonianGS, tdvpEquation, exactSampler, numSteps=200, stepSize=1e-2)
+            for _ in tqdm.tqdm(range(num_steps)):
+                psi.parameters, _ = stepper.step(0, tdvp_equation, psi.parameters_flat, hamiltonian=H, psi=psi)
 
-            obs = measure({"energy": hamiltonianGS}, psi, exactSampler)
-
+            obs = measure({"energy": H}, psi, exact_sampler)
+            print(jnp.abs((obs['energy']['mean'] - exE) / exE))
             self.assertTrue(jnp.max(jnp.abs((obs['energy']['mean'] - exE) / exE)) < 1e-3)
-
-
 
 if __name__ == "__main__":
     unittest.main()
