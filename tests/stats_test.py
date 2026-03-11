@@ -3,9 +3,9 @@ import unittest
 import jax
 import jax.numpy as jnp
 
-import jVMC
-from jVMC.stats import SampledObs
-import jVMC.operator as op
+import jVMC_exp
+from jVMC_exp.stats import SampledObs
+import jVMC_exp.operator as op
 
 
 class TestStats(unittest.TestCase):

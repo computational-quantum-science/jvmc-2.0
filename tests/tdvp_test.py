@@ -4,13 +4,13 @@ import numpy as np
 from scipy.interpolate import interp1d
 import tqdm
 
-import jVMC
-import jVMC.util.stepper as jVMCstepper
-import jVMC.nets as nets
-from jVMC.vqs import NQS
-import jVMC.operator.discrete as op
-import jVMC.sampler as sampler
-from jVMC.util import measure
+import jVMC_exp
+import jVMC_exp.util.stepper as jVMCstepper
+import jVMC_exp.nets as nets
+from jVMC_exp.vqs import NQS
+import jVMC_exp.operator.discrete as op
+import jVMC_exp.sampler as sampler
+from jVMC_exp.util import measure
 
 class TestGsSearch(unittest.TestCase):
     def test_gs_search_cpx(self):
@@ -31,11 +31,11 @@ class TestGsSearch(unittest.TestCase):
                 hamiltonian += J * (op.SigmaZ(l) * op.SigmaZ((l + 1) % L)) + hx * op.SigmaX(l)
 
             delta = 2
-            tdvpEquation = jVMC.util.TDVP(
+            tdvpEquation = jVMC_exp.util.TDVP(
                 exactSampler, snrTol=1, pinvTol=0.0, pinvCutoff=1e-8, 
                 rhsPrefactor=1., diagonalShift=delta, makeReal='real'
             )
-            stepper = jVMC.util.Euler(5e-2)
+            stepper = jVMC_exp.util.Euler(5e-2)
 
             for _ in tqdm.tqdm(range(100)):
                 psi.parameters, _ = stepper.step(0, tdvpEquation, psi.parameters_flat, psi=psi, hamiltonian=hamiltonian)
@@ -76,7 +76,7 @@ class TestTimeEvolution(unittest.TestCase):
 
         # Set up adaptive time stepper
         stepper = jVMCstepper.AdaptiveHeun(timeStep=1e-3, tol=1e-5)
-        tdvpEquation = jVMC.util.TDVP(exactSampler, snrTol=1, pinvTol=0.0, pinvCutoff=1e-8, rhsPrefactor=1.j, diagonalShift=0., makeReal='imag')
+        tdvpEquation = jVMC_exp.util.TDVP(exactSampler, snrTol=1, pinvTol=0.0, pinvCutoff=1e-8, rhsPrefactor=1.j, diagonalShift=0., makeReal='imag')
 
         t = 0
         t_max = 0.5
@@ -146,13 +146,13 @@ class TestTimeEvolutionMCSampler(unittest.TestCase):
             ZZ += op.SigmaZ(l) * op.SigmaZ((l + 1) % L)
 
         # Set up exact sampler
-        proposer = jVMC.propose.SpinFlip()
+        proposer = jVMC_exp.propose.SpinFlip()
         mc_sampler = sampler.MCSampler(psi, proposer, 123, num_chains, num_samples, mu=1)
 
         # Set up adaptive time stepper
         stepper = jVMCstepper.AdaptiveHeun(timeStep=1e-3, tol=1e-4)
 
-        tdvpEquation = jVMC.util.TDVP(mc_sampler, snrTol=1, pinvTol=1e-8, rhsPrefactor=1.j, diagonalShift=0., makeReal='imag', crossValidation=True)
+        tdvpEquation = jVMC_exp.util.TDVP(mc_sampler, snrTol=1, pinvTol=1e-8, rhsPrefactor=1.j, diagonalShift=0., makeReal='imag', crossValidation=True)
 
         t = 0
         t_max = 0.2

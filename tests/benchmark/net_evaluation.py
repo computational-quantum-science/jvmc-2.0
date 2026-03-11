@@ -2,9 +2,9 @@ import sys
 # Find jVMC package
 sys.path.append(sys.path[0]+"/../..")
 
-import jVMC
-import jVMC.nets as nets
-from jVMC.vqs import NQS
+import jVMC_exp
+import jVMC_exp.nets as nets
+from jVMC_exp.vqs import NQS
 import numpy as np
 import jax
 import jax.numpy as jnp

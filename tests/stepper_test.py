@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import jVMC.util.stepper as st
+import jVMC_exp.util.stepper as st
 
 class TestIntegrationHeun(unittest.TestCase):
 

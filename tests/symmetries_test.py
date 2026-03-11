@@ -3,9 +3,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import jVMC.util.symmetries as symmetries
-import jVMC.nets as nets
-from jVMC.vqs import NQS
+import jVMC_exp.util.symmetries as symmetries
+import jVMC_exp.nets as nets
+from jVMC_exp.vqs import NQS
 
 class TestSymmetries(unittest.TestCase):
 

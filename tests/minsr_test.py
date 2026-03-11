@@ -2,12 +2,12 @@ import unittest
 import tqdm
 import jax.numpy as jnp
 
-import jVMC
-import jVMC.nets as nets
-from jVMC.vqs import NQS
-import jVMC.operator.discrete as op
-import jVMC.sampler as sampler
-from jVMC.util import measure
+import jVMC_exp
+import jVMC_exp.nets as nets
+from jVMC_exp.vqs import NQS
+import jVMC_exp.operator.discrete as op
+import jVMC_exp.sampler as sampler
+from jVMC_exp.util import measure
 
 class TestGsSearch(unittest.TestCase):
     def test_gs_search_cpx(self):
@@ -33,8 +33,8 @@ class TestGsSearch(unittest.TestCase):
             # Set up exact sampler
             exact_sampler = sampler.ExactSampler(psi, 2)
 
-            tdvp_equation = jVMC.util.MinSR(exact_sampler, pinvTol=1e-6, diagonalShift=1e-3)
-            stepper = jVMC.util.Euler(timeStep=learning_rate)
+            tdvp_equation = jVMC_exp.util.MinSR(exact_sampler, pinvTol=1e-6, diagonalShift=1e-3)
+            stepper = jVMC_exp.util.Euler(timeStep=learning_rate)
 
             for _ in tqdm.tqdm(range(num_steps)):
                 psi.parameters, _ = stepper.step(0, tdvp_equation, psi.parameters_flat, hamiltonian=H, psi=psi)

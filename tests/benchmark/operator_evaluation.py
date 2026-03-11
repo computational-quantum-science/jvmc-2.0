@@ -2,8 +2,8 @@ import sys
 # Find jVMC package
 sys.path.append(sys.path[0]+"/../..")
 
-import jVMC
-import jVMC.operator as op
+import jVMC_exp
+import jVMC_exp.operator as op
 import numpy as np
 import jax
 import jax.numpy as jnp

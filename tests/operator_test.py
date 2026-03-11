@@ -4,12 +4,12 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 
-import jVMC
-import jVMC.operator.discrete as op
-import jVMC.sampler
-import jVMC.nets as nets
-from jVMC.vqs import NQS
-from jVMC.global_defs import DT_SAMPLES
+import jVMC_exp
+import jVMC_exp.operator.discrete as op
+import jVMC_exp.sampler
+import jVMC_exp.nets as nets
+from jVMC_exp.vqs import NQS
+from jVMC_exp.global_defs import DT_SAMPLES
 
 L = 4
 LDIM = 2
@@ -91,7 +91,7 @@ class TestOperator(unittest.TestCase):
         rbm = nets.CpxRBM(numHidden=2, bias=True)
         psi = NQS(rbm, l, num_samples)
 
-        sampler = jVMC.sampler.ExactSampler(psi)
+        sampler = jVMC_exp.sampler.ExactSampler(psi)
 
         def commutator(i, j):
             return op.Creation(j) * op.Annihilation(i) + op.Annihilation(i) * op.Creation(j)
@@ -102,7 +102,7 @@ class TestOperator(unittest.TestCase):
             '0_1': commutator(0, 1),
             '1_0': commutator(1, 0)
         }
-        out_dict = jVMC.util.measure(observalbes_dict, psi, sampler)
+        out_dict = jVMC_exp.util.measure(observalbes_dict, psi, sampler)
 
         self.assertTrue(
             jnp.allclose(
@@ -149,9 +149,9 @@ class TestOperator(unittest.TestCase):
         chi_model = Target(L=flavourL, d=2)
         chi = NQS(chi_model, flavourL, NUM_SAMPLES)
         chi.parameters = np.loadtxt("data_ref/fermion_ref.txt", dtype=np.complex128)
-        chi_sampler = jVMC.sampler.ExactSampler(chi)
+        chi_sampler = jVMC_exp.sampler.ExactSampler(chi)
         s, logPsi, p = chi_sampler.sample()
-        Oloc = jVMC.stats.SampledObs(h.get_O_loc(s, chi, logPsiS=logPsi), p)
+        Oloc = jVMC_exp.stats.SampledObs(h.get_O_loc(s, chi, logPsiS=logPsi), p)
 
         self.assertTrue(jnp.allclose(Oloc.mean, -9.95314531))
 
