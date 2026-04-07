@@ -5,6 +5,7 @@ import numpy as np
 
 import jVMC_exp
 import jVMC_exp.nets.activation_functions as act_funs
+import jVMC_exp.operator.discrete as op
 import jVMC_exp.util.symmetries as sym
 from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler import AbstractMCSampler
@@ -19,6 +20,86 @@ def get_iterable(x):
         return x
     else:
         return (x,)
+
+def matrix_to_jvmc_operator(
+    matrix: np.ndarray,
+    sites,
+    *,
+    return_conjugate: bool = False,
+):
+    r"""Convert a dense one- or two-site matrix into a ``jVMC`` discrete operator.
+
+    The matrix is expanded in the local operator basis
+    :math:`\{I, \sigma_x, \sigma_y, \sigma_z\}` and mapped onto the
+    corresponding ``jVMC_exp.operator.discrete`` operators. For two-site
+    matrices, tensor products of the same basis are used on the specified sites.
+
+    Args:
+        matrix: Dense operator matrix. Supported shapes are ``(2, 2)`` for a
+            single-site operator and ``(4, 4)`` for a two-site operator.
+        sites: Target lattice site or pair of lattice sites. Pass either a
+            single integer or an iterable of length two.
+        return_conjugate: If ``True``, also return the operator constructed from
+            the conjugate transpose ``matrix.conj().T``.
+
+    Returns:
+        The discrete operator corresponding to ``matrix`` on ``sites``. If
+        ``return_conjugate=True``, returns ``(operator, conjugate_operator)``.
+
+    Raises:
+        ValueError: If ``sites`` does not specify one or two sites, if
+            ``matrix`` is not square, or if its shape is incompatible with the
+            number of sites.
+    """
+    local_basis = [
+        np.eye(2, dtype=complex),
+        np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
+        np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex),
+        np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
+    ]
+    jvmc_basis = [
+        lambda i: op.IdentityOperator(2, i),
+        lambda i: op.SigmaX(i),
+        lambda i: op.SigmaY(i),
+        lambda i: op.SigmaZ(i),
+    ]
+
+    if isinstance(sites, (int, np.integer)):
+        sites = (int(sites),)
+    else:
+        sites = tuple(sites)
+
+    if len(sites) not in (1, 2):
+        raise ValueError("sites must be an int or a sequence of length 2.")
+
+    matrix = np.asarray(matrix, dtype=complex)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("matrix must be square.")
+
+    if len(sites) == 1 and matrix.shape != (2, 2):
+        raise ValueError("Single-site operators require a 2x2 matrix.")
+    if len(sites) == 2 and matrix.shape != (4, 4):
+        raise ValueError("Two-site operators require a 4x4 matrix.")
+
+    def build_from(mat):
+        if len(sites) == 1:
+            jvmc_op = 0
+            for idx, basis in enumerate(local_basis):
+                coeff = 0.5 * complex(np.trace(basis.conj().T @ mat))
+                jvmc_op += coeff * jvmc_basis[idx](sites[0])
+            return jvmc_op
+
+        jvmc_op = 0
+        for i, left_basis in enumerate(local_basis):
+            for j, right_basis in enumerate(local_basis):
+                basis = np.kron(left_basis, right_basis)
+                coeff = 0.25 * complex(np.trace(basis.conj().T @ mat))
+                jvmc_op += coeff * (jvmc_basis[i](sites[0]) * jvmc_basis[j](sites[1]))
+        return jvmc_op
+
+    if return_conjugate:
+        return build_from(matrix), build_from(matrix.conj().T)
+    return build_from(matrix)
 
 def init_net(descr, dims, seed=0):
     def get_activation_functions(actFuns):

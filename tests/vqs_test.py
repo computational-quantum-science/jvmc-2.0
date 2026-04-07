@@ -191,5 +191,33 @@ class TestEvaluation(unittest.TestCase):
 
         self.assertTrue(jnp.linalg.norm(jnp.real(cpxCoeffs) - realCoeffs) < 1e-6)
 
+    def test_full_configuration_state_parameters_from_array(self):
+        L = 2
+        num_samples = 4
+        model = nets.FullConfigurationState(L=L, d=2)
+        psi = NQS(model, L, num_samples)
+
+        amplitudes = jnp.array([1.0 + 0.0j, 2.0 + 0.0j, 3.0j, -4.0 + 0.0j])
+        psi.set_network_parameters_from_array(amplitudes, logarithmic=False)
+
+        self.assertTrue(jnp.allclose(psi.params["kernel"], amplitudes))
+
+        states = jnp.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=DT_SAMPLES)
+        self.assertTrue(jnp.allclose(psi(states), jnp.log(amplitudes + model.delta)))
+
+    def test_full_configuration_state_logarithmic_parameters_from_array(self):
+        L = 2
+        num_samples = 4
+        model = nets.FullConfigurationState(L=L, d=2)
+        psi = NQS(model, L, num_samples)
+
+        log_amplitudes = jnp.log(jnp.array([1.0 + 0.0j, 2.0 + 0.0j, 3.0 + 0.0j, 4.0j]))
+        psi.set_network_parameters_from_array(log_amplitudes, logarithmic=True)
+
+        self.assertTrue(jnp.allclose(psi.params["kernel"], jnp.exp(log_amplitudes)))
+
+        states = jnp.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=DT_SAMPLES)
+        self.assertTrue(jnp.allclose(psi(states), log_amplitudes))
+
 if __name__ == "__main__":
     unittest.main()

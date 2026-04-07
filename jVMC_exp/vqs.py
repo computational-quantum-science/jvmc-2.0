@@ -10,6 +10,7 @@ import collections
 from math import isclose
 from typing import Tuple
 
+from jVMC_exp.nets.fullconfigurationstate import FullConfigurationState
 from jVMC_exp.nets.sym_wrapper import avgFun_Coefficients_Exp, SymNet
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
 from jVMC_exp.util.key_gen import generate_seed, format_key
@@ -380,7 +381,7 @@ class NQS:
             return self._sample(keys, parameters=params, batch_size=self.batchSize)
 
         return None
-    
+ 
     @sharded()
     def _sample(self, keys, *, parameters, batch_size):
         return self.net.apply(parameters, keys, method=self.net.sample)
