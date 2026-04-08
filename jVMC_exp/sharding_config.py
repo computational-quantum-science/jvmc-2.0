@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, AxisType
+from jax.sharding import Mesh, NamedSharding
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import PartitionSpec as P
 from functools import partial, wraps
@@ -12,7 +12,7 @@ if USE_DISTRIBUTED:
     try:
         jax.distributed.initialize()
         num_processes = jax.process_count()
-        num_devices = jax.device_count() 
+        num_devices = jax.device_count()
         print(f"JAX distributed initialized: {num_processes} processes and {num_devices} devices.")
     except Exception as e:
         print(f"Failed to initialize JAX distributed: {e}")
@@ -66,7 +66,7 @@ def distribute(global_size: int, label: str | None=None):
 
     if global_size < total_devices:
         if label is not None:
-            print("WARNING: Number of {label} ({global_size}) is smaller than the total number of devices ({total_devices}).")
+            print(f"WARNING: Number of {label} ({global_size}) is smaller than the total number of devices ({total_devices}).")
             print(f"         Increased to: {total_devices}")
         return total_devices
     if global_size % total_devices != 0:
@@ -133,14 +133,17 @@ class sharded:
             static_kwarg_names=(),
             use_vmap=True, vmap_in_axes=None, # If None, default to (0,) * num_args
             in_specs=None,                    # If None, default to (DEVICE_SPEC,) * num_args
-            out_specs=DEVICE_SPEC
+            out_specs=DEVICE_SPEC,
+            automatic_sharding=False
     ):
         self.static_argnums = static_argnums
         self.static_kwarg_names = set(static_kwarg_names + ('batch_size',))
         self.use_vmap = use_vmap
         self.vmap_in_axes = vmap_in_axes
         self.in_specs = in_specs
+        self.in_sharding = None
         self.out_specs = out_specs
+        self.automatic_sharding = automatic_sharding
         
     def __call__(self, method: Callable[P, R]) -> Callable[P, R]:
         @wraps(method)
@@ -157,6 +160,7 @@ class sharded:
                     if len(self.in_specs) != len(args):
                         raise ValueError(f"in_specs length ({len(self.in_specs)}) must match "
                                          f"number of args ({len(args)})")
+                self.in_sharding = tuple(REPLICATED_SHARDING if REPLICATED_SPEC == s else DEVICE_SHARDING for s in self.in_specs)
                 
                 if self.vmap_in_axes is None:
                     self.vmap_in_axes = (0,) * len(args)
@@ -183,15 +187,20 @@ class sharded:
         Create all versions of the method.
         """
         vmapd_fn = jax.vmap(base_fn, in_axes=(None,) + self.vmap_in_axes) if self.use_vmap else base_fn
-        jsh_fn = jax.jit(
-            jax.shard_map(
-                vmapd_fn, 
-                mesh=MESH, 
-                in_specs=(REPLICATED_SPEC,) + self.in_specs, 
-                out_specs=self.out_specs
-            ),
-            static_argnums=self.static_argnums
-        )
+
+        if self.automatic_sharding:
+            jsh_fn = jax.jit(vmapd_fn, static_argnums=self.static_argnums)
+        else:
+            jsh_fn = jax.jit(
+                jax.shard_map(
+                    vmapd_fn, 
+                    mesh=MESH, 
+                    in_specs=(REPLICATED_SPEC,) + self.in_specs, 
+                    out_specs=self.out_specs
+                ),
+                static_argnums=self.static_argnums
+            )
+
         batched_fn = partial(self._batched_wrapper, jsh_fn=jsh_fn)
         
         return {'single': base_fn, "vmapd": vmapd_fn, 'batched': batched_fn}
@@ -211,8 +220,11 @@ class sharded:
         )
 
         results = []
-        for batch_idx in range(batched_args[0].shape[0]):
-            batch_args = tuple(ba[batch_idx] for ba in batched_args)
+        num_batches = batched_args[0].shape[0]
+        for batch_idx in range(num_batches):
+            batch_args = tuple(
+                jax.device_put(ba[batch_idx], self.in_sharding[arg_idx]) for arg_idx, ba in enumerate(batched_args)
+            )
             results.append(jsh_fn(kwargs, *batch_args))
 
         def stack_reshape_trim(*xs):

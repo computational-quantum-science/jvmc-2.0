@@ -291,7 +291,8 @@ class Evolution(AbstractOptimizer):
 
             pinvEv = self._invEv * regularizer
 
-            self._residual = jnp.linalg.norm((pinvEv * self._ev - jnp.ones_like(pinvEv)) * self._VtF) / F_norm
+            residual = jnp.linalg.norm((pinvEv * self._ev - jnp.ones_like(pinvEv)) * self._VtF) / F_norm
+            self._residual = residual
             self._update = jnp.real(jnp.dot(self._V, (pinvEv * self._VtF)))
             self._pinv_cutoff = max(cutoff, self.pinvCutoff)
 

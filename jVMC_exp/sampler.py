@@ -16,7 +16,53 @@ from jVMC_exp.operator.base import AbstractOperator
 from jVMC_exp.stats import SampledObs
 from jVMC_exp.global_defs import DT_SAMPLES, DT_SAMPLES_CONT
 
-class AbstractMCSampler(ABC):
+class AbstractSampler(ABC):
+    def __init__(self, net: NQS):
+        self._net = net
+        self._samples = None
+        self._logPsi = None
+        self._weights = None
+
+    @property
+    def net(self):
+        return self._net
+    
+    @property
+    def sampleShape(self):
+        return self.net.sampleShape
+    
+    @property
+    def logPsi(self):
+        return self._logPsi
+    
+    @property
+    def weights(self):
+        return self._weights
+    
+    @property
+    def samples(self):
+        if self._samples is None:
+            self.sample()
+
+        return self._samples
+
+    @abstractmethod
+    def sample(self, parameters=None, numSamples=None) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        '''
+        Sample configurations from the distribution defined by the network.
+        
+        Args.:
+            parameters: Optional network parameters to use for sampling. If None, the current network parameters are used.
+            numSamples: Optional number of samples to generate. If None, the default number of samples is used.
+        Returns:
+            A tuple of (configs, logPsi, p), where:
+            - configs: Sampled configurations.
+            - logPsi: Logarithm of the wave function coefficients for the sampled configurations.
+            - p: Normalized probabilities of the sampled configurations.
+        '''
+        pass
+
+class AbstractMCSampler(AbstractSampler):
     """
     A sampler class.
 
@@ -54,10 +100,12 @@ class AbstractMCSampler(ABC):
 
     def __init__(self, net: NQS, updateProposer: None | AbstractProposer, key=None, numChains=32, numSamples=128, 
                  thermalizationSweeps=10, sweepSteps=None, initState=None, mu=2, logProbFactor=0.5):
-        self._net = net
         if (not net.is_generator) and (not isinstance(updateProposer, AbstractProposer)):
             raise RuntimeError("Instantiation of MCSampler: `updateProposer` is `None` and cannot be used for MCMC sampling." \
                                 "'updateProposer' must be an instance of 'jVMC.propose.AbstractProposer'.")
+        
+        super().__init__(net)
+
         self.orbit = None
         if isinstance(self.net.net, SymNet):
             self.orbit = self.net.net.orbit.orbit
@@ -88,9 +136,6 @@ class AbstractMCSampler(ABC):
         self.numChains = numChains
 
         self.sampler_net, _ = self.net.get_sampler_net()
-        self._samples = None
-        self._logPsi = None
-        self._weights = None
 
     @property
     def thermalizationSweeps(self):
@@ -109,10 +154,6 @@ class AbstractMCSampler(ABC):
     def sweepSteps(self, value):
         self._sweepSteps = value
         self._get_samples_jsh = {}
-
-    @property
-    def sampleShape(self):
-        return self.net.sampleShape
 
     @property
     def updateProposer(self):
@@ -137,25 +178,6 @@ class AbstractMCSampler(ABC):
     def key(self, value):
         self._key = format_key(value)
         self._is_state_initialized = False
-
-    @property
-    def net(self):
-        return self._net
-    
-    @property
-    def samples(self):
-        if self._samples is None:
-            self.sample()
-
-        return self._samples
-    
-    @property
-    def logPsi(self):
-        return self._logPsi
-    
-    @property
-    def weights(self):
-        return self._weights
     
     def __call__(
             self, 
@@ -491,7 +513,7 @@ class MCSamplerCont(AbstractMCSampler):
     def _init_state(self):
         return self._init_state_general(self.updateProposer.geometry.uniform_populate, DT_SAMPLES_CONT)
 
-class ExactSampler:
+class ExactSampler(AbstractSampler):
     """
     Class for full enumeration of basis states.
 
@@ -507,7 +529,8 @@ class ExactSampler:
     """
 
     def __init__(self, net: NQS, lDim=2, logProbFactor=0.5):
-        self._net = net
+        super().__init__(net)
+
         self._lDim = lDim
         self._logProbFactor = logProbFactor
         self._lastNorm = 0.
@@ -523,7 +546,7 @@ class ExactSampler:
 
     @property
     def num_sites(self):
-        return jnp.prod(jnp.asarray(self.net.sampleShape))
+        return jnp.prod(jnp.asarray(self.sampleShape))
     
     @property
     def num_states(self):
@@ -544,7 +567,7 @@ class ExactSampler:
     @cached_property
     def basis(self):
         adjusted_dof = distribute(self.num_states)
-        int_repr = jax.device_put(jnp.arange(adjusted_dof), DEVICE_SHARDING)
+        int_repr = jax.device_put(jnp.arange(adjusted_dof, dtype=DT_SAMPLES), DEVICE_SHARDING)
 
         def get_basis(int_repr, n_sites):
             def make_state(int_repr, n_sites):
@@ -590,5 +613,9 @@ class ExactSampler:
 
         if parameters is not None:
             self.net.parameters = parameters_tmp
+
+        self._samples = self.basis
+        self._logPsi = logPsi
+        self._weights = p
 
         return self.basis, logPsi, p 

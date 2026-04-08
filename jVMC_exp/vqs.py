@@ -10,12 +10,11 @@ import collections
 from math import isclose
 from typing import Tuple
 
-from jVMC_exp.nets.fullconfigurationstate import FullConfigurationState
 from jVMC_exp.nets.sym_wrapper import avgFun_Coefficients_Exp, SymNet
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
 from jVMC_exp.util.key_gen import generate_seed, format_key
-from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING, REPLICATED_SPEC
-from jVMC_exp.sharding_config import distribute, broadcast_split_key, sharded
+from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
+from jVMC_exp.sharding_config import broadcast_split_key, sharded
 
 def flat_gradient_real(fun, params, arg):
     """
@@ -324,7 +323,7 @@ class NQS:
         """
         return self._gradients_sh(s, parameters=self.parameters, batch_size=self.batchSize)
     
-    @sharded()
+    @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_sh(self, s, *, parameters, batch_size):
         return self.flat_gradient_function(self.apply_fun, parameters, s)
     
@@ -335,7 +334,7 @@ class NQS:
             return self._append_gradients_dict_jsh(result, result)
         return result
     
-    @sharded()
+    @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_dict_sh(self, s, *, parameters, batch_size):
         return self.dict_gradient_function(self.apply_fun, parameters, s)
 
@@ -344,7 +343,7 @@ class NQS:
         start = 0
         P = jnp.arange(2 * self.numParameters)
         for s in self.paramShapes:
-            # Here we need to add the treatment for the complex non-holomorphic case
+            # TODO: Here we need to add the treatment for the complex non-holomorphic case
             if self.holomorphic:
                 PTreeShape.append((P[start:start + 2 * s[0]]))
                 start += 2 * s[0]
@@ -381,7 +380,7 @@ class NQS:
             return self._sample(keys, parameters=params, batch_size=self.batchSize)
 
         return None
- 
+    
     @sharded()
     def _sample(self, keys, *, parameters, batch_size):
         return self.net.apply(parameters, keys, method=self.net.sample)
