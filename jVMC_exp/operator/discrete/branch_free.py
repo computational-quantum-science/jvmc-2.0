@@ -1,24 +1,15 @@
 from abc import abstractmethod
-import warnings
 import jax.numpy as jnp
 import inspect
 import jax
 
 from jVMC_exp.operator.discrete.base import Operator as BaseOperator
-from jVMC_exp.operator.base import AbstractOperator
 from jVMC_exp.global_defs import DT_OPERATORS_CPX
 from jVMC_exp.sharding_config import MESH
-from jVMC_exp.stats import SampledObs
 
 def _has_kwargs(fun):
     sig = inspect.signature(fun)
     return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
-
-
-def _weighted_mean(values, weights):
-    """Return the weighted sample mean as a scalar when possible."""
-    mean = SampledObs(values, weights).mean
-    return jnp.squeeze(mean)
 
 class OperatorString(list):
     """
@@ -42,6 +33,7 @@ class Operator(BaseOperator):
         self._idx = idx
         self._diag = diag
         self._fermionic = fermionic
+        self._site_ldim = {idx: ldim} if ldim is not None else {}
         super().__init__(ldim)
 
     @property
@@ -130,9 +122,10 @@ class Operator(BaseOperator):
     def _compile(self):
         strings = self._get_list_of_strings()
         max_length = max(len(s) for s in strings)
+        max_ldim = max(self._site_ldim.values())
         
         # Create identity operator for padding
-        IdOp = IdentityOperator(self.ldim, 0)
+        IdOp = IdentityOperator(max_ldim, 0)
         
         idxC = []
         mapC = []
@@ -154,8 +147,8 @@ class Operator(BaseOperator):
                 if k_rev >= 0:
                     op = op_string[k_rev]
                     idx_row.append(op.idx)
-                    map_row.append(op.map)
-                    matels_row.append(op.mat_els)
+                    map_row.append(jnp.pad(op.map, (0, max_ldim - op.ldim)))
+                    matels_row.append(jnp.pad(op.mat_els, (0, max_ldim - op.ldim)))
                     fermionic_row.append(1.0 if op.fermionic else 0.0)
                     d *= op.diag
                 else:
@@ -226,10 +219,13 @@ class Operator(BaseOperator):
     
 class CompositeOperator(Operator):
     def __init__(self, O_1: Operator, O_2: Operator, label: str):
-        if O_1.ldim != O_2.ldim:
-            raise ValueError(f'The {label} is implemented only for operators with the same local dimension')
-        super().__init__(O_1.ldim, None, None, None)
+        for site in O_1._site_ldim.keys():
+            if (site in O_2._site_ldim.keys()) and (O_1._site_ldim[site] != O_2._site_ldim[site]):
+                raise ValueError(f"Can't combine two operators with different local dimensions. "
+                                 f"Got ldim={O_1._site_ldim[site]} and ldim={O_2._site_ldim[site]} at site {site}")
+        super().__init__(None, None, None, None)
 
+        self._site_ldim = {**O_1._site_ldim, **O_2._site_ldim}
         self.O_1 = O_1
         self.O_2 = O_2
         self._label = label
@@ -247,7 +243,8 @@ class ScaledOperator(Operator):
         if callable(scalar) and (not _has_kwargs(scalar)):
             raise ValueError('Any callable that multiplies an operator has to have **kwargs in its argument.')
 
-        super().__init__(O.ldim, None, None, None)
+        super().__init__(None, None, None, None)
+        self._site_ldim = O._site_ldim
         self.scalar = scalar
         self.O = O
 
@@ -313,7 +310,7 @@ class SigmaY(Operator):
 
     @property
     def mat_els(self):
-        return jnp.array([-1j, 1j], dtype=DT_OPERATORS_CPX)
+        return jnp.array([1j, -1j], dtype=DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -358,282 +355,3 @@ class Creation(_Creation):
 class Annihilation(_Annihilation):
     def __init__(self, idx):
         super().__init__(idx, True)
-
-
-class MovingAverage:
-    """Simple moving average used for the adaptive control-variate coefficient."""
-
-    def __init__(self, width=10, init=0.0):
-        self.values = jnp.full((width,), init)
-
-    def update(self, value):
-        self.values = jnp.roll(self.values, -1)
-        self.values = self.values.at[-1].set(value)
-        return jnp.mean(self.values)
-
-
-class Infidelity(AbstractOperator):
-    r"""Monte Carlo estimator of the wave-function infidelity.
-
-    This operator implements the infidelity functional between a reference state
-    :math:`\chi` and a trial state :math:`\psi`,
-
-    .. math::
-
-        \mathcal{I}(\psi, \chi) = 1 - \langle F^\psi_{\mathrm{loc}} \rangle_\Psi
-        \langle F^\chi_{\mathrm{loc}} \rangle_\Chi,
-
-    where the local estimators are constructed from ratios of amplitudes of the
-    two states, optionally dressed by an additional operator kernel and its
-    conjugate. The implementation supports the control-variate estimators used
-    in infidelity minimization workflows.
-
-    Args:
-        chi: Reference variational state.
-        chiSampler: Sampler associated with ``chi``.
-        Operator: Operator applied in the ``\psi \rightarrow \chi`` overlap.
-            Defaults to the identity on a single local degree of freedom.
-        ConjugatedOperator: Conjugate operator applied in the
-            ``\chi \rightarrow \psi`` overlap. If omitted, ``Operator`` is
-            assumed Hermitian and reused.
-        getCV: Whether to include the fixed control-variate estimator.
-        adaptCV: Whether to adapt the control-variate coefficient during the
-            optimization. Enabling this also enables ``getCV``.
-        MovingAverageWidth: Window size for the moving average used in the
-            adaptive control-variate coefficient.
-        lDim: Local Hilbert-space dimension used for the default identity
-            operator.
-
-    Notes:
-        Control variates are only meaningful when the applied operator and its
-        conjugate are both provided explicitly. If only ``Operator`` is given,
-        the implementation assumes Hermiticity and disables control variates.
-    """
-
-    def __init__(
-        self,
-        chi,
-        chiSampler,
-        Operator=None,
-        ConjugatedOperator=None,
-        getCV=False,
-        adaptCV=False,
-        MovingAverageWidth=1,
-        lDim=2,
-    ):
-        self.chi = chi
-        self.chiSampler = chiSampler
-
-        self.CVc = -0.5
-        self.getCV = getCV
-        self.adaptCV = adaptCV
-
-        if self.adaptCV and not self.getCV:
-            warnings.warn(
-                "adaptCV=True requires getCV=True. Enabling getCV automatically.",
-                stacklevel=2,
-            )
-            self.getCV = True
-
-        self.rmean = MovingAverage(MovingAverageWidth)
-
-        self.adaptCV_funcs = [
-            lambda x: x,
-            lambda x: jnp.abs(x) ** 2,
-            lambda x: jnp.abs(x) ** 4,
-            lambda x: x * (jnp.abs(x) ** 2),
-        ]
-        self.getCV_funcs = [
-            lambda x: x,
-            lambda x: jnp.abs(x) ** 2,
-        ]
-
-        self.chi_s, self.chi_logChi, self.chi_p = self.chiSampler.sample()
-
-        self.OperatorKernel = Operator if Operator is not None else IdentityOperator(lDim, 0)
-
-        if ConjugatedOperator is None:
-            if Operator is not None:
-                warnings.warn(
-                    "No ConjugatedOperator provided; assuming Operator is Hermitian.",
-                    stacklevel=2,
-                )
-                if self.getCV or self.adaptCV:
-                    warnings.warn(
-                        "Control variates are disabled when the operator is assumed Hermitian.",
-                        stacklevel=2,
-                    )
-                    self.getCV = False
-                    self.adaptCV = False
-            self.ConjugatedOperatorKernel = self.OperatorKernel
-        else:
-            self.ConjugatedOperatorKernel = ConjugatedOperator
-
-        self._reset_cached_observables()
-
-    def _reset_cached_observables(self):
-        self.chi_Floc = None
-        self.chi_FlocCV = None
-        self.chi_F2locCV = None
-        self.chi_Floc2FlocCV = None
-        self.Exp_chi_Floc = None
-        self.Exp_chi_FlocCV = None
-
-        self.psi_Floc = None
-        self.psi_FlocCV = None
-        self.psi_F2locCV = None
-        self.psi_Floc2FlocCV = None
-        self.sp = None
-        self._varF2 = None
-
-    def get_FP_loc(self, psi, sample_chi=True):
-        r"""Evaluate the local reference estimator :math:`F^\chi_{\rm loc}`.
-
-        Args:
-            psi: Trial variational state.
-            sample_chi: Whether to resample the reference state ``chi`` before
-                computing the estimator.
-
-        Returns:
-            A tuple ``(F_loc, mean_F)`` containing the local estimator evaluated
-            on the ``chi`` samples and its weighted mean.
-        """
-        if sample_chi:
-            self.chi_s, self.chi_logChi, self.chi_p = self.chiSampler.sample()
-
-        Oloc = self.ConjugatedOperatorKernel.get_O_loc(
-            self.chi_s,
-            psi,
-            logPsiS=self.chi_logChi,
-        )
-
-        if self.adaptCV:
-            Oloc_set = [f(Oloc) for f in self.adaptCV_funcs]
-            self.chi_Floc, self.chi_FlocCV, self.chi_F2locCV, self.chi_Floc2FlocCV = Oloc_set
-            self.Exp_chi_FlocCV = _weighted_mean(self.chi_FlocCV, self.chi_p)
-            self.Exp_chi_Floc = _weighted_mean(self.chi_Floc, self.chi_p)
-        elif self.getCV:
-            Oloc_set = [f(Oloc) for f in self.getCV_funcs]
-            self.chi_Floc, self.chi_FlocCV = Oloc_set
-            self.Exp_chi_FlocCV = _weighted_mean(self.chi_FlocCV, self.chi_p)
-            self.Exp_chi_Floc = _weighted_mean(self.chi_Floc, self.chi_p)
-        else:
-            self.chi_Floc = Oloc
-            self.Exp_chi_Floc = _weighted_mean(self.chi_Floc, self.chi_p)
-
-        return self.chi_Floc, self.Exp_chi_Floc
-
-    def get_gradient(self, psi, psi_p, getCVgrad=False, CVscale=1.0):
-        r"""Compute the infidelity gradient with respect to ``psi``.
-
-        Args:
-            psi: Trial variational state.
-            psi_p: Born probabilities associated with the sampled configurations
-                stored from the last :meth:`get_O_loc` call.
-            getCVgrad: Present for API compatibility. Control-variate gradients
-                are currently not included.
-            CVscale: Present for API compatibility. Unused.
-
-        Returns:
-            A tuple ``(gradient, sampled_gradients)`` where ``gradient`` is the
-            infidelity gradient and ``sampled_gradients`` contains the log-wave
-            function derivatives as :class:`~jVMC_exp.stats.SampledObs`.
-
-        Raises:
-            RuntimeError: If :meth:`get_O_loc` has not been called beforehand.
-        """
-        del getCVgrad, CVscale
-
-        if self.sp is None or self.psi_Floc is None or self.Exp_chi_Floc is None:
-            raise RuntimeError("Call get_O_loc before requesting the gradient.")
-
-        Opsi = psi.gradients(self.sp)
-        grads = SampledObs(Opsi, psi_p)
-        Floc = SampledObs(self.psi_Floc, psi_p)
-        grad = 2.0 * grads.get_covar(Floc) * self.Exp_chi_Floc
-
-        return -jnp.squeeze(grad), grads
-
-    def get_O_loc(self, samples, psi, logPsiS=None, psi_p=None, sample_chi=True, **kwargs):
-        r"""Compute the local infidelity estimator on ``samples``.
-
-        Args:
-            samples: Sampled computational-basis configurations.
-            psi: Trial variational state.
-            logPsiS: Optional logarithmic amplitudes :math:`\log \psi(s)`.
-                They are computed from ``psi`` when omitted.
-            psi_p: Born probabilities of ``samples``. Required when
-                ``adaptCV=True``.
-            sample_chi: Whether to resample the reference state before updating
-                the cached :math:`F^\chi` estimator.
-            **kwargs: Optional estimator parameters. Currently only ``CVc`` is
-                used to override the adaptive control-variate coefficient.
-
-        Returns:
-            The local infidelity estimator
-            :math:`1 - F^\psi_{\rm loc}(s) \langle F^\chi_{\rm loc} \rangle`.
-        """
-        self.get_FP_loc(psi, sample_chi=sample_chi)
-
-        if logPsiS is None:
-            logPsiS = psi(samples)
-
-        Oloc = self.OperatorKernel.get_O_loc(
-            samples,
-            self.chi,
-            logPsiS=logPsiS,
-        )
-
-        self.sp = samples
-
-        if self.adaptCV:
-            if psi_p is None:
-                raise ValueError("psi_p is required when adaptCV=True.")
-
-            Oloc_set = [f(Oloc) for f in self.adaptCV_funcs]
-            self.psi_Floc, self.psi_FlocCV, self.psi_F2locCV, self.psi_Floc2FlocCV = Oloc_set
-            self._get_CVc(psi_p)
-            CVc = kwargs.get("CVc", self.CVc)
-
-            return 1.0 - self.psi_Floc * self.Exp_chi_Floc - CVc * (
-                self.psi_FlocCV * self.Exp_chi_FlocCV - 1.0
-            )
-
-        if self.getCV:
-            Oloc_set = [f(Oloc) for f in self.getCV_funcs]
-            self.psi_Floc, self.psi_FlocCV = Oloc_set
-
-            return 1.0 - self.psi_Floc * self.Exp_chi_Floc - self.CVc * (
-                self.psi_FlocCV * self.Exp_chi_FlocCV - 1.0
-            )
-
-        self.psi_Floc = Oloc
-        return 1.0 - self.psi_Floc * self.Exp_chi_Floc
-
-    def _get_CVc(self, psi_p):
-        r"""Update the adaptive control-variate coefficient.
-
-        The coefficient is estimated from the covariance of the fidelity and its
-        squared magnitude according to the control-variate construction used in
-        infidelity minimization.
-        """
-        covarFF2 = _weighted_mean(self.chi_Floc2FlocCV, self.chi_p) * _weighted_mean(
-            self.psi_Floc2FlocCV, psi_p
-        )
-        Exp_psi_FlocCV = _weighted_mean(self.psi_FlocCV, psi_p)
-        Exp_psi_Floc = _weighted_mean(self.psi_Floc, psi_p)
-
-        covarFF2 -= (
-            self.Exp_chi_FlocCV
-            * self.Exp_chi_Floc
-            * Exp_psi_FlocCV
-            * Exp_psi_Floc
-        )
-
-        varF2 = _weighted_mean(self.chi_F2locCV, self.chi_p) * _weighted_mean(
-            self.psi_F2locCV, psi_p
-        )
-        varF2 -= (self.Exp_chi_FlocCV * Exp_psi_FlocCV) ** 2
-
-        self._varF2 = varF2
-        self.CVc = self.rmean.update(-jnp.abs(jnp.real(covarFF2) / jnp.real(varF2)))
