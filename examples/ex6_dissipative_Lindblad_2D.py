@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import jax
-import jVMC
+import jVMC_exp
 jax.config.update("jax_enable_x64", True)
 from functools import partial
 
@@ -31,7 +31,7 @@ dim = "2D"
 
 # Initialize net
 sample_shape = (L, L)
-psi = jVMC.util.util.init_net({"batch_size": 5000, "net1": {"type": "RNN2D",
+psi = jVMC_exp.util.util.init_net({"batch_size": 5000, "net1": {"type": "RNN2D",
                                         "translation": True,
                                         "parameters": {"inputDim": 4, "logProbFactor": 1, "hiddenSize": 5, "L": L, "depth": 2, "cell": "RNN",
                                                        "realValuedOutput": True,
@@ -41,8 +41,8 @@ print(f"The variational ansatz has {psi.numParameters} parameters.")
 
 # Set up hamiltonian
 system_data = {"dim": dim, "L": L}
-povm = jVMC.operator.POVM(system_data)
-Lindbladian = jVMC.operator.POVMOperator(povm)
+povm = jVMC_exp.operator.POVM(system_data)
+Lindbladian = jVMC_exp.operator.POVMOperator(povm)
 for x in range(L):
     for y in range(L):
         Lindbladian.add({"name": "ZZ", "strength": 1.0, "sites": (xy_to_id(x, y, L), xy_to_id((x + 1) % L, y, L))})
@@ -51,7 +51,7 @@ for x in range(L):
         Lindbladian.add({"name": "dephasing", "strength": .5, "sites": (xy_to_id(x, y, L),)})
 
 # Set up initial state as product state
-prob_dist = jVMC.operator.povm.get_1_particle_distributions("z_up", Lindbladian.povm)
+prob_dist = jVMC_exp.operator.povm.get_1_particle_distributions("z_up", Lindbladian.povm)
 prob_dist /= prob_dist[0]
 biases = jnp.log(prob_dist[1:])
 params = copy_dict(psi._param_unflatten(psi.get_parameters()))
@@ -63,15 +63,15 @@ params = jnp.concatenate([p.ravel()
 psi.set_parameters(params)
 
 # Set up sampler
-sampler = jVMC.sampler.ExactSampler(psi, sample_shape, lDim=inputDim, logProbFactor=logProbFactor)
+sampler = jVMC_exp.sampler.ExactSampler(psi, sample_shape, lDim=inputDim, logProbFactor=logProbFactor)
 # sampler = jVMC.sampler.MCSampler(psi, sample_shape, random.PRNGKey(123), updateProposer=jVMC.sampler.propose_POVM_outcome, numSamples=1000)
 
 
 # Set up TDVP
-tdvpEquation = jVMC.util.tdvp.TDVP(sampler, rhsPrefactor=-1.,
+tdvpEquation = jVMC_exp.util.tdvp.TDVP(sampler, rhsPrefactor=-1.,
                                    svdTol=1e-6, diagonalShift=0, makeReal='real')
 
-stepper = jVMC.util.stepper.AdaptiveHeun(timeStep=1e-3, tol=1e-2)  # ODE integrator
+stepper = jVMC_exp.util.stepper.AdaptiveHeun(timeStep=1e-3, tol=1e-2)  # ODE integrator
 
 res = {"X": [], "Y": [], "Z": [], "X_corr_L1": [],
        "Y_corr_L1": [], "Z_corr_L1": []}
@@ -81,7 +81,7 @@ t = 0
 
 while t < 5 * 1e-0:
     times.append(t)
-    result = jVMC.operator.povm.measure_povm(Lindbladian.povm, sampler)
+    result = jVMC_exp.operator.povm.measure_povm(Lindbladian.povm, sampler)
     for dim in ["X", "Y", "Z"]:
         res[dim].append(result[dim]["mean"])
         res[dim + "_corr_L1"].append(result[dim + "_corr_L1"]["mean"])

@@ -7,9 +7,9 @@ import numpy as np
 
 import time
 
-import jVMC
-from jVMC.util import measure
-import jVMC.operator as op
+import jVMC_exp
+from jVMC_exp.util import measure
+import jVMC_exp.operator as op
 
 import matplotlib.pyplot as plt
 
@@ -23,12 +23,12 @@ integratorTol = 1e-4  # Adaptive integrator tolerance
 tmax = 2  # Final time
 
 # Set up variational wave function
-net = jVMC.nets.CpxRBM(numHidden=10, bias=True)
+net = jVMC_exp.nets.CpxRBM(numHidden=10, bias=True)
 
-psi = jVMC.vqs.NQS(net, seed=1234)  # Variational wave function
+psi = jVMC_exp.vqs.NQS(net, seed=1234)  # Variational wave function
 
 # Set up hamiltonian
-hamiltonian = jVMC.operator.BranchFreeOperator()
+hamiltonian = jVMC_exp.operator.BranchFreeOperator()
 for l in range(L):
     hamiltonian.add(op.scal_opstr(-1., (op.Sz(l), op.Sz((l + 1) % L))))
     hamiltonian.add(op.scal_opstr(g, (op.Sx(l), )))
@@ -37,24 +37,24 @@ for l in range(L):
 # Set up observables
 observables = {
     "energy": hamiltonian,
-    "X": jVMC.operator.BranchFreeOperator(),
+    "X": jVMC_exp.operator.BranchFreeOperator(),
 }
 for l in range(L):
     observables["X"].add(op.scal_opstr(1. / L, (op.Sx(l), )))
 
 sampler = None
 # Set up exact sampler
-sampler = jVMC.sampler.ExactSampler(psi, L)
+sampler = jVMC_exp.sampler.ExactSampler(psi, L)
 
 # Set up TDVP
-tdvpEquation = jVMC.util.tdvp.TDVP(sampler, pinvTol=1e-8,
+tdvpEquation = jVMC_exp.util.tdvp.TDVP(sampler, pinvTol=1e-8,
                                    rhsPrefactor=1.j,
                                    makeReal='imag')
 
 t = 0.0  # Initial time
 
 # Set up stepper
-stepper = jVMC.util.stepper.AdaptiveHeun(timeStep=dt, tol=integratorTol)
+stepper = jVMC_exp.util.stepper.AdaptiveHeun(timeStep=dt, tol=integratorTol)
 
 # Measure initial observables
 obs = measure(observables, psi, sampler)

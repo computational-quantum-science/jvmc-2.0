@@ -33,3 +33,22 @@ class CoulombInteraction(Operator):
 
     def _get_O_loc(self, s, apply_fun, parameters, kwargs):
         return jnp.sum(self._interaction_charge / self.geometry.get_absolute_distance(s))
+    
+class ParticleDensity(Operator):
+    def __init__(self, geometry, linear_partition=(10, 10)):
+        if not hasattr(geometry, 'count_particles_in_cell'):
+            raise ValueError('For the particle density operator to work the given geometry ' \
+                            'has to implement the method "count_particle_in_cell"')
+
+        super().__init__(geometry, True)
+        self._count_fn = lambda x: geometry.count_particles_in_cell(x, linear_partition)
+
+    def _get_O_loc(self, s, apply_fun, parameters, kwargs):
+        return self._count_fn(s)
+    
+class Monopole(Operator):
+    def __init__(self, geometry):
+        super().__init__(geometry, True)
+
+    def _get_O_loc(self, s, apply_fun, parameters, kwargs):
+        return jnp.sum(s**2)

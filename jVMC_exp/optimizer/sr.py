@@ -1,13 +1,12 @@
-from jVMC_exp.optimizer.base import Evolution
+from .base import Evolution
+from jVMC_exp.solver.pinv_snr import PinvSNR
 
 class SR(Evolution):
     def __init__(
-            self, sampler, psi, stepper, 
-            output_manager=None, use_cross_valiadation=False, diagonalizeOnDevice=True, 
-            snrTol=2, pinvTol=1e-14, pinvCutoff=1e-8, diagonalShift=0.001
+            self, sampler, psi, 
+            use_cross_valiadation=False, diagonalShift=0.001, solver=PinvSNR()
         ):
         super().__init__(
-            sampler, psi, stepper, True, True, 
-            output_manager, use_cross_valiadation, diagonalizeOnDevice, 
-            snrTol, pinvTol, pinvCutoff, diagonalShift
+            sampler, psi, True, True, 
+            use_cross_valiadation, diagonalShift, solver
         )

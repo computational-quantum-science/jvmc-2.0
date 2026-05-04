@@ -7,8 +7,8 @@ import jax.random as random
 import jax.numpy as jnp
 import numpy as np
 
-import jVMC
-from jVMC.util.symmetries import LatticeSymmetry
+import jVMC_exp
+from jVMC_exp.util.symmetries import LatticeSymmetry
 
 L = 50
 g = -0.7
@@ -16,38 +16,38 @@ g = -0.7
 # Initialize net
 # net = jVMC.nets.CpxCNN(F=[15,], channels=[100], bias=False)
 orbit = LatticeSymmetry(jnp.array([jnp.roll(jnp.identity(L, dtype=np.int32), l, axis=1) for l in range(L)]))
-net = jVMC.nets.RNNsym(orbit=orbit, hiddenSize=15, L=L, depth=5)
+net = jVMC_exp.nets.RNNsym(orbit=orbit, hiddenSize=15, L=L, depth=5)
 
-psi = jVMC.vqs.NQS(net, batchSize=500, seed=1234)  # Variational wave function
+psi = jVMC_exp.vqs.NQS(net, batchSize=500, seed=1234)  # Variational wave function
 print(f"The variational ansatz has {psi.numParameters} parameters.")
 
 # Set up hamiltonian
-hamiltonian = jVMC.operator.BranchFreeOperator()
+hamiltonian = jVMC_exp.operator.BranchFreeOperator()
 for l in range(L):
-    hamiltonian.add(jVMC.operator.scal_opstr(-1., (jVMC.operator.Sz(l), jVMC.operator.Sz((l + 1) % L))))
-    hamiltonian.add(jVMC.operator.scal_opstr(g, (jVMC.operator.Sx(l), )))
+    hamiltonian.add(jVMC_exp.operator.scal_opstr(-1., (jVMC_exp.operator.Sz(l), jVMC_exp.operator.Sz((l + 1) % L))))
+    hamiltonian.add(jVMC_exp.operator.scal_opstr(g, (jVMC_exp.operator.Sx(l), )))
 
 # Set up sampler
-sampler = jVMC.sampler.MCSampler(psi, (L,), random.PRNGKey(4321), updateProposer=jVMC.sampler.propose_spin_flip_Z2,
+sampler = jVMC_exp.sampler.MCSampler(psi, (L,), random.PRNGKey(4321), updateProposer=jVMC_exp.sampler.propose_spin_flip_Z2,
                                  numChains=50, sweepSteps=L,
                                  numSamples=300000, thermalizationSweeps=0)
 
 # Set up TDVP
-tdvpEquation = jVMC.util.tdvp.TDVP(sampler, rhsPrefactor=1.,
+tdvpEquation = jVMC_exp.util.tdvp.TDVP(sampler, rhsPrefactor=1.,
                                    svdTol=1e-8, diagonalShift=10, makeReal='real')
 
-stepper = jVMC.util.stepper.Euler(timeStep=1e-2)  # ODE integrator
+stepper = jVMC_exp.util.stepper.Euler(timeStep=1e-2)  # ODE integrator
 
 # Set up OutputManager
 wdir = "./benchmarks/"
-if jVMC.mpi_wrapper.rank == 0:
+if jVMC_exp.mpi_wrapper.rank == 0:
     try:
         os.makedirs(wdir)
     except OSError:
         print("Creation of the directory %s failed" % wdir)
     else:
         print("Successfully created the directory %s " % wdir)
-outp = jVMC.util.OutputManager("./benchmarks/data.hdf5", append=False)
+outp = jVMC_exp.util.OutputManager("./benchmarks/data.hdf5", append=False)
 
 res = []
 for n in range(3):

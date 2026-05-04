@@ -50,6 +50,19 @@ def _apply_and_project(data, apply_fn, projection):
 def _get_tangent_kernel(norm_data):
     return jnp.matmul(norm_data, jnp.conj(jnp.transpose(norm_data)))
 
+@jax.jit(static_argnums=(1, 2))
+@partial(jax.vmap, in_axes=(0, None, None))
+def _get_autocorrelation_time(x, c, dim):
+    fft = jnp.abs(jnp.fft.fft(x - jnp.mean(x), n=dim))
+    correlation = jnp.fft.ifft(fft ** 2)[:x.size].real
+    correlation = correlation / correlation[0]
+    tau = 2 * jnp.cumsum(correlation) - 1
+
+    m = jnp.arange(len(tau)) < c * tau
+    window = jax.lax.cond(jnp.any(m), lambda: jnp.argmin(m), lambda: len(tau) - 1)
+
+    return tau[window]
+
 class SampledObs():
     def __init__(self, observations, weights=None):
         """
@@ -160,7 +173,42 @@ class SampledObs():
         covar_per_sample = _get_covar_per_sample(self._centered_obs, other._centered_obs)
 
         return SampledObs(covar_per_sample, self.weights)
+    
+    def get_R_hat(self, n_chains):
+        """
+        Compute the Gelman-Rubin R-hat convergence diagnostic.
 
+        The samples are split into `n_chains` equal-length chains and the
+        between-chain and within-chain variances are compared. If the chains
+        have converged to the same distribution, R-hat will be close to 1.
+        Convergence is typically assumed when R-hat < 1.01.
+
+        Args:
+            n_chains : int
+                Number of chains 
+        """
+        if self._num_obs != 1:
+            raise NotImplementedError
+
+        chain_length = self._num_samples // n_chains
+        chain_obs = SampledObs(self.observations.reshape((n_chains, chain_length)).T)
+
+        B = jnp.sum((chain_obs.mean.real - self.mean.real)**2) / (n_chains - 1)
+        W = jnp.mean(chain_obs.var) 
+        
+        return jnp.sqrt(((chain_length - 1) / chain_length * W + B) / W)
+    
+    def get_autocorrelation_time(self, n_chains, c=5) -> SampledObs:
+        if self._num_obs != 1:
+            raise NotImplementedError
+
+        chain_length = self._num_samples // n_chains
+        obs = self.observations.reshape((n_chains, chain_length))
+        z = obs - jnp.mean(obs, axis=-1)[:, None]
+        dim = int(jnp.ceil(jnp.log2(chain_length)))
+        
+        return SampledObs(_get_autocorrelation_time(z, c, dim))
+    
     def transform(self, element_wise_fn=lambda x: x, linear_map=None) -> SampledObs:
         """
         Apply a transformation to observations and return a new SampledObs.
@@ -206,5 +254,3 @@ class SampledObs():
         new_weights = self.weights[sl]
 
         return SampledObs(self.observations[sl], new_weights / jnp.sum(new_weights))
-
-

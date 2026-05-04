@@ -1,23 +1,18 @@
 import jax
 import jax.numpy as jnp
-import numpy as np
 from abc import ABC, abstractmethod
-import warnings
 import tqdm
 from typing import Dict
-import os
 
 from jVMC_exp.stats import SampledObs
 from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler import AbstractMCSampler, ExactSampler
 from jVMC_exp.util.output_manager import OutputManager
-from jVMC_exp.operator.base import AbstractOperator
-from jVMC_exp.optimizer.stepper import AbstractStepper, Euler
+from jVMC_exp.stepper import AbstractStepper, Euler
 from jVMC_exp.util import ObservableEntry, measure
-
-def _eigh_numpy(S):
-    e, V = np.linalg.eigh(np.array(S))
-    return jnp.array(e), jnp.array(V)
+from jVMC_exp.solver.base import AbstractSolver, SolverState
+from jVMC_exp.solver.pinv_snr import PinvSNR
+from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
 
 @jax.jit 
 def real_fn(x):
@@ -28,21 +23,19 @@ def imag_fn(x):
     return 1j * jnp.imag(x)
 
 class AbstractOptimizer(ABC):
-    def __init__(
-            self, sampler:AbstractMCSampler, psi: NQS, stepper: AbstractStepper, 
-            output_manager: None | OutputManager=None, use_cross_valiadation: bool=False
-        ):
+    def __init__(self, sampler:AbstractMCSampler, psi: NQS, use_cross_valiadation: bool=False):
         self._sampler = sampler
         self._psi = psi
-        self._stepper = stepper
-        self._output_manager = output_manager
         self.use_cross_valiadation = use_cross_valiadation
         self.meta_data = {}
+        self._output_manager = OutputManager()
+        self.o_loc = None
+        self._elapsed = 0
 
     @property
     def output_manager(self):
         return self._output_manager
-    
+
     @property
     def sampler(self):
         return self._sampler
@@ -51,7 +44,10 @@ class AbstractOptimizer(ABC):
     def psi(self):
         return self._psi
     
-    def __call__(self, parameters, t, *, hamiltonian: AbstractOperator, numSamples=None, intStep=None):
+    def __call__(
+            self, parameters, t, *, numSamples=None, intStep=None,
+            objective_function: AbstractObjectiveFunction, **objective_function_kwargs
+    ):
         """ 
         Arguments:
             * ``parameters``: Parameters of the NQS.
@@ -68,132 +64,133 @@ class AbstractOptimizer(ABC):
         """
         tmp_parameters = self.psi.parameters
         self.psi.parameters = parameters
-
-        def start_timing(name):
-            if self.output_manager is not None:
-                self.output_manager.start_timing(name)
-
-        def stop_timing(name, waitFor=None):
-            if self.output_manager is not None:
-                if waitFor is not None:
-                    waitFor.block_until_ready()
-                self.output_manager.stop_timing(name)
+        self._elapsed = 0
+        
+        def stop_timing(name, wait_for=None):
+            if wait_for is not None:
+                jax.block_until_ready(wait_for)
+            return self.output_manager.stop_timing(name)
 
         # Get sample
-        start_timing("sampling")
-        sampleConfigs, sampleLogPsi, p = self.sampler.sample(numSamples=numSamples)
-        stop_timing("sampling", waitFor=sampleConfigs)
+        self.output_manager.start_timing("sampling")
+        samples, _, _ = self.sampler.sample(numSamples=numSamples)
+        self._elapsed += stop_timing("sampling", wait_for=samples)
 
-        # Evaluate local energy
-        start_timing("compute Eloc")
-        Eloc = hamiltonian.get_O_loc(sampleConfigs, self.psi, LogPsiS=sampleLogPsi, t=t)
-        stop_timing("compute Eloc", waitFor=Eloc)
-        self.Eloc = SampledObs(Eloc, p)
+        # Evaluate local observables and their gradient 
+        self.output_manager.start_timing("compute objective function and gradient")
+        objective_fn_out = objective_function.value_and_grad(self.sampler, t=t, **objective_function_kwargs)
+        self._elapsed += stop_timing("compute objective function and gradient", wait_for=objective_fn_out.grad_log_psi.observations)
 
-        # Evaluate gradients
-        start_timing("compute gradients")
-        sampleGradients = self.psi.gradients(sampleConfigs)
-        stop_timing("compute gradients", waitFor=sampleGradients)
-        sampleGradients = SampledObs(sampleGradients, p)
-
-        start_timing("solve")
-        update = self.solve(self.Eloc, sampleGradients)
-        stop_timing("solve")
+        # Obtain the update from the gradients
+        self.output_manager.start_timing("solve")
+        update = self.get_update(objective_fn_out)
+        self._elapsed += stop_timing("solve")
 
         self.psi.parameters = tmp_parameters
 
         if intStep is not None:
             if intStep == 0:
-                self.energy = self.Eloc
+                self.o_loc = objective_fn_out.o_loc
                 self._update_meta_data()
 
                 if self.use_cross_valiadation:
-                    self.cross_validation()
+                    self.output_manager.start_timing("cross_validation")
+                    self.cross_validation(objective_fn_out)
+                    self._elapsed += stop_timing("cross_validation")
 
         return update
     
     def ground_state_search(
-            self, 
-            steps, 
-            hamiltonian: AbstractOperator,
-            observables: Dict[str, ObservableEntry] | None = None
+            self,
+            steps,
+            objective_function: AbstractObjectiveFunction,
+            stepper: AbstractStepper = Euler(),
+            observables: Dict[str, ObservableEntry] | None = None,
+            save_meta_data: bool = False,
+            **objective_function_kwargs
         ):
-        if not hasattr(self._stepper, "update_dt"):
+        if not hasattr(stepper, "update_dt"):
             raise ValueError("For ground state search the stepper must " \
                             f"implement a mehod called 'update_dt'")
 
-        output_manager = self.output_manager or OutputManager("_tmp.h5")
-        measures = {}
-
         pbar = tqdm.tqdm(range(steps))
         for n in pbar: 
-            self._stepper.update_dt(n)
-            self.psi.parameters, _ = self.step(hamiltonian)
-            
-            energy = dict(
-                mean = jnp.real(self.energy.mean).item(),
-                variance = jnp.real(self.energy.var).item(),
-                MC_error = jnp.real(self.energy.error_of_mean).item()
+            stepper.update_dt(n)
+            self.psi.parameters, _ = stepper.step(
+                0,
+                self,
+                self.psi.parameters_flat,
+                objective_function=objective_function,
+                **objective_function_kwargs
             )
-            if observables is not None:
-                measures = measure(observables, self.psi, self.sampler)
-            output_manager.write_observables(n, energy=energy, **measures)
+            
+            self._measure_and_store(n, observables, save_meta_data)
 
-            pbar.set_postfix(E=f"{self.energy}")
+            pbar.set_postfix(E=f"{self.o_loc}")
   
-        results = output_manager.to_dict()
-        output_manager.print_timings()
-        if self.output_manager is None:
-            os.remove("_tmp.h5")
-
-        return results['observables']
+        self.output_manager.print_timings()
         
+        if save_meta_data:
+            return self.output_manager.data['observables'], self.output_manager.data['metadata']
+        
+        return self.output_manager.data["observables"]
+
     def time_evolution(
             self,
             t_max,
-            hamiltonian: AbstractOperator,
-            observables: Dict[str, ObservableEntry] | None = None
+            objective_function: AbstractObjectiveFunction,
+            stepper: AbstractStepper = Euler,
+            observables: Dict[str, ObservableEntry] | None = None,
+            save_meta_data: bool = False,
+            **objective_function_kwargs
         ):
-        output_manager = self.output_manager or OutputManager("_tmp.h5")
-        measures = {}
 
         pbar = tqdm.tqdm(total=t_max)
         t = 0
         while t < t_max:
-            self.psi.parameters, dt = self.step(hamiltonian)
-            t += dt
-            energy = dict(
-                mean = jnp.real(self.energy.mean).item(),
-                variance = jnp.real(self.energy.var).item(),
-                MC_error = jnp.real(self.energy.error_of_mean).item()
+            self.psi.parameters, dt = stepper.step(
+                t,
+                self,
+                self.psi.parameters_flat,
+                objective_function=objective_function,
+                **objective_function_kwargs
             )
-            if observables is not None:
-                measures = measure(observables, self.psi, self.sampler)
-            output_manager.write_observables(t, energy=energy, **measures)
 
-            pbar.update(float(dt))
+            dt = float(dt)
+            if t + dt >= t_max:
+                dt = t_max - t
+            t += dt
 
-            # TODO: Decide what to print
-            # pbar.set_postfix(E=f"{self.energy}")
+            self.meta_data['dt'] = dt
+            self._measure_and_store(t, observables, save_meta_data)
 
-        results = output_manager.to_dict()
-        output_manager.print_timings()
-        if self.output_manager is None:
-            os.remove("_tmp.h5")
+            pbar.update(1)
+            pbar.set_postfix({
+                "t": f"{t:.4f}/{t_max}",
+                "dt": f"{dt:.2e}",
+                "ETA": f"{(t_max - t) / dt * self._elapsed:.1f}s",
+                'Progress': f'{int(t / t_max * 100)}%',
+                'E': f"{self.o_loc}",
+            })
 
-        return results['observables']
+        pbar.close()
+        self.output_manager.print_timings()
+
+        if save_meta_data:
+            return self.output_manager.data['observables'], self.output_manager.data['metadata']
         
-    def step(self, hamiltonian: AbstractOperator):
-        """
-        Returns new parameters and new time step (if changed).
-        """
-        return self._stepper.step(0, self, self.psi.parameters_flat, hamiltonian=hamiltonian)
+        return self.output_manager.data["observables"]
 
     @abstractmethod
-    def solve(self, Eloc: SampledObs, gradients: SampledObs):
+    def get_update(self, objective_function_output: ObjectiveFunctionOutput):
         '''
-        Return the update.
+        Return the update and write self.update and self._additional_info
         '''
+        self.update = None
+        self._additional_info = None
+
+    @abstractmethod
+    def cross_validation(self, objective_function_output: ObjectiveFunctionOutput):
         pass
 
     @abstractmethod
@@ -201,127 +198,134 @@ class AbstractOptimizer(ABC):
         '''
         Update the dictionary self.meta_data
         '''
-        pass
+        self.meta_data = {}
 
-    @abstractmethod
-    def cross_validation(self, Eloc: SampledObs, gradients: SampledObs):
-        pass
+    def _measure_and_store(self, t, observables, save_meta_data):
+        measures = {}
+        energy = dict(
+            mean = jnp.real(self.o_loc.mean).item(),
+            variance = jnp.real(self.o_loc.var).item(),
+            MC_error = jnp.real(self.o_loc.error_of_mean).item()
+        )
+
+        if observables is not None:
+            measures = measure(observables, self.sampler)
+        self.output_manager.write_observables(t, energy=energy, **measures)
+
+        if save_meta_data:
+            self.output_manager.write_metadata(t, **self.meta_data)
 
 class Evolution(AbstractOptimizer):
     def __init__(
-            self, sampler, psi, stepper, imag_time: bool, make_real: bool,
-            output_manager=None, use_cross_valiadation=False, diagonalizeOnDevice=True,
-            snrTol=2, pinvTol=1e-14, pinvCutoff=1e-8, diagonalShift=1e-3
+            self, sampler, psi, 
+            imag_time: bool, make_real: bool, use_cross_valiadation: bool=False, 
+            diagonal_shift: float=1e-3, solver: AbstractSolver=PinvSNR()
         ):
-        self.snrTol = snrTol
-        self.pinvTol = pinvTol
-        self.pinvCutoff = pinvCutoff
-        self.diagonalShift = diagonalShift
         self.rhsPrefactor = 1 if imag_time else 1j
-        self.diagonalizeOnDevice = diagonalizeOnDevice
         self._lhs_trans_fn = real_fn if make_real else imag_fn
         self._rhs_trans_fn = lambda x: self._lhs_trans_fn((- self.rhsPrefactor) * x)
+        self.diagonal_shift = diagonal_shift
+        self._solver = solver
+        self._get_lhs = self._get_lhs_dense if solver._needs_dense_matrix else self._get_lhs_lazy
+       
+        super().__init__(sampler, psi, use_cross_valiadation)
 
-        super().__init__(sampler, psi, stepper, output_manager, use_cross_valiadation)
+        self._solver_state = SolverState(
+            covar_grad_o_loc=lambda: self._covar_grad_o_loc,
+            rhs_trans_fn=self._rhs_trans_fn,
+            exact_sampler=isinstance(self.sampler, ExactSampler)
+        )
+
+        self._F0 = None
+        self._S0 = None
+
+    @property
+    def solver(self):
+        return self._solver
+    
+    @property
+    def solver_state(self):
+        return self._solver_state
+    
+    def get_update(self, objective_function_output: ObjectiveFunctionOutput):
+        grad = objective_function_output.grad
+        grad_log_psi = objective_function_output.grad_log_psi
+        self._covar_grad_o_loc = grad
+
+        S = self._get_lhs(grad_log_psi)
+        F = self._get_rhs(grad)   
+        self.update, self._additional_info = self.solver(S, F, self.solver_state)
+
+        return self.update
+    
+    # TODO: Test if this actually works (tdvp error has to be handled in a different way)
+    def cross_validation(self, objective_function_output: ObjectiveFunctionOutput):
+        o_loc_1 = objective_function_output.o_loc.get_subset(start=0, step=2)
+        grad_1 = objective_function_output.grad.get_subset(start=0, step=2)
+        grad_log_psi_1 = objective_function_output.grad_log_psi.get_subset(start=0, step=2)
+        grad_2 = objective_function_output.grad.get_subset(start=1, step=2)
+        grad_log_psi_2 = objective_function_output.grad_log_psi.get_subset(start=1, step=2)
+
+        update_1 = self.get_update(o_loc_1, grad_1, grad_log_psi_1)
+        F2 = self._get_rhs(grad_2)
+        S2 = self._get_lhs(grad_log_psi_2)
+
+        validation_tdvp_err = self._get_tdvp_error(update_1)
+        _ = self.get_update(objective_function_output)
+        Sv = S2(update_1) if callable(S2) else S2.dot(update_1)
+        validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / self._additional_info["residual"]
+
+        crossValidationFactor_residual = validation_residual
+        crossValidationFactor_tdvpErr = validation_tdvp_err / self.meta_data["tdvp_error"]
+        self.meta_data["tdvp_residual_cross_validation_ratio"] = crossValidationFactor_residual
+        self.meta_data["tdvp_error_cross_validation_ratio"] = crossValidationFactor_tdvpErr
 
     def _get_tdvp_error(self, update):
-        return jnp.abs(1. + jnp.real(update.dot(self._S0.dot(update)) - 2. * jnp.real(update.dot(self._F0))) / (self.energy.var + 1e-10))
-    
-    def get_tdvp_equation(self, Eloc: SampledObs, gradients: SampledObs):
-        '''
-        Returns left and right hand side of the TDVP equation
-        '''
-        self._covar_grad_eloc = gradients.get_covar_obs(Eloc)
-        self._F0 = - self.rhsPrefactor * self._covar_grad_eloc.mean.ravel()
-        F = self._lhs_trans_fn(self._F0)
+        Sv = self._S0(update) if callable(self._S0) else self._S0.dot(update)
 
-        self._S0 = gradients.get_covar()
+        return jnp.abs(1. + jnp.real(update.dot(Sv) - 2. * jnp.real(update.dot(self._F0))) / (self.o_loc.var + 1e-10))
+    
+    def _get_lhs_dense(self, grad_log_psi: SampledObs):
+        '''
+        Returns left hand side of the TDVP equation
+        '''
+        self._S0 = grad_log_psi.get_covar()
         S = self._lhs_trans_fn(self._S0)
 
-        if self.diagonalShift > 1e-10:
-            S = S + jnp.diag(self.diagonalShift * jnp.diag(S))
+        if self.diagonal_shift > 1e-15:
+            S = S + jnp.diag(self.diagonal_shift * jnp.diag(S))
 
-        return S, F
+        return S
     
-    def _transform_to_eigenbasis(self, S, F):
-        if self.diagonalizeOnDevice:
-            try:
-                self._ev, self._V = jnp.linalg.eigh(S)
-            except ValueError:
-                warnings.warn(
-                    "jax.numpy.linalg.eigh raised an exception. Falling back to " 
-                    "numpy.linalg.eigh for diagonalization.", RuntimeWarning
-                )
-            
-                self._ev, self._V = _eigh_numpy(S)
-        else:
-            self._ev, self._V = _eigh_numpy(S)
+    def _get_lhs_lazy(self, grad_log_psi: SampledObs):
+        '''
+        Returns a function that computes the matrix vector product with the left hand side of the TDVP equation
+        '''
+        O = grad_log_psi._normalized_obs
 
-        self._VtF = jnp.dot(jnp.transpose(jnp.conj(self._V)), F)
+        def raw_matvec(v):
+            return (O.conj().T @ (O @ v))
+        self._S0 = raw_matvec
 
-    def _get_snr(self):
-        rho = self._covar_grad_eloc.transform(self._rhs_trans_fn, jnp.transpose(self._V))
-        self._rho_var = rho.var.ravel()
+        def matvec(v):
+            Sv = self._lhs_trans_fn(raw_matvec(v))
+            if self.diagonal_shift > 1e-15:
+                diag = jnp.sum(jnp.abs(O) ** 2, axis=0)
+                Sv = Sv + self.diagonal_shift * diag * v
 
-        return jnp.sqrt(jnp.abs(rho._num_samples * (jnp.conj(self._VtF) * self._VtF) / (self._rho_var + 1e-10))).ravel()
+            return Sv
+
+        return matvec 
     
-    def solve(self, Eloc: SampledObs, gradients: SampledObs):
-        # Get TDVP equation from MC data
-        self._S, F = self.get_tdvp_equation(Eloc, gradients)
+    def _get_rhs(self, grad: SampledObs):
+        self._F0 = - self.rhsPrefactor * grad.mean.ravel()
+        F = self._lhs_trans_fn(self._F0)
         F.block_until_ready()
 
-        # Transform TDVP equation to eigenbasis and compute Signal to Noise Ratio
-        self._transform_to_eigenbasis(self._S, F) 
-        self._snr = self._get_snr()
+        return F
 
-        # Discard eigenvalues below numerical precision
-        self._invEv = jnp.where(jnp.abs(self._ev / self._ev[-1]) > 1e-14, 1. / self._ev, 0.)
-
-        residual = 1.0
-        cutoff = 1e-2
-        F_norm = jnp.linalg.norm(F)
-        while residual > self.pinvTol and cutoff > self.pinvCutoff:
-            cutoff *= 0.8
-            # Set regularizer for singular value cutoff
-            regularizer = 1. / (1. + (max(cutoff, self.pinvCutoff) / jnp.abs(self._ev / self._ev[-1]))**6)
-
-            if not isinstance(self.sampler, ExactSampler):
-                # Construct a soft cutoff based on the SNR
-                regularizer *= 1. / (1. + (self.snrTol / self._snr)**6)
-
-            pinvEv = self._invEv * regularizer
-
-            residual = jnp.linalg.norm((pinvEv * self._ev - jnp.ones_like(pinvEv)) * self._VtF) / F_norm
-            self._residual = residual
-            self._update = jnp.real(jnp.dot(self._V, (pinvEv * self._VtF)))
-            self._pinv_cutoff = max(cutoff, self.pinvCutoff)
-
-        return self._update
-    
-    def cross_validation(self, Eloc, gradients):
-        Eloc1 = Eloc.get_subset(start=0, step=2)
-        sampleGradients1 = gradients.get_subset(start=0, step=2)
-        Eloc2 = Eloc.get_subset(start=1, step=2)
-        sampleGradients2 = gradients.get_subset(start=1, step=2)
-        update_1, _, _ = self.solve(Eloc1, sampleGradients1)
-        S2, F2 = self.get_tdvp_equation(Eloc2, sampleGradients2)
-
-        validation_tdvpErr = self._get_tdvp_error(update_1)
-        _, solverResidual, _ = self.solve(Eloc, gradients)
-        validation_residual = (jnp.linalg.norm(S2.dot(update_1) - F2) / jnp.linalg.norm(F2)) / solverResidual
-
-        self.crossValidationFactor_residual = validation_residual
-        self.crossValidationFactor_tdvpErr = validation_tdvpErr / self.meta_data["tdvp_error"]
-        self.meta_data["tdvp_residual_cross_validation_ratio"] = self.crossValidationFactor_residual
-        self.meta_data["tdvp_error_cross_validation_ratio"] = self.crossValidationFactor_tdvpErr
-
-        self.S, _ = self.get_tdvp_equation(self.Eloc, gradients)
-    
     def _update_meta_data(self):
-        self.meta_data = {
-            "tdvp_error": self._get_tdvp_error(self._update),
-            "tdvp_residual": self._residual,
-            "pinv_cutoff": self._pinv_cutoff,
-            "SNR": self._snr, 
-            "spectrum": self._ev,
-        }
+        self.meta_data = dict(
+            tdvp_error=self._get_tdvp_error(self.update).item(), 
+            **self._additional_info
+        )

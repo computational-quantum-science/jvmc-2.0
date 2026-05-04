@@ -52,9 +52,6 @@ class Euler(AbstractStepper):
 
         return yInitial + self.dt * dy, self.dt
 
-# end class Euler
-
-
 class Heun(AbstractStepper):
     """ This class implements an adaptive second order consistent integration scheme.
 
@@ -103,10 +100,6 @@ class Heun(AbstractStepper):
         dy0 = 0.5 * dt * (k0 + k1)
 
         return yInitial + dy0, dt
-        return y, self.dt
-
-# end class Heun
-
 
 class AdaptiveHeun(AbstractStepper):
     """ This class implements an adaptive second order consistent integration scheme.
@@ -146,7 +139,6 @@ class AdaptiveHeun(AbstractStepper):
         Returns:
             New value of :math:`y` and time step used :math:`\\Delta t`.
         """
-
         fe = 0.5
 
         dt = self.dt
@@ -154,7 +146,6 @@ class AdaptiveHeun(AbstractStepper):
         yInitial = y.copy()
 
         while fe < 1.:
-
             y = yInitial.copy()
             k0 = f(y, t, **rhsArgs, intStep=0)
             y += dt * k0
@@ -187,8 +178,6 @@ class AdaptiveHeun(AbstractStepper):
 
             if dt > self.maxStep:
                 dt = self.maxStep
-
-        # end while
 
         self.dt = dt
 

@@ -2,14 +2,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import jVMC.global_defs as global_defs
+import jVMC_exp.global_defs as global_defs
 
-import jVMC.operator
+import jVMC_exp.operator
 
 import functools
 
 
-class SxOperator(jVMC.operator.Operator):
+class SxOperator(jVMC_exp.operator.Operator):
     """Define a `\hat\sigma_l^x` operator."""
 
     def __init__(self, siteIdx):
@@ -28,7 +28,7 @@ class SxOperator(jVMC.operator.Operator):
             sp = sp.ravel()
 
             # Define matrix element
-            matEl = jnp.array([1., ], dtype=global_defs.tCpx)
+            matEl = jnp.array([1., ], dtype=global_defs.DT_PARAMS_CPX)
             # Define mapping of Sx: 0->1, 1->0
             sMap = jnp.array([1, 0])
             # Perform mapping

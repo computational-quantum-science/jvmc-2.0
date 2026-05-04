@@ -9,5 +9,8 @@ from . import stats
 from . import geometry
 from . import propose
 from . import optimizer
+from . import solver
+from . import objective_function
+from . import stepper
 
 from .version import __version__

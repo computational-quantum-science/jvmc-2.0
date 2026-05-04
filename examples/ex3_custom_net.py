@@ -1,6 +1,6 @@
 import jax
 import flax
-import jVMC
+import jVMC_exp
 
 # This class defines the network structure of a complex RBM
 
@@ -14,7 +14,7 @@ class MyNet(flax.linen.Module):
         s = 2 * s - 1  # Go from 0/1 representation to 1/-1
 
         h = flax.linen.Dense(features=self.numHidden,
-                             dtype=jVMC.global_defs.tCpx)(s)
+                             dtype=jVMC_exp.global_defs.DT_PARAMS_CPX)(s)
 
         h = jax.numpy.log(jax.numpy.cosh(h))
 
@@ -27,7 +27,7 @@ L = 4  # system size
 net = MyNet(numHidden=7)
 
 # Create the variational quantum state
-psi = jVMC.vqs.NQS(net, seed=1234)
+psi = jVMC_exp.vqs.NQS(net, seed=1234)
 
 # Create a set of 13 random input configurations
 configs = jax.random.bernoulli(jax.random.PRNGKey(4321), shape=(1, 13, L))

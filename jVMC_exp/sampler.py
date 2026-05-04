@@ -33,10 +33,16 @@ class AbstractSampler(ABC):
     
     @property
     def logPsi(self):
+        if self._samples is None:
+            self.sample()
+        
         return self._logPsi
     
     @property
     def weights(self):
+        if self._samples is None:
+            self.sample()
+
         return self._weights
     
     @property
@@ -45,6 +51,10 @@ class AbstractSampler(ABC):
             self.sample()
 
         return self._samples
+    
+    @abstractmethod
+    def __call__(self, observable: AbstractOperator, **obs_kwargs) -> SampledObs:
+        pass
 
     @abstractmethod
     def sample(self, parameters=None, numSamples=None) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -342,7 +352,7 @@ class AbstractMCSampler(AbstractSampler):
         self._logPsi = logPsi
         self._weights = p
 
-        return configs, logPsi, p 
+        return configs, logPsi, p
 
     def _randomize_samples(self, samples, key, orbit):
         """ 
@@ -586,6 +596,11 @@ class ExactSampler(AbstractSampler):
         return jax.jit(
             jax.shard_map(partial(get_basis, n_sites=self.num_sites), mesh=MESH, in_specs=DEVICE_SPEC, out_specs=DEVICE_SPEC)
         )(int_repr)[:self.num_states]
+    
+    def __call__(self, observable: AbstractOperator, **obs_kwargs) -> SampledObs:
+        raw_data = observable.get_O_loc(self.samples, self.net, logPsiS=self.logPsi, **obs_kwargs)
+
+        return SampledObs(raw_data, self.weights)
     
     def sample(self, parameters=None, numSamples=None):
         """

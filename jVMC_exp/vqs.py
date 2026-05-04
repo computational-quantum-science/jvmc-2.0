@@ -1,74 +1,21 @@
 import jax
-from jax import grad 
 from jax import numpy as jnp
 from jax.tree_util import tree_flatten, tree_unflatten, tree_map
 import flax
 from flax.core.frozen_dict import freeze
-import numpy as np
 import flax.linen as nn
 import collections
 from math import isclose
 from typing import Tuple
+from functools import reduce
+import copy
 
 from jVMC_exp.nets.sym_wrapper import avgFun_Coefficients_Exp, SymNet
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
+from jVMC_exp.util.grads import pick_gradient
 from jVMC_exp.util.key_gen import generate_seed, format_key
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
 from jVMC_exp.sharding_config import broadcast_split_key, sharded
-
-def flat_gradient_real(fun, params, arg):
-    """
-    Grad for fun: Real -> Real
-    """
-    g = grad(lambda p, y: jnp.real(fun(p, y)))(params, arg)["params"]
-    g = tree_flatten(tree_map(lambda x: x.ravel(), g))[0]
-
-    return jnp.concatenate(g)
-
-def flat_gradient(fun, params, arg):
-    """
-    Grad for fun: Real -> Complex 
-    """
-    gr = grad(lambda p, y: jnp.real(fun(p, y)))(params, arg)["params"]
-    gr = tree_flatten(tree_map(lambda x: x.ravel(), gr))[0]
-    gi = grad(lambda p, y: jnp.imag(fun(p, y)))(params, arg)["params"]
-    gi = tree_flatten(tree_map(lambda x: x.ravel(), gi))[0]
-
-    return jnp.concatenate(gr) + 1.j * jnp.concatenate(gi)
-
-def flat_gradient_nonholo(fun, params, arg):
-    """
-    Grad for fun: Complex -> Complex (not holomorphic) 
-    """
-    gr = grad(lambda p, y: jnp.real(fun(p, y)))(params, arg)["params"]
-    gr = tree_flatten(tree_map(lambda x: [jnp.real(x.ravel()), -jnp.imag(x.ravel())], gr))[0]
-    gi = grad(lambda p, y: jnp.imag(fun(p, y)))(params, arg)["params"]
-    gi = tree_flatten(tree_map(lambda x: [jnp.real(x.ravel()), -jnp.imag(x.ravel())], gi))[0]
-
-    return jnp.concatenate(gr) + 1.j * jnp.concatenate(gi)
-
-def flat_gradient_holo(fun, params, arg):
-    """
-    Grad for fun: Complex -> Complex (holomorphic) 
-    """
-    g = grad(lambda p, y: jnp.real(fun(p, y)))(params, arg)["params"]
-    g = tree_flatten(tree_map(lambda x: [x.ravel(), 1.j * x.ravel()], g))[0]
-
-    return jnp.concatenate(g)
-
-def dict_gradient(fun, params, arg):
-    gr = grad(lambda p, y: jnp.real(fun(p, y)))(params, arg)["params"]
-    gr = tree_map(lambda x: x.ravel(), gr)
-    gi = grad(lambda p, y: jnp.imag(fun(p, y)))(params, arg)["params"]
-    gi = tree_map(lambda x: x.ravel(), gi)
-
-    return tree_map(lambda x,y: x + 1.j*y, gr, gi)
-
-def dict_gradient_real(fun, params, arg):
-    g = grad(lambda p, y: jnp.real(fun(p, y)))(params, arg)["params"]
-    g = tree_map(lambda x: x.ravel(), g)
-
-    return g
         
 class NQS:
     """
@@ -139,14 +86,13 @@ class NQS:
         self._batchSize = batchSize
 
         self._logarithmic = logarithmic
-        
-        self.init_net(seed)
         if self.logarithmic:
             self.apply_fun = self.net.apply
         else:
             def apply_fun(parameters, s, method=None):
                 return jnp.log(self.net.apply(parameters, s, method))
             self.apply_fun = apply_fun
+        self.init_net(seed)
 
         self._append_gradients_dict_single = lambda x, y: tree_map(lambda a, b: jnp.concatenate((a, 1.j * b)), x, y)
         self._append_gradients_dict = lambda x, y: tree_map(lambda a, b: jnp.concatenate((a[:, :], 1.j * b[:, :]), axis=1), x, y)
@@ -158,6 +104,8 @@ class NQS:
                 out_specs=DEVICE_SPEC
             )
         )
+
+        self._frozen_params = None
 
     @property
     def parameters(self):
@@ -174,8 +122,6 @@ class NQS:
             value = self._param_unflatten(value)
         if 'params' not in value.keys():
             value = {'params': value}
-        if isinstance(self.parameters, flax.core.frozen_dict.FrozenDict):
-            value = freeze(value)
         if jax.tree_util.tree_structure(value) != jax.tree_util.tree_structure(self.parameters):
             raise ValueError(
                 "Parameter tree structure mismatch.\n"
@@ -183,7 +129,14 @@ class NQS:
                 f"  Received: {jax.tree_util.tree_structure(value)}"
             )
 
-        self._parameters = value
+        if self._frozen_params is not None:
+            for frozen_path in self._frozen_params:
+                original = reduce(lambda d, key: d[key], frozen_path, self.params)
+                reduce(lambda d, k: d[k], frozen_path[:-1], value['params'])[frozen_path[-1]] = original
+        if isinstance(self.parameters, flax.core.frozen_dict.FrozenDict):
+            value = freeze(value)
+
+        self._parameters = copy.deepcopy(value)
 
     @property
     def params(self):
@@ -204,6 +157,27 @@ class NQS:
         if not self._realParams:
             return jnp.concatenate([jnp.concatenate([p.ravel().real, p.ravel().imag]) for p in tree_flatten(self.params)[0]])
         return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]])
+    
+    @property
+    def frozen_parameters(self):
+        return self._frozen_params
+
+    @frozen_parameters.setter
+    def frozen_parameters(self, labels: list[str] | None | str):
+        if labels is not None:
+            if isinstance(labels, str):
+                labels = (labels,)
+            try:
+                reduce(lambda d, key: d[key], labels, self.parameters['params'])
+            except KeyError as e:
+                raise ValueError(f'The given label {e} does not exist in parameters')
+            
+            if self._frozen_params is None:
+                self._frozen_params = []
+            if labels not in self._frozen_params:
+                self._frozen_params.append(labels)
+        else:
+            self._frozen_params = None
 
     @property
     def batchSize(self):
@@ -255,33 +229,10 @@ class NQS:
             seed = generate_seed()
         self._parameters = jax.device_put(self.net.init(jax.random.PRNGKey(seed), dummy_sample), REPLICATED_SHARDING)
         self._out_dtype = self.net.apply(self._parameters, dummy_sample).dtype
-        self._realParams = False
-        self._holomorphic = False
         
-        dtypes = [a.dtype for a in tree_flatten(self.parameters)[0]]
-        if not all(d == dtypes[0] for d in dtypes):
-            raise Exception("Network uses different parameter data types. This is not supported.")
-        if dtypes[0] == np.single or dtypes[0] == np.double:
-            self._realParams = True
-        self._param_dtype = dtypes[0]
-
-        # check Cauchy-Riemann condition to test for holomorphicity
-        def make_flat(t):
-            return jnp.concatenate([p.ravel() for p in tree_flatten(t)[0]])
-        
-        grads_r = make_flat(jax.grad(lambda a, b: jnp.real(self.net.apply(a,b)))(self.parameters, dummy_sample)["params"])
-        grads_i = make_flat(jax.grad(lambda a, b: jnp.imag(self.net.apply(a,b)))(self.parameters, dummy_sample)["params"])
-        if isclose(jnp.linalg.norm(grads_r - 1.j * grads_i) / grads_r.shape[0], 0.0, abs_tol=1e-14):
-            self._holomorphic = True
-            self._flat_gradient_function = flat_gradient_holo
-            self._dict_gradient_function = dict_gradient_real
-        else:
-            if self._realParams:
-                self._flat_gradient_function = flat_gradient
-                self._dict_gradient_function = dict_gradient
-            else:
-                self._flat_gradient_function = flat_gradient_nonholo
-                self._dict_gradient_function = dict_gradient_real
+        self._realParams, self._holomorphic, self._flat_gradient_function, self._dict_gradient_function = pick_gradient(
+            self.apply_fun, self.parameters, dummy_sample
+        )
 
         self._paramShapes = [(p.size, p.shape) for p in tree_flatten(self.parameters["params"])[0]]
         self._netTreeDef = jax.tree_util.tree_structure(self.parameters["params"])

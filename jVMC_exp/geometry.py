@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import numpy as np
 import jax
 from abc import ABC, abstractmethod
 
@@ -110,3 +111,28 @@ class HyperRectangle(AbstractGeometry):
         PBC = jnp.array(self.PBC, dtype=bool)
 
         return diff - PBC * extent * jnp.round(diff / extent)
+    
+    def count_particles_in_cell(self, sample, linear_partition):
+        """
+        sample: (n_particles * n_dims,)
+        linear_partition: tuple of ints, one per dim
+        """
+        sample = sample.reshape((self.n_particles, self.n_dim))
+        delta = jnp.array(self.extent) / jnp.array(linear_partition)
+        shifted = sample - self.domain[:, 0]              
+        cell_indices = jnp.floor(shifted / delta).astype(jnp.int32)      
+
+        # clip to handle particles on the upper boundary
+        cell_indices = jnp.clip(
+            cell_indices,
+            0,
+            jnp.array(linear_partition) - 1
+        )
+
+        flat_indices = jnp.ravel_multi_index(
+            cell_indices.T,
+            dims=linear_partition,
+            mode='clip'
+        )
+
+        return jnp.bincount(flat_indices, length=np.prod(linear_partition)).reshape(linear_partition)

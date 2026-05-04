@@ -11,7 +11,7 @@ import flax.linen as nn
 import numpy as np
 import matplotlib.pyplot as plt
 
-import jVMC
+import jVMC_exp
 
 L = 10
 g = -0.7
@@ -24,18 +24,18 @@ if GPU_avail:
     # estimated run_time in colab (GPU enabled): ~26 minutes
     def myActFun(x):
         return 1 + nn.elu(x)
-    net = jVMC.nets.CNN(F=(L,), channels=(16,), strides=(1,), periodicBoundary=True, actFun=(myActFun,))
+    net = jVMC_exp.nets.CNN(F=(L,), channels=(16,), strides=(1,), periodicBoundary=True, actFun=(myActFun,))
     n_steps = 1000
     n_Samples = 40000
 else:
     # may be used to obtain results on Laptop CPUs
     # estimated run_time: ~100 seconds
-    net = jVMC.nets.CpxRBM(numHidden=8, bias=False)
+    net = jVMC_exp.nets.CpxRBM(numHidden=8, bias=False)
     n_steps = 300
     n_Samples = 5000
 
 
-psi = jVMC.vqs.NQS(net, seed=1234)  # Variational wave function
+psi = jVMC_exp.vqs.NQS(net, seed=1234)  # Variational wave function
 
 
 def energy_single_p_mode(h_t, P):
@@ -53,21 +53,21 @@ exact_energy = ground_state_energy_per_site(g, L)
 print(exact_energy)
 
 # Set up hamiltonian
-hamiltonian = jVMC.operator.BranchFreeOperator()
+hamiltonian = jVMC_exp.operator.BranchFreeOperator()
 for l in range(L):
-    hamiltonian.add(jVMC.operator.scal_opstr(-1., (jVMC.operator.Sz(l), jVMC.operator.Sz((l + 1) % L))))
-    hamiltonian.add(jVMC.operator.scal_opstr(g, (jVMC.operator.Sx(l), )))
+    hamiltonian.add(jVMC_exp.operator.scal_opstr(-1., (jVMC_exp.operator.Sz(l), jVMC_exp.operator.Sz((l + 1) % L))))
+    hamiltonian.add(jVMC_exp.operator.scal_opstr(g, (jVMC_exp.operator.Sx(l), )))
 
 # Set up sampler
-sampler = jVMC.sampler.MCSampler(psi, (L,), random.PRNGKey(4321), updateProposer=jVMC.sampler.propose_spin_flip_Z2,
+sampler = jVMC_exp.sampler.MCSampler(psi, (L,), random.PRNGKey(4321), updateProposer=jVMC_exp.sampler.propose_spin_flip_Z2,
                                  numChains=100, sweepSteps=L,
                                  numSamples=n_Samples, thermalizationSweeps=25)
 
 # Set up TDVP
-tdvpEquation = jVMC.util.tdvp.TDVP(sampler, rhsPrefactor=1.,
+tdvpEquation = jVMC_exp.util.tdvp.TDVP(sampler, rhsPrefactor=1.,
                                    svdTol=1e-8, diagonalShift=10, makeReal='real')
 
-stepper = jVMC.util.stepper.Euler(timeStep=1e-2)  # ODE integrator
+stepper = jVMC_exp.util.stepper.Euler(timeStep=1e-2)  # ODE integrator
 
 res = []
 for n in range(n_steps):
