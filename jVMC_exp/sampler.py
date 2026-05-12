@@ -258,9 +258,14 @@ class AbstractMCSampler(AbstractSampler):
             self.states = initializer(initStateKey, (self.numChains,) + self.sampleShape, dtype)
         self.states = jax.device_put(self.states, DEVICE_SHARDING)
 
-        def _log_prob_fun(s, mu, p):
-            # vmap is over parallel MC chains
-            return jax.vmap(lambda x: mu * self.sampler_net(p, x))(s)
+        if self.net.eval_ratio:
+            def _log_prob_fun(s, mu, p):
+                # vmap is over parallel MC chains
+                return jax.vmap(lambda x: 1)(s)
+        else:
+            def _log_prob_fun(s, mu, p):
+                # vmap is over parallel MC chains
+                return jax.vmap(lambda x: mu * self.sampler_net(p, x))(s)
         self._log_prob_fun_jsh = jax.jit(
             jax.shard_map(
                 _log_prob_fun,
@@ -459,8 +464,12 @@ class AbstractMCSampler(AbstractSampler):
             newState, log_prob_correction = updateProposer(proposerKey, state, ProposerArg)
             
             # Compute acceptance probability
-            newLogProb = self.mu * net(params, newState)
-            P = jnp.exp(newLogProb - logProb + log_prob_correction)
+            if self.net.eval_ratio:
+                newLogProb = logProb
+                P = jnp.abs(net(params, state, newState)) ** self.mu
+            else:
+                newLogProb = self.mu * net(params, newState)
+                P = jnp.exp(newLogProb - logProb + log_prob_correction)
             
             # Roll dice
             acceptKey, newKey = random.split(newKey)
