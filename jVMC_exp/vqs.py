@@ -8,6 +8,8 @@ import collections
 from typing import Tuple
 from functools import reduce
 import copy
+import flax.linen as nn
+from flax import nnx
 
 from jVMC_exp.nets.sym_wrapper import avgFun_Coefficients_Exp, SymNet
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
@@ -15,52 +17,98 @@ from jVMC_exp.util.grads import pick_gradient
 from jVMC_exp.util.key_gen import generate_seed, format_key
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
 from jVMC_exp.sharding_config import broadcast_split_key, sharded
+
+def check_model(model, nnx_init_kwargs=None):
+    if isinstance(model, nn.Module):
+        return model
+    
+    if isinstance(model, nnx.Module):
+        raise ValueError(
+            "Pass the NNX class, not an instance: "
+            f"use {type(model).__name__} instead of {type(model).__name__}(...)"
+        )
+    
+    if isinstance(model, type) and issubclass(model, nnx.Module):
+        kwargs = nnx_init_kwargs or {}
+        return nnx.bridge.to_linen(model, **kwargs)
+    
+    raise ValueError(f"Expected a flax.linen.Module instance or a flax.nnx.Module class, got {type(model)}")
         
 class NQS:
     """
-        Initializes NQS class.
-        
-        This class can operate in two modi:
-            #. Single-network ansatz
-                Quantum state of the form :math:`\\psi_\\theta(s)\\equiv\\exp(r_\\theta(s))`, \
-                where the network :math:`r_\\theta` is
-                a) holomorphic, i.e., parametrized by complex valued parameters :math:`\\vartheta`.
-                b) non-holomorphic, i.e., parametrized by real valued parameters :math:`\\theta`.
-            #. Two-network ansatz
-                Quantum state of the form 
-                :math:`\\psi_\\theta(s)\\equiv\\exp(r_{\\theta_r}(s)+i\\varphi_{\\theta_\\phi}(s))` \
-                with an amplitude network :math:`r_{\\theta_{r}}` and a phase network \
-                :math:`\\varphi_{\\theta_\\phi}` \
-                parametrized by real valued parameters :math:`\\theta_r,\\theta_\\phi`.
-        Args:       
-            * ``net``: Variational network or tuple of networks.
-                A network has to be registered as pytree node and provide \
-                a ``__call__`` function for evaluation. \
-                If a tuple of two networks is given, the first is used for the logarithmic \
-                amplitude and the second for the phase of the wave function coefficient.
-            * ``logarithmic``: Boolean variable indicating, whether the ANN returns logarithmic \
-                (:math:`\\log\\psi_\\theta(s)`) or plain (:math:`\\psi_\\theta(s)`) wave function coefficients.
-            * ``batchSize``: Batch size for batched network evaluation. Choice \
-                of this parameter impacts performance: with too small values performance \
-                is limited by memory access overheads, too large values can lead \
-                to "out of memory" issues.
-            * ``seed``: Seed for the PRNG to initialize the network parameters.
-            * ``orbit``: Orbit which defining the symmetry operations (instance of ``util.symmetries.LatticeSymmetry``). \
-                If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
-            * ``avgFun``: Reduction operation for the symmetrization.
-        """
+    Initializes NQS class.
 
+    This class can operate in two modi:
+        #. Single-network ansatz
+            Quantum state of the form :math:`\\psi_\\theta(s)\\equiv\\exp(r_\\theta(s))`, \
+            where the network :math:`r_\\theta` is
+            a) holomorphic, i.e., parametrized by complex valued parameters :math:`\\vartheta`.
+            b) non-holomorphic, i.e., parametrized by real valued parameters :math:`\\theta`.
+        #. Two-network ansatz
+            Quantum state of the form 
+            :math:`\\psi_\\theta(s)\\equiv\\exp(r_{\\theta_r}(s)+i\\varphi_{\\theta_\\phi}(s))` \
+            with an amplitude network :math:`r_{\\theta_{r}}` and a phase network \
+            :math:`\\varphi_{\\theta_\\phi}` \
+            parametrized by real valued parameters :math:`\\theta_r,\\theta_\\phi`.
+
+    Args:
+        * ``net``: Variational network, tuple of networks, or ``flax.nnx.Module`` subclass. \
+            A network has to be registered as pytree node and provide \
+            a ``__call__`` function for evaluation. \
+            If a tuple of two networks is given, the first is used for the logarithmic \
+            amplitude and the second for the phase of the wave function coefficient. \
+            If a ``flax.nnx.Module`` subclass is given, it will be automatically wrapped \
+            into a ``flax.linen``-compatible module via ``flax.nnx.bridge.to_linen``. \
+            In this case, ``nnx_init`` must also be provided.
+        * ``logarithmic``: Boolean variable indicating, whether the ANN returns logarithmic \
+            (:math:`\\log\\psi_\\theta(s)`) or plain (:math:`\\psi_\\theta(s)`) wave function coefficients.
+        * ``batchSize``: Batch size for batched network evaluation. Choice \
+            of this parameter impacts performance: with too small values performance \
+            is limited by memory access overheads, too large values can lead \
+            to "out of memory" issues.
+        * ``seed``: Seed for the PRNG to initialize the network parameters.
+        * ``orbit``: Orbit which defining the symmetry operations (instance of ``util.symmetries.LatticeSymmetry``). \
+            If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
+        * ``avgFun``: Reduction operation for the symmetrization.
+        * ``nnx_init``: Dictionary of keyword arguments passed to the ``flax.nnx.Module`` constructor, \
+            excluding ``rngs`` (which is handled internally). Required when ``net`` is a \
+            ``flax.nnx.Module`` subclass or a tuple thereof; ignored otherwise. \
+            If ``net`` is a tuple of two ``flax.nnx.Module`` subclasses, ``nnx_init`` must be \
+            a tuple of two dictionaries, one per network.
+
+    Example:
+        Using a ``flax.linen`` model (unchanged behavior)::
+
+            psi = NQS(RBMLinenModel(numHidden=4), sampleShape, batchSize=32, seed=0)
+
+        Using a ``flax.nnx`` model::
+
+            psi = NQS(RBMNNXModel, sampleShape, batchSize=32, seed=0,
+                    nnx_init=dict(in_features=10, numHidden=4, bias=True))
+
+        Using two ``flax.nnx`` models::
+
+            psi = NQS((AmplitudeNNX, PhaseNNX), sampleShape, batchSize=32, seed=0,
+                    nnx_init=(dict(in_features=10, numHidden=4),
+                                dict(in_features=10, numHidden=4)))
+    """
     def __init__(self, net: nn.Module | Tuple[nn.Module, nn.Module], sampleShape, batchSize: int | None = None, batchSize_per_device: int | None = None, 
-                 logarithmic=True, seed: None | int = None, orbit=None, avgFun=avgFun_Coefficients_Exp):
+                 logarithmic=True, seed: None | int = None, orbit=None, avgFun=avgFun_Coefficients_Exp, nnx_init=None):
         if isinstance(net, collections.abc.Iterable):
             if len(net) != 2:
                 raise ValueError(f"If a tuple is passed for 'net', this must have len 2. Got {len(net)}.") 
-            if not isinstance(net[0], nn.Module) or not isinstance(net[1], nn.Module):
-                raise ValueError("The argument 'net' has to be an instance of flax.nn.Module.")
+            if nnx_init is not None:
+                if not isinstance(nnx_init, collections.abc.Iterable):
+                    raise ValueError(f"If a tuple is passed for 'net', nnx_init can be either None or a tuple of len 2.")
+                if len(nnx_init) != 2:
+                    raise ValueError("If a tuple is passed for 'net', and nnx_init is not None, nnx_init must be a tuple of len 2."
+                                     f"Got {len(nnx_init)}")
+            else:
+                nnx_init = (None, None)
+            net = tuple(check_model(n, i) for n, i in zip(net, nnx_init))
             net = TwoNets(net)
         else:
-            if not isinstance(net, nn.Module):
-                raise ValueError("The argument 'net' has to be an instance of flax.nn.Module.")
+            net = check_model(net, nnx_init)
             
         self._isGenerator = False
         if "sample" in dir(net):
