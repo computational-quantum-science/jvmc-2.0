@@ -2,6 +2,59 @@ import jax.numpy as jnp
 from abc import ABC, abstractmethod
 from typing import Callable
 
+def _get_rk_step(butcher_tableau, t, f, y0, dt, k0=None, start_step=0, **rhs_kwargs):
+    '''
+    The Butcher tableau of the explicit Runge-Kutta scheme has to be given as a tuple
+    (A, b, c).
+
+    The tableau defines the integration scheme through:
+
+        k_i = f(
+            y_n + dt * sum_j A[i,j] * k_j,
+            t_n + c[i] * dt
+        )
+
+    and the final update:
+
+        y_{n+1} = y_n + dt * sum_i b[i] * k_i
+
+    where:
+        * A : strictly lower-triangular matrix of stage coefficients
+        * b : vector of coefficients for the final weighted sum
+        * c : vector of time shifts for each stage
+
+    The tableau must follow the standard explicit RK convention:
+        * len(A) == len(b) == len(c)
+        * c[0] == 0
+        * A[0,:] == 0
+        * A[i,j] = 0 for j >= i
+    '''
+    A, b, c = butcher_tableau
+
+    K = [f(y0, t, **rhs_kwargs, intStep=start_step)] if k0 is None else [k0]
+    step = b[0] * K[0]
+
+    for i in range(1, len(b)):
+        y_stage = y0 + dt * sum(A[i][j] * K[j] for j in range(i))
+        t_stage = t + c[i] * dt
+
+        K.append(f(y_stage, t_stage, **rhs_kwargs, intStep=i + start_step))
+        step += b[i] * K[i]
+
+    return dt * step, K
+
+def _adaptive_step_control(dy_low, dy_high, tolerance, max_step, norm_function, dt, order):
+    update_diff = norm_function(dy_low - dy_high)
+    fe = tolerance / update_diff
+
+    if 0.2 > 0.9 * fe**(1 / (order + 1)):
+        tmp = 0.2
+    else:
+        tmp = 0.9 * fe**(1 / (order + 1))
+    dt_new = dt * min(2, tmp)
+
+    return fe > 1., min(dt_new, max_step)
+
 class AbstractStepper(ABC):
     @abstractmethod
     def step(self, t, f, yInitial, **kwargs):
@@ -60,14 +113,13 @@ class Heun(AbstractStepper):
     """
 
     def __init__(self, timeStep=1e-3):
-
         self.dt = timeStep
 
-    
-    def set_dt(self, timeStep):
-
-        self.dt = timeStep
-
+        self._butcher_tableau = (
+                jnp.array([[0, 0], [1, 0]]),
+                jnp.array([0.5, 0.5]),
+                jnp.array([0, 1])
+            )
 
     def step(self, t, f, yInitial, **rhsArgs):
         """ This function performs an integration time step.
@@ -91,15 +143,12 @@ class Heun(AbstractStepper):
             New value of :math:`y` and time step used :math:`\\Delta t`.
         """
 
-        dt = self.dt
-        if "dt" in rhsArgs:
-            dt = rhsArgs["dt"]
-        k0 = f(yInitial, t, **rhsArgs, intStep=0)
-        y = yInitial + dt * k0
-        k1 = f(y, t + dt, **rhsArgs, intStep=1)
-        dy0 = 0.5 * dt * (k0 + k1)
+        dy0, _ = _get_rk_step(
+            self._butcher_tableau, 
+            t, f, yInitial, self.dt, **rhsArgs
+        )
 
-        return yInitial + dy0, dt
+        return yInitial + dy0, self.dt
 
 class AdaptiveHeun(AbstractStepper):
     """ This class implements an adaptive second order consistent integration scheme.
@@ -114,6 +163,12 @@ class AdaptiveHeun(AbstractStepper):
         self.dt = timeStep
         self.tolerance = tol
         self.maxStep = maxStep
+
+        self._butcher_tableau = (
+            jnp.array([[0, 0], [1, 0]]),
+            jnp.array([0.5, 0.5]),
+            jnp.array([0, 1])
+        )
 
     def step(self, t, f, y, normFunction=jnp.linalg.norm, **rhsArgs):
         """ This function performs an integration time step.
@@ -139,46 +194,118 @@ class AdaptiveHeun(AbstractStepper):
         Returns:
             New value of :math:`y` and time step used :math:`\\Delta t`.
         """
-        fe = 0.5
+        converged = False
 
-        dt = self.dt
-
-        yInitial = y.copy()
-
-        while fe < 1.:
-            y = yInitial.copy()
+        while not converged:
             k0 = f(y, t, **rhsArgs, intStep=0)
-            y += dt * k0
-            k1 = f(y, t + dt, **rhsArgs, intStep=1)
-            dy0 = 0.5 * dt * (k0 + k1)
+            dy0, _ = _get_rk_step(
+                self._butcher_tableau, 
+                t, f, y, self.dt, k0, **rhsArgs
+            )
+            dy1, _ = _get_rk_step(
+                self._butcher_tableau, 
+                t, f, y, 0.5 * self.dt, k0, 1, **rhsArgs
+            )
+            dy1_half, _ = _get_rk_step(
+                self._butcher_tableau, 
+                t + 0.5 * self.dt, f, y + dy1, 0.5 * self.dt, start_step=3, **rhsArgs
+            )
+            dy1 += dy1_half
 
-            # now with half step size
-            y -= 0.5 * dt * k0
-            k10 = f(y, t + 0.5 * dt, **rhsArgs, intStep=2)
-            dy1 = 0.25 * dt * (k0 + k10)
-            y = yInitial + dy1
-            k01 = f(y, t + 0.5 * dt, **rhsArgs, intStep=3)
-            y += 0.5 * dt * k01
-            k11 = f(y, t + dt, **rhsArgs, intStep=4)
-            dy1 += 0.25 * dt * (k01 + k11)
+            current_dt = self.dt
+            converged, self.dt = _adaptive_step_control(dy0, dy1, self.tolerance, self.maxStep, normFunction, self.dt, order=2)
 
-            # compute deviation
-            updateDiff = normFunction(dy1 - dy0)
-            fe = self.tolerance / updateDiff
+        return y + dy1, current_dt
+    
+class RK23(AbstractStepper):
+    """ 
+    This class implements the explicit Runge-Kutta method of order 2(3) by Bogacki and Shampine.
 
-            if 0.2 > 0.9 * fe**0.33333:
-                tmp = 0.2
-            else:
-                tmp = 0.9 * fe**0.33333
-            if tmp > 2.:
-                tmp = 2.
+    Initializer arguments:
+        * ``timeStep``: Initial time step (will be adapted automatically)
+        * ``tol``: Tolerance for integration errors.
+        * ``maxStep``: Maximal allowed time step.
+    """
 
-            realDt = dt
-            dt *= tmp
+    def __init__(self, timeStep=1e-3, tol=1e-8, maxStep=1):
+        self.dt = timeStep
+        self.tolerance = tol
+        self.maxStep = maxStep
+        self._k0 = None
 
-            if dt > self.maxStep:
-                dt = self.maxStep
+        self._butcher_tableau = (
+            jnp.array([[0, 0, 0], [0.5, 0, 0], [0, 0.75, 0]]),
+            jnp.array([2/9, 1/3, 4/9]),
+            jnp.array([0, 0.5, 0.75])
+        )
 
-        self.dt = dt
+    def step(self, t, f, y, normFunction=jnp.linalg.norm, **rhsArgs):
+        converged = False
 
-        return yInitial + dy1, realDt
+        while not converged:
+            # k0 = self._k0 if self._k0 is not None else f(y, t, **rhsArgs, intStep=0) 
+            # TODO: at the moment this is needed to trigger intStep=0, but the above line saves a step
+            k0 = f(y, t, **rhsArgs, intStep=0)
+            dy_high, K = _get_rk_step(
+                self._butcher_tableau,
+                t, f, y, self.dt, k0, **rhsArgs
+            )
+            y_new = y + dy_high
+            K.append(f(y_new, t + self.dt , **rhsArgs, intStep=3))
+            dy_low = self.dt * (7/24 * K[0] + 1/4 * K[1] + 1/3 * K[2] + 1/8 * K[3])
+
+            current_dt = self.dt
+            converged, self.dt = _adaptive_step_control(dy_low, dy_high, self.tolerance, self.maxStep, normFunction, self.dt, order=3)
+            self._k0 = K[-1] if converged else None
+
+        return y_new, current_dt
+    
+class RK45(AbstractStepper):
+    """ 
+    This class implements the explicit Runge-Kutta method of order 4(5) by Dormand and Prince.
+
+    Initializer arguments:
+        * ``timeStep``: Initial time step (will be adapted automatically)
+        * ``tol``: Tolerance for integration errors.
+        * ``maxStep``: Maximal allowed time step.
+    """
+
+    def __init__(self, timeStep=1e-3, tol=1e-8, maxStep=1):
+        self.dt = timeStep
+        self.tolerance = tol
+        self.maxStep = maxStep
+        self._k0 = None
+
+        self._butcher_tableau = (
+            jnp.array([
+                [0, 0, 0, 0, 0, 0], 
+                [0.2, 0, 0, 0, 0, 0], 
+                [3/40, 9/40, 0, 0, 0, 0],
+                [44/45, -56/15, 32/9, 0, 0, 0],
+                [19375/6561, -25460/2187, 64448/6561, -212/729, 0, 0],
+                [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0]
+            ]),
+            jnp.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84]),
+            jnp.array([0, 0.2, 3/10, 0.8, 8/9, 1])
+        )
+
+    def step(self, t, f, y, normFunction=jnp.linalg.norm, **rhsArgs):
+        converged = False
+
+        while not converged:
+            # k0 = self._k0 if self._k0 is not None else f(y, t, **rhsArgs, intStep=0) 
+            # TODO: at the moment this is needed to trigger intStep=0, but the above line saves a step
+            k0 = f(y, t, **rhsArgs, intStep=0)
+            dy_high, K = _get_rk_step(
+                self._butcher_tableau,
+                t, f, y, self.dt, k0, **rhsArgs
+            )
+            y_new = y + dy_high
+            K.append(f(y_new, t + self.dt , **rhsArgs, intStep=6))
+            dy_low = self.dt * (5179/57600 * K[0] + 7571/16695 * K[2] + 393/640 * K[3] - 92097/339200 * K[4] + 187/2100 * K[5] + 1/40 * K[6])
+
+            current_dt = self.dt
+            converged, self.dt = _adaptive_step_control(dy_low, dy_high, self.tolerance, self.maxStep, normFunction, self.dt, order=5)
+            self._k0 = K[-1] if converged else None
+
+        return y_new, current_dt

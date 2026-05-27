@@ -56,10 +56,13 @@ class PinvSNR(AbstractSolver):
         residual = 1.0
         cutoff = 1e-2
         F_norm = jnp.linalg.norm(F)
-        while residual > self.pinv_tol and cutoff > self.pinv_cutoff:
+        first = True 
+        while (residual > self.pinv_tol and cutoff > self.pinv_cutoff) or first:
             residual, cutoff, pinvEv = self._regularizer_step(
                 cutoff, snr, self.last_eigenvalues, invEv, self._VtF, F_norm, solver_state.exact_sampler
             )
+
+            first = False
 
         update = jnp.real(jnp.dot(self.last_eigenvectors, (pinvEv * self._VtF)))
         info = dict(
