@@ -1,15 +1,11 @@
 import jax
 jax.config.update("jax_enable_x64", True)
-import flax
-#from flax import nn
 import flax.linen as nn
 import jax.numpy as jnp
 
 import jVMC_exp.global_defs as global_defs
 import jVMC_exp.nets.activation_functions as act_funs
 from jVMC_exp.nets.initializers import init_fn_args
-
-from functools import partial
 
 import jVMC_exp.nets.initializers
 
@@ -36,9 +32,6 @@ class CpxRBM(nn.Module):
                          )
 
         return jnp.sum(act_funs.log_cosh(layer(2 * s.ravel() - 1)))
-
-# ** end class CpxRBM
-
 
 class CpxRBM_Nospinflip(nn.Module):
     """Restricted Boltzmann machine with complex parameters.
@@ -87,8 +80,6 @@ class RBM(nn.Module):
 
         return jnp.sum(jnp.log(jnp.cosh(layer(2 * s - 1))))
 
-# ** end class RBM
-
 class CpxRBM_ratio(nn.Module):
     """Restricted Boltzmann machine with complex parameters.
 
@@ -114,5 +105,3 @@ class CpxRBM_ratio(nn.Module):
 
     def eval_ratio(self, s, sp):
         return jnp.exp(self(sp) - self(s))
-
-# ** end class CpxRBM_ratio
