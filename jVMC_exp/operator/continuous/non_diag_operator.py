@@ -50,23 +50,26 @@ class TotalKineticOperator(Operator):
     def _get_O_loc(self, s, apply_fun, parameters, kwargs):
         log_psi = lambda x: apply_fun(parameters, x)
         
-        if self.laplacian_mode == 'standard':
+        if self.laplacian_mode.lower() == 'standard':
             grad_log_psi = lambda x: grad_real_to_cpx(log_psi, x) 
             lap_log_psi = laplacian(grad_log_psi)(s)
             grad_log_psi = grad_log_psi(s)
         
-        elif self.laplacian_mode == 'forward': # This no longer works with the latest version of jax
+        elif self.laplacian_mode.lower() == 'forward': # This no longer works with the latest version of jax
             raise NotImplementedError(
                 "The 'forward' laplacian mode is currently not compatible with the latest version of jax. " \
                 "Please use 'standard' mode instead."
             )
-            from ._frwrd_lap_fix import lap as fwdlap
-            _, grad_log_psi, lap_log_psi = fwdlap(
-                log_psi,
-                (s,),
-                (jnp.eye(s.size, dtype=s.dtype),),
-                (SymbolicZero(get_aval(s).to_tangent_aval()),)
-            )
+            # from ._frwrd_lap_fix import lap as fwdlap, SymbolicZero
+            # _, grad_log_psi, lap_log_psi = fwdlap(
+            #     log_psi,
+            #     (s,),
+            #     (jnp.eye(s.size, dtype=s.dtype),),
+            #     (SymbolicZero(jax.core.get_aval(s).to_tangent_aval()),)
+            # )
+        
+        else:
+            raise ValueError(f"Laplacian mode can only be set to 'standard' or 'forward', got {self.laplacian_mode}")
  
         laplacian_psi = lap_log_psi + grad_log_psi**2
 

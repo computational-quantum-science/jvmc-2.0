@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from abc import ABC, abstractmethod
 import tqdm
 from typing import Dict
+import warnings
 
 from jVMC_exp.stats import SampledObs
 from jVMC_exp.vqs import NQS
@@ -219,12 +220,21 @@ class Evolution(AbstractOptimizer):
     def __init__(
             self, sampler, psi, 
             imag_time: bool, make_real: bool, use_cross_valiadation: bool=False, 
-            diagonal_shift: float=1e-3, solver: AbstractSolver=PinvSNR()
+            diagonal_shift: float=1e-3, diag_scale: float=0., 
+            solver: AbstractSolver=PinvSNR()
         ):
         self.rhsPrefactor = 1 if imag_time else 1j
         self._lhs_trans_fn = real_fn if make_real else imag_fn
         self._rhs_trans_fn = lambda x: self._lhs_trans_fn((- self.rhsPrefactor) * x)
         self.diagonal_shift = diagonal_shift
+        self.diagonal_scale = diag_scale
+        warnings.warn(
+            "Naming convention changed: "
+            "'diagonal_shift' now adds a constant term to the diagonal, "
+            "while 'diag_scale' multiplies the diagonal entries. "
+            "This is the opposite of the previous convention.",
+            UserWarning,
+        )
         self._solver = solver
         self._get_lhs = self._get_lhs_dense if solver._needs_dense_matrix else self._get_lhs_lazy
        
@@ -292,8 +302,10 @@ class Evolution(AbstractOptimizer):
         self._S0 = grad_log_psi.get_covar()
         S = self._lhs_trans_fn(self._S0)
 
+        if self.diagonal_scale > 1e-15:
+            S = S + jnp.diag(self.diagonal_scale * jnp.diag(S))
         if self.diagonal_shift > 1e-15:
-            S = S + jnp.diag(self.diagonal_shift * jnp.diag(S))
+            S = S + self.diagonal_shift * jnp.eye(S.shape[0])
 
         return S
     
@@ -309,9 +321,11 @@ class Evolution(AbstractOptimizer):
 
         def matvec(v):
             Sv = self._lhs_trans_fn(raw_matvec(v))
-            if self.diagonal_shift > 1e-15:
+            if self.diagonal_scale > 1e-15:
                 diag = jnp.sum(jnp.abs(O) ** 2, axis=0)
-                Sv = Sv + self.diagonal_shift * diag * v
+                Sv = Sv + self.diagonal_scale * diag * v
+            if self.diagonal_shift > 1e-15:
+                Sv = Sv + self.diagonal_shift * v
 
             return Sv
 

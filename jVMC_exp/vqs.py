@@ -344,13 +344,12 @@ class NQS:
         Returns:
             Real part of the NQS and current parameters
         """
-        if "eval_real" in dir(self.net):
-            if callable(self.net.eval_real):
-                return lambda p, x: jnp.real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
+        if "eval_real" in dir(self.net) and callable(self.net.eval_real):
+            return lambda p, x: jnp.real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
         elif self._eval_ratio:
             return lambda p, x, y: self.apply_fun(p, x, y, method=self.net.eval_ratio), self.parameters
-        else:
-            return lambda p, x: jnp.real(self.apply_fun(p, x)), self.parameters
+        
+        return lambda p, x: jnp.real(self.apply_fun(p, x)), self.parameters
     
     def sample(self, numSamples, key=None, parameters=None):
         if self._isGenerator:
