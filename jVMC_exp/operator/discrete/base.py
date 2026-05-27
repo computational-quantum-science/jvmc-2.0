@@ -1,5 +1,5 @@
 from __future__ import annotations
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import jax.numpy as jnp
 
 from jVMC_exp.vqs import NQS
@@ -76,9 +76,14 @@ class Operator(AbstractOperator):
             return NotImplemented
         
     def get_O_loc(self, s, psi: NQS, *, logPsiS=None, **kwargs):
-        logPsiS = psi(s) if logPsiS is None else logPsiS
-
         s_p, matEls = self.get_conn_elements(s, psi.batchSize, **kwargs)
+
+        if psi.eval_ratio:
+            logPsi_ratio = psi.call_ratio(jnp.repeat(s,matEls.shape[1], axis=0), s_p.reshape((-1, *psi.sampleShape))).reshape(matEls.shape)
+
+            return self._get_O_loc_ratio(logPsi_ratio, matEls, batch_size=psi.batchSize) 
+        
+        logPsiS = psi(s) if logPsiS is None else logPsiS
         logPsiS_p = psi(s_p.reshape((-1, *psi.sampleShape))).reshape(matEls.shape)
 
         return self._get_O_loc(logPsiS, logPsiS_p, matEls, batch_size=psi.batchSize) 
@@ -86,6 +91,10 @@ class Operator(AbstractOperator):
     @sharded(use_vmap=False)
     def _get_O_loc(self, logPsiS, logPsiS_p, matEls, *, batch_size):
         return jnp.sum(jnp.exp(logPsiS_p - logPsiS[:, None]) * matEls, axis=1)
+
+    @sharded(use_vmap=False)
+    def _get_O_loc_ratio(self, logPsi_ratio, matEls, *, batch_size):
+        return jnp.sum(logPsi_ratio * matEls, axis=1)
 
     def get_conn_elements(self, s, batch_size, **kwargs):
         if not self._is_compiled:

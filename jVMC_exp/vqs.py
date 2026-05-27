@@ -5,7 +5,6 @@ import flax
 from flax.core.frozen_dict import freeze
 import flax.linen as nn
 import collections
-from math import isclose
 from typing import Tuple
 from functools import reduce
 import copy
@@ -67,6 +66,10 @@ class NQS:
         if "sample" in dir(net):
             if callable(net.sample):
                 self._isGenerator = True
+
+        self._eval_ratio = False
+        if "eval_ratio" in dir(net) and callable(net.eval_ratio):
+                self._eval_ratio = True
         if orbit is not None:
             net = SymNet(net=net, orbit=orbit, avgFun=avgFun)
         self._net = net
@@ -198,6 +201,10 @@ class NQS:
     @property
     def is_generator(self):
         return self._isGenerator
+
+    @property
+    def eval_ratio(self):
+        return self._eval_ratio
     
     @property
     def holomorphic(self):
@@ -258,6 +265,29 @@ class NQS:
     def _apply_fun_sh(self, s, *, parameters, batch_size):
         return self.apply_fun(parameters, s)
 
+    def call_ratio(self, s, sp):
+        """
+        Evaluate variational wave function.
+        
+        Compute the logarithmic wave function coefficients :math:`\\ln\\psi(s)` for \
+        computational configurations :math:`s`.
+        
+        Args:
+            * ``s``: Array of computational basis states.
+        Returns:
+            Logarithmic wave function coefficients :math:`\\ln\\psi(s)`.
+        
+        :meta public:
+        """ 
+        if self.eval_ratio:
+            return self._apply_ratio_sh(s, sp, parameters=self.parameters, batch_size=self.batchSize)
+        
+        return jnp.exp(self(sp) - self(s))
+    
+    @sharded()
+    def _apply_ratio_sh(self, s, sp, *, parameters, batch_size):
+        return self.apply_fun(parameters, s, sp, method=self.net.eval_ratio)
+
     def gradients(self, s):
         """
         Compute gradients of logarithmic wave function.
@@ -317,6 +347,8 @@ class NQS:
         if "eval_real" in dir(self.net):
             if callable(self.net.eval_real):
                 return lambda p, x: jnp.real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
+        elif self._eval_ratio:
+            return lambda p, x, y: self.apply_fun(p, x, y, method=self.net.eval_ratio), self.parameters
         else:
             return lambda p, x: jnp.real(self.apply_fun(p, x)), self.parameters
     

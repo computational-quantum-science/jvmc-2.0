@@ -159,6 +159,14 @@ class TestMC(unittest.TestCase):
 
         _test_sampling(net, self, two_nets=True)
 
+    def test_MCMC_sampling_ratio(self):
+        rbm = nets.rbm.CpxRBM_ratio(numHidden=2, bias=False)
+        orbit = jVMC_exp.util.symmetries.get_orbit_1D(4, "translation", "reflection", "spinflip")
+        net = SymNet(net=rbm, orbit=orbit)
+        
+        _test_sampling(net, self, test_two_samplers=True)
+
+
     # def test_autoregressive_sampling(self):
     #     rnn = nets.RNN1DGeneral(L=4, hiddenSize=5, depth=2)
     #     rbm = nets.RBM(numHidden=2, bias=False)
@@ -239,13 +247,12 @@ class TestExactSampler(unittest.TestCase):
 
         # Compute exact probabilities
         s, psi_s, _ = exact_sampler.sample()
-
-        self.assertTrue(jnp.max((psi(s) - psi_s) / psi_s) < 1e-14)
+        self.assertTrue(jnp.max(jnp.abs((psi(s) - psi_s) / psi_s)) < 1e-14)
         
         s, psi_s, _ = exact_sampler.sample(parameters=p0)
 
         psi.parameters = p0
-        self.assertTrue(jnp.max((psi(s) - psi_s) / psi_s) < 1e-14)
+        self.assertTrue(jnp.max(jnp.abs((psi(s) - psi_s) / psi_s)) < 1e-14)
 
 if __name__ == "__main__":
     unittest.main()
