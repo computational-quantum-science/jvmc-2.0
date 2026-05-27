@@ -5,7 +5,6 @@ import flax
 from flax.core.frozen_dict import freeze
 import flax.linen as nn
 import collections
-from math import isclose
 from typing import Tuple
 from functools import reduce
 import copy
@@ -69,8 +68,7 @@ class NQS:
                 self._isGenerator = True
 
         self._eval_ratio = False
-        if "eval_ratio" in dir(net):
-            if callable(net.eval_ratio):
+        if "eval_ratio" in dir(net) and callable(net.eval_ratio):
                 self._eval_ratio = True
         if orbit is not None:
             net = SymNet(net=net, orbit=orbit, avgFun=avgFun)
@@ -283,8 +281,8 @@ class NQS:
         """ 
         if self.eval_ratio:
             return self._apply_ratio_sh(s, sp, parameters=self.parameters, batch_size=self.batchSize)
-        else:
-            return jnp.exp(self(sp) - self(s))
+        
+        return jnp.exp(self(sp) - self(s))
     
     @sharded()
     def _apply_ratio_sh(self, s, sp, *, parameters, batch_size):

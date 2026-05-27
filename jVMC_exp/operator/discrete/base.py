@@ -1,5 +1,5 @@
 from __future__ import annotations
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import jax.numpy as jnp
 
 from jVMC_exp.vqs import NQS
@@ -78,18 +78,15 @@ class Operator(AbstractOperator):
     def get_O_loc(self, s, psi: NQS, *, logPsiS=None, **kwargs):
         s_p, matEls = self.get_conn_elements(s, psi.batchSize, **kwargs)
 
-        logPsiS = psi(s) if logPsiS is None else logPsiS
-        logPsiS_p = psi(s_p.reshape((-1, *psi.sampleShape))).reshape(matEls.shape)
-
         if psi.eval_ratio:
             logPsi_ratio = psi.call_ratio(jnp.repeat(s,matEls.shape[1], axis=0), s_p.reshape((-1, *psi.sampleShape))).reshape(matEls.shape)
 
             return self._get_O_loc_ratio(logPsi_ratio, matEls, batch_size=psi.batchSize) 
-        else:
-            logPsiS = psi(s) if logPsiS is None else logPsiS
-            logPsiS_p = psi(s_p.reshape((-1, *psi.sampleShape))).reshape(matEls.shape)
+        
+        logPsiS = psi(s) if logPsiS is None else logPsiS
+        logPsiS_p = psi(s_p.reshape((-1, *psi.sampleShape))).reshape(matEls.shape)
 
-            return self._get_O_loc(logPsiS, logPsiS_p, matEls, batch_size=psi.batchSize) 
+        return self._get_O_loc(logPsiS, logPsiS_p, matEls, batch_size=psi.batchSize) 
     
     @sharded(use_vmap=False)
     def _get_O_loc(self, logPsiS, logPsiS_p, matEls, *, batch_size):
