@@ -127,7 +127,7 @@ class AbstractMCSampler(AbstractSampler):
                 raise ValueError(f"The provided initState has the wrog sample shape. \
                                 Got {self.initial_states.shape[1:]}, while sampleShape is {self.sampleShape}.")
             elif numChains - self.initial_states[0] < 0:
-                raise ValueError(f"The number of chain if initState ({self.states.shape[0]}) \
+                raise ValueError(f"The number of chain in initState ({self.states.shape[0]}) \
                                  is greater than the provided numChains ({numChains}).")
 
         self.logProbFactor = logProbFactor
@@ -175,6 +175,21 @@ class AbstractMCSampler(AbstractSampler):
     
     @numChains.setter
     def numChains(self, value):
+        if value > self.net.batchSize:
+            Warning(
+                f"numChains ({value}) is larger than the batch size ({self.net.batchSize}), "
+                "which may lead to an out-of-memory error. "
+                "Automatically setting numChains = batchSize."
+            )
+            value = self.net.batchSize
+            if self.initial_states is not None:
+                if value - self.initial_states[0] < 0:
+                    self.initial_states = self.initial_states[:value]
+        if self.numSamples < value:
+            raise ValueError(
+                f"The provided number of chains {value} is bigger than the number of samples {self.numSamples}. "
+            )
+
         self._numChains = value
         self._is_state_initialized = False
         self._get_samples_jsh = {}
@@ -252,7 +267,7 @@ class AbstractMCSampler(AbstractSampler):
             self.states = self.initial_states.astype(dtype)
             res = self.numChains - self.states.shape[0]
             if res > 0:
-                pad = jnp.zeros((res,) + self.sampleShape, dtype=dtype)
+                pad = initializer(initStateKey, (res,) + self.sampleShape, dtype)
                 self.states = jnp.concat([self.initial_states, pad])
         else:
             self.states = initializer(initStateKey, (self.numChains,) + self.sampleShape, dtype)
