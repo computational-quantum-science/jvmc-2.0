@@ -9,6 +9,7 @@ class SolverState():
     covar_grad_o_loc: Callable[[], SampledObs] | None = None
     rhs_trans_fn: Callable | None = None
     exact_sampler: bool = False
+    holomorphic: bool = False
 
 class AbstractSolver(ABC):
     @property

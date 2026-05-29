@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+from typing import Callable
 
 from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
@@ -17,9 +18,13 @@ class MinSR(AbstractOptimizer):
     """
     def __init__(self, sampler, psi, pinvTol=1e-14, diagonalShift=1e-3):
         self.pinvTol = pinvTol
-        self.diagonalShift = diagonalShift
+        self._diag_shift_fn = diagonalShift if isinstance(diagonalShift, Callable) else lambda step: diagonalShift
+        self.diagonalShift = self._diag_shift_fn(0)
 
         super().__init__(sampler, psi, use_cross_valiadation=False)
+
+    def update_hyperparams(self, step):
+        self.diagonalShift = self._diag_shift_fn(step)
 
     def get_update(self, objective_function_output: ObjectiveFunctionOutput):
         """

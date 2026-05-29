@@ -64,7 +64,8 @@ class PinvSNR(AbstractSolver):
 
             first = False
 
-        update = jnp.real(jnp.dot(self.last_eigenvectors, (pinvEv * self._VtF)))
+        update = jnp.dot(self.last_eigenvectors, (pinvEv * self._VtF))
+        update = update if solver_state.holomorphic else jnp.real(update)
         info = dict(
             residual=residual.item(),
             pinv_cutoff=max(cutoff, self.pinv_cutoff),
