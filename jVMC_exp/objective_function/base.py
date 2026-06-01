@@ -60,7 +60,11 @@ class Estimator(AbstractObjectiveFunction):
             self._is_grad_init = True
 
         value = self(sampler)
-        grad = self._get_estimator_grad(sampler.samples, parameters=sampler.net.parameters, batch_size=sampler.net.batchSize)
+        grad = SampledObs(self._get_estimator_grad(
+            sampler.samples, 
+            parameters=sampler.net.parameters, 
+            batch_size=sampler.net.batchSize
+        ), sampler.weights)
 
         return ObjectiveFunctionOutput(o_loc=value, grad=grad)
 
