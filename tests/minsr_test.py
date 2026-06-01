@@ -18,7 +18,7 @@ class TestGsSearch(unittest.TestCase):
         
         batch_size = int(2 ** L)
         learning_rate = 1e-2
-        num_steps = 200
+        num_steps = 150
 
         for hx, exE in zip(hxs, exEs):
             # Set up variational wave function
@@ -31,17 +31,19 @@ class TestGsSearch(unittest.TestCase):
                 H += J * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) + hx * op.SigmaX(l)
 
             # Set up exact sampler
-            exact_sampler = sampler.ExactSampler(psi, 2)
+            exact_sampler = sampler.ExactSampler(psi, lDim=2)
 
-            tdvp_equation = jVMC_exp.util.MinSR(exact_sampler, pinvTol=1e-6, diagonalShift=1e-3)
-            stepper = jVMC_exp.util.Euler(timeStep=learning_rate)
+            # set up the minsr solver
+            solver = jVMC_exp.optimizer.MinSR(exact_sampler, psi, pinvTol=1e-6, diagonalShift=1e-3, centered=True)
+            stepper = jVMC_exp.stepper.Euler(timeStep=learning_rate)
+            objective = jVMC_exp.objective_function.Observable(operator=H)
 
             for _ in tqdm.tqdm(range(num_steps)):
-                psi.parameters, _ = stepper.step(0, tdvp_equation, psi.parameters_flat, hamiltonian=H, psi=psi)
+                psi.parameters, _ = stepper.step(0, solver, psi.parameters_flat, objective_function=objective)
 
-            obs = measure({"energy": H}, psi, exact_sampler)
-            print(jnp.abs((obs['energy']['mean'] - exE) / exE))
-            self.assertTrue(jnp.max(jnp.abs((obs['energy']['mean'] - exE) / exE)) < 1e-3)
+            obs = solver.o_loc.mean[0]
+            print(jnp.abs((obs - exE) / exE))
+            self.assertTrue(jnp.max(jnp.abs((obs - exE) / exE)) < 1e-3)
 
 if __name__ == "__main__":
     unittest.main()
