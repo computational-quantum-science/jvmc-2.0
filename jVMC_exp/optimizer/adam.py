@@ -17,6 +17,7 @@ class Adam(AbstractOptimizer):
 
         self._adam = adam(learning_rate, b1, b2, eps)
         self._opt_state = self._adam.init(self.psi.parameters_flat)
+        self._stepper = Euler(1)
 
     def get_update(self, objective_function_out: ObjectiveFunctionOutput):
         grad = objective_function_out.grad.mean.squeeze()
@@ -38,20 +39,18 @@ class Adam(AbstractOptimizer):
             save_meta_data: bool = False,
             **objective_function_kwargs
         ):
-        stepper = Euler(1)
-
         pbar = tqdm.tqdm(range(steps))
         for n in pbar: 
-            stepper.update_dt(n)
-            self.psi.parameters, _ = stepper.step(
-                0,
-                self,
-                self.psi.parameters_flat,
-                objective_function=objective_function,
-                **objective_function_kwargs
-            )
-            
+            self._stepper.update_dt(n)
+            self.update_hyperparams(n)
+
+            # Updating the parameters after the measurements, 
+            # allows to reuse the samples for the measurement of the observables
+            # saving one sample call per step
+            new_parameters, _ = self.step(0, self._stepper, objective_function, **objective_function_kwargs)
+            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out     
             self._measure_and_store(n, observables, save_meta_data)
+            self.psi.parameters = new_parameters
 
             pbar.set_postfix(E=f"{self.o_loc}")
   

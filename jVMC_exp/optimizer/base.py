@@ -27,6 +27,7 @@ class AbstractOptimizer(ABC):
         self._output_manager = OutputManager()
         self.o_loc = None
         self._elapsed = 0
+        self._sampler_out = (None,) * 3
 
     @property
     def output_manager(self):
@@ -69,8 +70,8 @@ class AbstractOptimizer(ABC):
 
         # Get sample
         self.output_manager.start_timing("sampling")
-        samples, _, _ = self.sampler.sample(numSamples=numSamples)
-        self._elapsed += stop_timing("sampling", wait_for=samples)
+        sampler_out = self.sampler.sample(numSamples=numSamples)
+        self._elapsed += stop_timing("sampling", wait_for=sampler_out[0])
 
         # Evaluate local observables and their gradient 
         self.output_manager.start_timing("compute objective function and gradient")
@@ -86,6 +87,7 @@ class AbstractOptimizer(ABC):
 
         if intStep is not None:
             if intStep == 0:
+                self._sampler_out = sampler_out
                 self.o_loc = objective_fn_out.o_loc
                 self._update_meta_data()
 
@@ -96,6 +98,15 @@ class AbstractOptimizer(ABC):
 
         return update
     
+    def step(self, t, stepper: AbstractStepper, objective_function: AbstractObjectiveFunction, **kwargs):
+        return stepper.step(
+                t,
+                self,
+                self.psi.parameters_flat,
+                objective_function=objective_function,
+                **kwargs
+            )
+    
     def ground_state_search(
             self,
             steps,
@@ -103,7 +114,7 @@ class AbstractOptimizer(ABC):
             stepper: AbstractStepper = Euler(),
             observables: Dict[str, ObservableEntry] | None = None,
             save_meta_data: bool = False,
-            **objective_function_kwargs
+            **kwargs # KWARGS ARE FOR BOTH THE STEPPER AND THE OBJECTIVE FUNCTION, TODO: ADD DOCUMENTATION ON THIS
         ):
         if not hasattr(stepper, "update_dt"):
             raise ValueError("For ground state search the stepper must " \
@@ -113,15 +124,14 @@ class AbstractOptimizer(ABC):
         for n in pbar: 
             stepper.update_dt(n)
             self.update_hyperparams(n)
-            self.psi.parameters, _ = stepper.step(
-                0,
-                self,
-                self.psi.parameters_flat,
-                objective_function=objective_function,
-                **objective_function_kwargs
-            )
-            
+
+            # Updating the parameters after the measurements, 
+            # allows to reuse the samples for the measurement of the observables
+            # saving one sample call per step
+            new_parameters, _ = self.step(0, stepper, objective_function, **kwargs)
+            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out     
             self._measure_and_store(n, observables, save_meta_data)
+            self.psi.parameters = new_parameters
 
             pbar.set_postfix(E=f"{self.o_loc}")
   
@@ -139,27 +149,23 @@ class AbstractOptimizer(ABC):
             stepper: AbstractStepper = Euler,
             observables: Dict[str, ObservableEntry] | None = None,
             save_meta_data: bool = False,
-            **objective_function_kwargs
+            **kwargs
         ):
 
         pbar = tqdm.tqdm(total=t_max)
         t = 0
         while t < t_max:
-            self.psi.parameters, dt = stepper.step(
-                t,
-                self,
-                self.psi.parameters_flat,
-                objective_function=objective_function,
-                **objective_function_kwargs
-            )
+            new_parameters, dt = self.step(t, stepper, objective_function, **kwargs) 
+            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out 
+            self._measure_and_store(t, observables, save_meta_data)
+            self.psi.parameters = new_parameters
 
             dt = float(dt)
-            if t + dt >= t_max:
-                dt = t_max - t
-            t += dt
-
             self.meta_data['dt'] = dt
-            self._measure_and_store(t, observables, save_meta_data)
+            if t + dt >= t_max:
+                t += dt
+                break
+            t += dt            
 
             pbar.update(1)
             pbar.set_postfix({
@@ -169,6 +175,10 @@ class AbstractOptimizer(ABC):
                 'Progress': f'{int(t / t_max * 100)}%',
                 'E': f"{self.o_loc}",
             })
+        
+        self.meta_data['dt'] = dt
+        self.sampler.sample()
+        self._measure_and_store(t, observables, save_meta_data)
 
         pbar.close()
         self.output_manager.print_timings()
@@ -229,11 +239,8 @@ class Evolution(AbstractOptimizer):
             self._lhs_trans_fn = (lambda x: jnp.real(x)) if make_real else (lambda x: 1j * jnp.imag(x))
         self._rhs_trans_fn = lambda x: self._lhs_trans_fn((- self.rhsPrefactor) * x)
 
-        self._diag_shift_fn = diagonalShift if isinstance(diagonalShift, Callable) else lambda step: diagonalShift
-        self.diag_shift = self._diag_shift_fn(0)
-
-        self._diag_scale_fn = diagonalScale if isinstance(diagonalScale, Callable) else lambda step: diagonalScale
-        self.diag_scale = self._diag_scale_fn(0)
+        self.diag_scale = diagonalScale
+        self.diag_shift = diagonalShift
 
         self._make_cmplx_fn = jax.jit(partial(make_cmplx_array, params_shape=psi.paramShapes))
         self._make_real_fn = jax.jit(partial(make_real_array, params_shape=psi.paramShapes))
@@ -270,18 +277,33 @@ class Evolution(AbstractOptimizer):
     def solver_state(self):
         return self._solver_state
     
+    @property
+    def diag_scale(self):
+        return self._diag_scale
+    
+    @diag_scale.setter
+    def diag_scale(self, value):
+        self._diag_scale_fn = value if isinstance(value, Callable) else lambda step: value
+        self._diag_scale = self._diag_scale_fn(0)
+
+    @property
+    def diag_shift(self):
+        return self._diag_shift
+    
+    @diag_shift.setter
+    def diag_shift(self, value):
+        self._diag_shift_fn = value if isinstance(value, Callable) else lambda step: value
+        self._diag_shift = self._diag_shift_fn(0)
+
     def update_hyperparams(self, step):
-        self.diag_shift = self._diag_shift_fn(step)
-        self.diag_scale = self._diag_scale_fn(step)
+        self._diag_shift = self._diag_shift_fn(step)
+        self._diag_scale = self._diag_scale_fn(step)
     
     def get_update(self, objective_function_output: ObjectiveFunctionOutput):
+        if self.psi.holomorphic:
+            objective_function_output = objective_function_output.transform(self._remove_double_trans)
         grad = objective_function_output.grad
         grad_log_psi = objective_function_output.grad_log_psi
-
-        if self.psi.holomorphic:
-            grad = grad.transform(self._remove_double_trans)
-            grad_log_psi = grad_log_psi.transform(self._remove_double_trans)
-
         self._covar_grad_o_loc = grad
 
         S = self._get_lhs(grad_log_psi)
@@ -291,26 +313,24 @@ class Evolution(AbstractOptimizer):
 
         return self.update
     
-    # TODO: Test if this actually works (tdvp error has to be handled in a different way)
     def cross_validation(self, objective_function_output: ObjectiveFunctionOutput):
-        o_loc_1 = objective_function_output.o_loc.get_subset(start=0, step=2)
-        grad_1 = objective_function_output.grad.get_subset(start=0, step=2)
-        grad_log_psi_1 = objective_function_output.grad_log_psi.get_subset(start=0, step=2)
-        grad_2 = objective_function_output.grad.get_subset(start=1, step=2)
-        grad_log_psi_2 = objective_function_output.grad_log_psi.get_subset(start=1, step=2)
+        residual = self.meta_data["residual"]
+        tvp_error = self.meta_data["tdvp_error"]
+        objective_fn_out_1 = objective_function_output.get_subset(start=0, step=2)
+        objective_fn_out_2 = objective_function_output.get_subset(start=1, step=2)
 
-        update_1 = self.get_update(o_loc_1, grad_1, grad_log_psi_1)
-        F2 = self._get_rhs(grad_2)
-        S2 = self._get_lhs(grad_log_psi_2)
-
+        update_1 = self.get_update(objective_fn_out_1)
         validation_tdvp_err = self._get_tdvp_error(update_1)
-        _ = self.get_update(objective_function_output)
-        update_1 = self._make_cmplx_fn(update_1) if self.psi.holomorphic else update_1
+        if self.psi.holomorphic:
+            update_1 = self._make_cmplx_fn(update_1)
+            objective_fn_out_2 = objective_fn_out_2.transform(self._remove_double_trans)
+        F2 = self._get_rhs(objective_fn_out_2.grad)
+        S2 = self._get_lhs(objective_fn_out_2.grad_log_psi)
         Sv = S2(update_1) if callable(S2) else S2.dot(update_1)
-        validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / self._additional_info["residual"]
+        validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / residual
 
         crossValidationFactor_residual = validation_residual
-        crossValidationFactor_tdvpErr = validation_tdvp_err / self.meta_data["tdvp_error"]
+        crossValidationFactor_tdvpErr = validation_tdvp_err / tvp_error
         self.meta_data["tdvp_residual_cross_validation_ratio"] = crossValidationFactor_residual
         self.meta_data["tdvp_error_cross_validation_ratio"] = crossValidationFactor_tdvpErr
 
