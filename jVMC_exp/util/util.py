@@ -1,6 +1,7 @@
+from __future__ import annotations
 import jax.numpy as jnp
 import collections
-from typing import Dict, Union, Any
+from typing import Dict, Union, Any, TYPE_CHECKING
 import numpy as np
 from functools import partial
 import jax
@@ -13,7 +14,9 @@ from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler import AbstractMCSampler
 from jVMC_exp.operator.base import AbstractOperator
 import jVMC_exp.operator.discrete.branch_free as op
-from jVMC_exp.optimizer import TDVP
+
+if TYPE_CHECKING:
+    from jVMC_exp.optimizer import TDVP
 
 OperatorWithKwargs = tuple[AbstractOperator, dict[str, Any]]
 ObservableEntry = Union[AbstractOperator, OperatorWithKwargs]
