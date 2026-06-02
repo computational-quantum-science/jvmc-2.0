@@ -102,7 +102,7 @@ class TestOperator(unittest.TestCase):
             '0_1': commutator(0, 1),
             '1_0': commutator(1, 0)
         }
-        out_dict = jVMC_exp.util.measure(observalbes_dict, psi, sampler)
+        out_dict = jVMC_exp.util.measure(observalbes_dict, sampler)
 
         self.assertTrue(
             jnp.allclose(

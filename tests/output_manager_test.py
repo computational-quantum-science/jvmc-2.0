@@ -1,46 +1,144 @@
-import unittest
-import numpy as np
-import h5py
 import os
+import time
+import unittest
 
-from jVMC_exp.util.output_manager import OutputManager
+import h5py
+import numpy as np
 
-class TestOutputManger(unittest.TestCase):
-    def test_output(self):
-        outp = OutputManager("test.h5", append=False)
-        outp.set_group("test")
+from jVMC_exp.util.output_manager import OutputManager  
 
-        with h5py.File("test.h5") as f:
-            self.assertTrue(len(f.keys()) == 1)
-            self.assertTrue("test" in f.keys())
 
-        x = np.array([13.2])
-        outp.write_metadata(0.3, bla=x)
-        with h5py.File("test.h5") as f:
-            self.assertTrue("metadata" in f["test"].keys())
-            self.assertTrue("bla" in f["test"]["metadata"].keys())
-            self.assertTrue(np.allclose(f["test"]["metadata"]["bla"][0], x))
+class TestOutputManager(unittest.TestCase):
 
-        y = 99.1
-        outp.write_metadata(0.5, bla=y)
-        with h5py.File("test.h5") as f:
-            self.assertTrue(np.allclose(f["test"]["metadata"]["bla"], np.array([x, [y]])))
+    def setUp(self):
+        self.h5 = "test_output.h5"
+        self.outp = OutputManager()
 
+    def tearDown(self):
+        if os.path.exists(self.h5):
+            os.remove(self.h5)
+
+    # ------------------------------------------------------------------
+    # metadata
+    # ------------------------------------------------------------------
+
+    def test_metadata_times_recorded(self):
+        self.outp.write_metadata(0.3, bla=1.0)
+        self.outp.write_metadata(0.5, bla=2.0)
+        self.outp.save_to_h5(self.h5)
+
+        with h5py.File(self.h5) as f:
+            times = f["metadata/times"][()]
+            self.assertTrue(np.allclose(times, [0.3, 0.5]))
+
+    # ------------------------------------------------------------------
+    # observables
+    # ------------------------------------------------------------------
+
+    def test_observables_nested_dict(self):
+        """Nested dict kwargs must create sub-groups in the HDF5 file."""
         x = np.random.uniform(1, 2, size=(13,))
         y = np.random.uniform(-1, 1, size=(3,))
-        outp.write_observables(0.1, obs1={"mean": x}, obs2={"mean": y})
-        with h5py.File("test.h5") as f:
-            self.assertTrue("observables" in f["test"].keys())
-            self.assertTrue("obs1" in f["test"]["observables"].keys())
-            self.assertTrue(np.allclose(f["test"]["observables"]["obs1"]["mean"][0], x))
-            self.assertTrue(np.allclose(f["test"]["observables"]["obs2"]["mean"][0], y))
+        self.outp.write_observables(0.1, obs1={"mean": x}, obs2={"mean": y})
+        self.outp.save_to_h5(self.h5)
 
-        y = 99.1
-        outp.write_observables(0.5, bla={"mean": y})
-        with h5py.File("test.h5") as f:
-            self.assertTrue(np.allclose(f["test"]["observables"]["bla"]["mean"][0], np.array([y])))
+        with h5py.File(self.h5) as f:
+            self.assertIn("observables", f)
+            self.assertIn("obs1", f["observables"])
+            self.assertIn("obs2", f["observables"])
+            self.assertTrue(np.allclose(f["observables/obs1/mean"][0], x))
+            self.assertTrue(np.allclose(f["observables/obs2/mean"][0], y))
 
-        os.remove("test.h5")
+    def test_observables_times_and_values(self):
+        """Times and values accumulate across multiple write_observables calls."""
+        self.outp.write_observables(0.1, energy=1.0)
+        self.outp.write_observables(0.5, energy=2.0)
+        self.outp.save_to_h5(self.h5)
 
-if __name__ == '__main__':
+        with h5py.File(self.h5) as f:
+            self.assertTrue(np.allclose(f["observables/times"][()], [0.1, 0.5]))
+            self.assertTrue(np.allclose(f["observables/energy"][()], [1.0, 2.0]))
+
+    def test_observables_scalar_nested(self):
+        """Scalar inside a nested dict is stored as a single-element row."""
+        self.outp.write_observables(0.5, bla={"mean": 99.1})
+        self.outp.save_to_h5(self.h5)
+
+        with h5py.File(self.h5) as f:
+            self.assertTrue(np.allclose(f["observables/bla/mean"][0], [99.1]))
+
+    # ------------------------------------------------------------------
+    # network checkpoints
+    # ------------------------------------------------------------------
+
+    def test_network_checkpoint_roundtrip(self):
+        """Checkpoint stored in memory and retrieved by index and time."""
+        weights = np.random.uniform(size=(5,))
+        self.outp.write_network_checkpoint(1.0, weights)
+
+        t, w = self.outp.get_network_checkpoint()       
+        self.assertAlmostEqual(t, 1.0)
+        self.assertTrue(np.allclose(w, weights))
+
+        t, w = self.outp.get_network_checkpoint(time=1.0)
+        self.assertAlmostEqual(t, 1.0)
+        self.assertTrue(np.allclose(w, weights))
+
+    def test_network_checkpoint_saved_to_h5(self):
+        weights = np.random.uniform(size=(4,))
+        self.outp.write_network_checkpoint(2.0, weights)
+        self.outp.save_to_h5(self.h5)
+
+        with h5py.File(self.h5) as f:
+            self.assertIn("network_checkpoints", f)
+            self.assertTrue(np.allclose(f["network_checkpoints/checkpoints"][0], weights))
+
+    # ------------------------------------------------------------------
+    # append mode
+    # ------------------------------------------------------------------
+
+    def test_save_append_overwrites_datasets(self):
+        """Calling save_to_h5 twice with append=True should replace datasets."""
+        self.outp.write_observables(0.1, energy=1.0)
+        self.outp.save_to_h5(self.h5)
+        self.outp.write_observables(0.5, energy=2.0)
+        self.outp.save_to_h5(self.h5, append=True)
+
+        with h5py.File(self.h5) as f:
+            self.assertEqual(len(f["observables/times"][()]), 2)
+
+    # ------------------------------------------------------------------
+    # load roundtrip
+    # ------------------------------------------------------------------
+
+    def test_load_from_h5_roundtrip(self):
+        """load_from_h5 should reconstruct the same arrays."""
+        self.outp.write_observables(0.1, energy=1.0)
+        self.outp.write_observables(0.5, energy=2.0)
+        self.outp.save_to_h5(self.h5)
+
+        loaded = OutputManager.load_from_h5(self.h5)
+        self.assertTrue(np.allclose(loaded["observables"]["times"], [0.1, 0.5]))
+        self.assertTrue(np.allclose(loaded["observables"]["energy"], [1.0, 2.0]))
+
+    # ------------------------------------------------------------------
+    # timings
+    # ------------------------------------------------------------------
+
+    def test_timings_accumulate(self):
+        self.outp.start_timing("step")
+        time.sleep(0.02)
+        elapsed = self.outp.stop_timing("step")
+        self.assertGreater(elapsed, 0.01)
+        self.assertGreater(self.outp._timings["step"]["total"], 0.0)
+        self.assertEqual(self.outp._timings["step"]["count"], 1)
+
+    def test_add_timing(self):
+        self.outp.add_timing("manual", 0.5)
+        self.outp.add_timing("manual", 0.3)
+        self.assertAlmostEqual(self.outp._timings["manual"]["total"], 0.8, places=9)
+        self.assertEqual(self.outp._timings["manual"]["count"], 2)
+
+
+if __name__ == "__main__":
     unittest.main()

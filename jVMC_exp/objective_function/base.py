@@ -13,6 +13,20 @@ class ObjectiveFunctionOutput():
     grad: SampledObs | None = None
     grad_log_psi: SampledObs | None = None
 
+    def get_subset(self, start=None, end=None, step=None):
+        return ObjectiveFunctionOutput(
+            o_loc=self.o_loc.get_subset(start=start, end=end, step=step) if self.o_loc is not None else None,
+            grad=self.grad.get_subset(start=start, end=end, step=step) if self.grad is not None else None,
+            grad_log_psi=self.grad_log_psi.get_subset(start=start, end=end, step=step ) if self.grad_log_psi is not None else None
+        )
+    
+    def transform(self, element_wise_fn=lambda x: x, linear_map=None):
+        return ObjectiveFunctionOutput(
+            o_loc=self.o_loc.transform(element_wise_fn, linear_map) if self.o_loc is not None else None,
+            grad=self.grad.transform(element_wise_fn, linear_map) if self.grad is not None else None,
+            grad_log_psi=self.grad_log_psi.transform(element_wise_fn, linear_map) if self.grad_log_psi is not None else None
+        )
+
 class AbstractObjectiveFunction(ABC):
     @abstractmethod
     def __call__(self, sampler: AbstractSampler, **kwargs) -> SampledObs:
@@ -60,7 +74,11 @@ class Estimator(AbstractObjectiveFunction):
             self._is_grad_init = True
 
         value = self(sampler)
-        grad = self._get_estimator_grad(sampler.samples, parameters=sampler.net.parameters, batch_size=sampler.net.batchSize)
+        grad = SampledObs(self._get_estimator_grad(
+            sampler.samples, 
+            parameters=sampler.net.parameters, 
+            batch_size=sampler.net.batchSize
+        ), sampler.weights)
 
         return ObjectiveFunctionOutput(o_loc=value, grad=grad)
 
