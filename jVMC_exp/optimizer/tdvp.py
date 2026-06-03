@@ -1,5 +1,10 @@
+from typing import Dict
+
 from .base import Evolution
 from jVMC_exp.solver.pinv_snr import PinvSNR
+from jVMC_exp.objective_function import AbstractObjectiveFunction
+from jVMC_exp.stepper import AbstractStepper, Euler
+from jVMC_exp.util import ObservableEntry
 
 class TDVP(Evolution):
     def __init__(
@@ -9,4 +14,18 @@ class TDVP(Evolution):
         super().__init__(
             sampler, psi, False, make_real, 
             use_cross_valiadation, diagonalShift, diagonalScale, solver
+        )
+
+    def ground_state_search(
+            self,
+            steps,
+            objective_function: AbstractObjectiveFunction,
+            stepper: AbstractStepper = Euler(),
+            observables: Dict[str, ObservableEntry] | None = None,
+            save_meta_data: bool = False,
+            **kwargs
+        ):
+        raise NotImplementedError(
+            "The SR optimizer is intended for ground state search only and "
+            "cannot be used for time evolution. Use jVMC_exp.optimizer.TDVP instead."
         )
