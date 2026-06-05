@@ -156,12 +156,12 @@ class AbstractOptimizer(ABC):
         t = 0
         while t < t_max:
             new_parameters, dt = self.step(t, stepper, objective_function, **kwargs) 
-            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out 
+            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out
+            dt = float(dt)
+            self.meta_data['dt'] = dt 
             self._measure_and_store(t, observables, save_meta_data)
             self.psi.parameters = new_parameters
 
-            dt = float(dt)
-            self.meta_data['dt'] = dt
             if t + dt >= t_max:
                 t += dt
                 break
