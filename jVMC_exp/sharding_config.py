@@ -168,9 +168,10 @@ class sharded:
                     if len(self.vmap_in_axes) != len(args):
                         raise ValueError(f"vmap_in_axes length ({len(self.vmap_in_axes)}) must match "
                                          f"number of args ({len(args)})")
-                    
-                if kwargs['batch_size'] % MESH.size != 0:
-                    raise ValueError(f"The batch size ({kwargs['batch_size']}) has to be divisible by the number of devices ({MESH.size})")
+                
+                if kwargs['batch_size'] is not None and kwargs['batch_size'] % MESH.size != 0:
+                    raise ValueError(f"The batch size ({kwargs['batch_size']}) "
+                                     f"has to be divisible by the number of devices ({MESH.size})")
                 
                 static_kwargs = {k: v for k, v in kwargs.items() if k in self.static_kwarg_names}
                 base_fn = lambda kw, *a: method(instance, *a, **kw, **static_kwargs)
@@ -208,6 +209,10 @@ class sharded:
     def _batched_wrapper(self, batch_size, kwargs, *args, jsh_fn):
         """Wrapper for batched computation - assumes batch_size is divisible by number of devices."""
         num_samples = args[0].shape[0]
+        trim = True
+        if batch_size is None:
+            batch_size = num_samples
+            trim = False
         append = (-num_samples) % batch_size
         total_sumples = num_samples + append
 
@@ -229,7 +234,9 @@ class sharded:
 
         def stack_reshape_trim(*xs):
             x = jnp.stack(xs)
-            x = x.reshape((-1,) + x.shape[2:])
-            return x[:num_samples]
+            if trim:
+                x = x.reshape((-1,) + x.shape[2:])
+                return x[:num_samples]
+            return x
 
         return jax.tree_util.tree_map(stack_reshape_trim, *results)
