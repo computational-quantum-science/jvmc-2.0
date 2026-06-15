@@ -34,7 +34,7 @@ class TestGsSearch(unittest.TestCase):
             
             loss_function = jVMC_exp.objective_function.Observable(H)
             stepper = jVMC_exp.stepper.Euler(timeStep=learning_rate)
-            opt = jVMC_exp.optimizer.MinSR(exact_sampler, psi, pinvTol=1e-6, diagonalShift=1e-3)
+            opt = jVMC_exp.optimizer.MinSR(exact_sampler, psi, pinv_tol=1e-6, diagonalShift=1e-3)
 
             opt.ground_state_search(num_steps, loss_function, stepper)
 
