@@ -6,6 +6,7 @@ from jVMC_exp.sampler import AbstractSampler
 from jVMC_exp.vqs import NQS
 from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
+from jVMC_exp.util.output_manager import OutputManager
 from jVMC_exp.sharding_config import DEVICE_SPEC, REPLICATED_SPEC, MESH, sharded
 
 @jax.jit
@@ -24,7 +25,10 @@ class MinSR(AbstractOptimizer):
         * ``diagonalSchift``: Regularization parameter :math:`\\lambda`, see below.
         * ``diagonalizeOnDevice``: Choose whether to diagonalize :math:`S` on GPU or CPU.
     """
-    def __init__(self, sampler: AbstractSampler, psi: NQS, pinv_tol=1e-14, diagonalShift=1e-3):
+    def __init__(
+            self, sampler: AbstractSampler, psi: NQS, pinv_tol=1e-14, diagonalShift=1e-3,
+            output_manager: OutputManager | None = None
+        ):
         self.pinv_tol = pinv_tol
         self.diag_shift = diagonalShift
 
@@ -32,7 +36,7 @@ class MinSR(AbstractOptimizer):
         num_devices = MESH.shape["devices"]
         self._params_pad_size = int((num_devices - num_params % num_devices) % num_devices)
 
-        super().__init__(sampler, psi, use_cross_valiadation=False)
+        super().__init__(sampler, psi, use_cross_valiadation=False, output_manager=output_manager)
 
     @property
     def diag_shift(self):

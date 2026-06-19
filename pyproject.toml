@@ -13,7 +13,6 @@ authors = [
 license = { text = "MIT License" }
 keywords = ["Neural quantum states", "Variational Monte Carlo"]
 dependencies = ["numpy>=2", 
-                "openfermion", 
                 "jax>=0.10.1", 
                 "jaxlib>=0.10.1", 
                 "flax>=0.7.0",
