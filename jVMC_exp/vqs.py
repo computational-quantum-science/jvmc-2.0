@@ -10,24 +10,26 @@ from functools import reduce
 import copy
 import flax.linen as nn
 from flax import nnx
+import warnings
 
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
 from jVMC_exp.symmetry_projector import SymmetryProjector, ProjectedOrbitNet
 from jVMC_exp.util.grads import pick_gradient
 from jVMC_exp.util.key_gen import generate_seed, format_key
+import jVMC_exp.global_defs as global_defs
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
 from jVMC_exp.sharding_config import broadcast_split_key, sharded
 
 
-def _has_sample_method(net):
-    if isinstance(net, ProjectedOrbitNet):
-        return callable(getattr(net.base_net, "sample", None))
-    return callable(getattr(net, "sample", None))
+def _is_complex_dtype(dtype):
+    return jnp.issubdtype(jnp.dtype(dtype), jnp.complexfloating)
 
+def _operator_dtype_for(dtype):
+    return global_defs.DT_OPERATORS_CPX if _is_complex_dtype(dtype) else global_defs.DT_OPERATORS_REAL
 
-def _has_eval_ratio_method(net):
-    return callable(getattr(net, "eval_ratio", None))
-
+def _is_low_precision_parameter_dtype(dtype):
+    dtype = jnp.dtype(dtype)
+    return dtype in (jnp.dtype(jnp.float32), jnp.dtype(jnp.complex64))
 
 def check_model(model, nnx_init_kwargs=None):
     if isinstance(model, nn.Module):
@@ -81,6 +83,9 @@ class NQS:
         * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``symmetry_projector.SymmetryProjector``). \
             If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
         * ``symmetry_average``: Built-in symmetry average name or callable passed to ``ProjectedOrbitNet``.
+        * ``mixed_precision``: If ``True``, low-precision parameter storage is allowed while public \
+            amplitudes, ratios, flattened parameters, and gradients are cast to operator precision. \
+            If ``False``, fp32/complex64 parameter storage raises an error.
         * ``nnx_init``: Dictionary of keyword arguments passed to the ``flax.nnx.Module`` constructor, \
             excluding ``rngs`` (which is handled internally). Required when ``net`` is a \
             ``flax.nnx.Module`` subclass or a tuple thereof; ignored otherwise. \
@@ -104,7 +109,9 @@ class NQS:
                                 dict(in_features=10, numHidden=4)))
     """
     def __init__(self, net: nn.Module | Tuple[nn.Module, nn.Module], sampleShape, batchSize: int | None = None, batchSize_per_device: int | None = None, 
-                 logarithmic=True, seed: None | int = None, orbit=None, symmetry_average="exp", nnx_init=None):
+                 logarithmic=True, seed: None | int = None, orbit=None, symmetry_average="exp", nnx_init=None, mixed_precision: bool = False):
+        self._mixed_precision = bool(mixed_precision)
+        self._warned_param_casts = set()
         if isinstance(net, collections.abc.Iterable):
             if len(net) != 2:
                 raise ValueError(f"If a tuple is passed for 'net', this must have len 2. Got {len(net)}.") 
@@ -128,8 +135,12 @@ class NQS:
                 )
             net = ProjectedOrbitNet(base_net=net, symmetry=orbit, symmetry_average=symmetry_average)
         self._net = net
-        self._isGenerator = _has_sample_method(net)
-        self._eval_ratio = _has_eval_ratio_method(net)
+        if isinstance(net, ProjectedOrbitNet):
+            self._isGenerator = callable(getattr(net.base_net, "sample", None))
+        else:
+            self._isGenerator = callable(getattr(net, "sample", None))
+        
+        self._eval_ratio = callable(getattr(net, "eval_ratio", None))
 
         if isinstance(sampleShape, tuple):
             self._sampleShape = sampleShape
@@ -182,6 +193,8 @@ class NQS:
             value = self._param_unflatten(value)
         if 'params' not in value.keys():
             value = {'params': value}
+        if hasattr(self, "paramDtypes"):
+            value = self._cast_param_tree(value)
         if jax.tree_util.tree_structure(value) != jax.tree_util.tree_structure(self.parameters):
             raise ValueError(
                 "Parameter tree structure mismatch.\n"
@@ -215,8 +228,14 @@ class NQS:
             Array holding current values of all variational parameters.
         """
         if not self._realParams:
-            return jnp.concatenate([jnp.concatenate([p.ravel().real, p.ravel().imag]) for p in tree_flatten(self.params)[0]])
-        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]])
+            return jnp.concatenate([
+                jnp.concatenate([
+                    p.ravel().real.astype(global_defs.DT_OPERATORS_REAL),
+                    p.ravel().imag.astype(global_defs.DT_OPERATORS_REAL),
+                ])
+                for p in tree_flatten(self.params)[0]
+            ])
+        return jnp.concatenate([p.ravel().astype(global_defs.DT_OPERATORS_REAL) for p in tree_flatten(self.params)[0]])
     
     @property
     def frozen_parameters(self):
@@ -262,6 +281,10 @@ class NQS:
     @property
     def eval_ratio(self):
         return self._eval_ratio
+
+    @property
+    def mixed_precision(self):
+        return self._mixed_precision
     
     @property
     def holomorphic(self):
@@ -292,6 +315,8 @@ class NQS:
         if seed == None:
             seed = generate_seed()
         self._parameters = jax.device_put(self.net.init(jax.random.PRNGKey(seed), dummy_sample), REPLICATED_SHARDING)
+        self.paramDtypes = [p.dtype for p in tree_flatten(self.parameters["params"])[0]]
+        self._validate_parameter_dtypes()
         self._out_dtype = self.net.apply(self._parameters, dummy_sample).dtype
         
         self._realParams, self._holomorphic, self._flat_gradient_function, self._dict_gradient_function = pick_gradient(
@@ -301,6 +326,7 @@ class NQS:
         self._paramShapes = [(p.size, p.shape) for p in tree_flatten(self.parameters["params"])[0]]
         self._netTreeDef = jax.tree_util.tree_structure(self.parameters["params"])
         self._numParameters = jnp.sum(jnp.array([p.size for p in tree_flatten(self.parameters["params"])[0]]))
+
     
     def __call__(self, s):
         """
@@ -316,7 +342,7 @@ class NQS:
         
         :meta public:
         """ 
-        return self._apply_fun_sh(s, parameters=self.parameters, batch_size=self.batchSize)
+        return self._cast_output(self._apply_fun_sh(s, parameters=self.parameters, batch_size=self.batchSize))
     
     @sharded()
     def _apply_fun_sh(self, s, *, parameters, batch_size):
@@ -339,11 +365,17 @@ class NQS:
         if self.eval_ratio:
             return self._apply_ratio_sh(s, sp, parameters=self.parameters, batch_size=self.batchSize)
         
-        return jnp.exp(self(sp) - self(s))
+        log_psi_s = self._cast_output(self._apply_fun_sh(s, parameters=self.parameters, batch_size=self.batchSize))
+        log_psi_sp = self._cast_output(self._apply_fun_sh(sp, parameters=self.parameters, batch_size=self.batchSize))
+        return self._cast_output(jnp.exp(log_psi_sp - log_psi_s))
     
     @sharded()
     def _apply_ratio_sh(self, s, sp, *, parameters, batch_size):
-        return self.apply_fun(parameters, s, sp, method=self.net.eval_ratio)
+        if self._mixed_precision:
+            log_psi_s = self._cast_output(self.apply_fun(parameters, s))
+            log_psi_sp = self._cast_output(self.apply_fun(parameters, sp))
+            return self._cast_output(jnp.exp(log_psi_sp - log_psi_s))
+        return self._cast_output(self.apply_fun(parameters, s, sp, method=self.net.eval_ratio))
 
     def gradients(self, s):
         """
@@ -359,7 +391,7 @@ class NQS:
             with respect to each variational parameter :math:`\\theta_k` for each \
             input configuration :math:`s`.
         """
-        return self._gradients_sh(s, parameters=self.parameters, batch_size=self.batchSize)
+        return self._cast_output(self._gradients_sh(s, parameters=self.parameters, batch_size=self.batchSize))
     
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_sh(self, s, *, parameters, batch_size):
@@ -369,8 +401,8 @@ class NQS:
         result = self._gradients_dict_sh(s, parameters=self.parameters, batch_size=self.batchSize)
 
         if self.holomorphic:
-            return self._append_gradients_dict_jsh(result, result)
-        return result
+            result = self._append_gradients_dict_jsh(result, result)
+        return tree_map(self._cast_output, result)
     
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_dict_sh(self, s, *, parameters, batch_size):
@@ -402,11 +434,15 @@ class NQS:
             Real part of the NQS and current parameters
         """
         if "eval_real" in dir(self.net) and callable(self.net.eval_real):
-            return lambda p, x: jnp.real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
+            return lambda p, x: jnp.real(self._cast_output(self.apply_fun(p, x, method=self.net.eval_real))), self.parameters
         elif self._eval_ratio:
-            return lambda p, x, y: self.apply_fun(p, x, y, method=self.net.eval_ratio), self.parameters
+            if self._mixed_precision:
+                return lambda p, x, y: self._cast_output(
+                    jnp.exp(self._cast_output(self.apply_fun(p, y)) - self._cast_output(self.apply_fun(p, x)))
+                ), self.parameters
+            return lambda p, x, y: self._cast_output(self.apply_fun(p, x, y, method=self.net.eval_ratio)), self.parameters
         
-        return lambda p, x: jnp.real(self.apply_fun(p, x)), self.parameters
+        return lambda p, x: jnp.real(self._cast_output(self.apply_fun(p, x))), self.parameters
     
     def sample(self, numSamples, key=None, parameters=None):
         if self._isGenerator:
@@ -423,6 +459,67 @@ class NQS:
     @sharded()
     def _sample(self, keys, *, parameters, batch_size):
         return self.net.apply(parameters, keys, method=self.net.sample)
+
+    def _cast_output(self, x):
+        x = jnp.asarray(x)
+        return x.astype(_operator_dtype_for(x.dtype))
+
+    def _validate_parameter_dtypes(self):
+        unsupported = [
+            dtype for dtype in self.paramDtypes
+            if jnp.dtype(dtype) not in (
+                jnp.dtype(jnp.float32),
+                jnp.dtype(jnp.float64),
+                jnp.dtype(jnp.complex64),
+                jnp.dtype(jnp.complex128),
+            )
+        ]
+        if unsupported:
+            raise TypeError(f"Unsupported parameter dtypes: {unsupported}")
+        if not self.mixed_precision and any(_is_low_precision_parameter_dtype(dtype) for dtype in self.paramDtypes):
+            raise ValueError(
+                "NQS has fp32/complex64 parameters but mixed_precision=False. "
+                "Pass mixed_precision=True or initialize the network with fp64/complex128 parameters."
+            )
+
+    def _warn_if_unsafe_param_cast(self, source, target_dtype, leaf_idx):
+        source = jnp.asarray(source)
+        target_dtype = jnp.dtype(target_dtype)
+        if _is_complex_dtype(source.dtype) and not _is_complex_dtype(target_dtype):
+            imag_norm = float(jnp.max(jnp.abs(jnp.imag(source))))
+            if imag_norm > 1e-12 and (leaf_idx, "imag") not in self._warned_param_casts:
+                warnings.warn(
+                    "Casting complex parameter update to a real parameter leaf discards a nonzero imaginary part.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self._warned_param_casts.add((leaf_idx, "imag"))
+        if self.mixed_precision and source.dtype != target_dtype and target_dtype in (jnp.dtype(jnp.float32), jnp.dtype(jnp.complex64)):
+            casted = source.astype(target_dtype).astype(source.dtype)
+            scale = jnp.maximum(jnp.max(jnp.abs(source)), jnp.asarray(1.0, dtype=jnp.real(source).dtype))
+            rel_loss = float(jnp.max(jnp.abs(source - casted)) / scale)
+            if rel_loss > 1e-5 and (leaf_idx, "precision") not in self._warned_param_casts:
+                warnings.warn(
+                    f"Casting parameter update from {source.dtype} to stored dtype {target_dtype} "
+                    f"loses relative precision {rel_loss:.3e}.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self._warned_param_casts.add((leaf_idx, "precision"))
+
+    def _cast_param_tree(self, params):
+        if not hasattr(self, "paramDtypes"):
+            return params
+        payload = params["params"] if isinstance(params, dict) and "params" in params else params
+        leaves, treedef = tree_flatten(payload)
+        if len(leaves) != len(self.paramDtypes):
+            raise ValueError(f"Parameter tree leaf mismatch: got {len(leaves)}, expected {len(self.paramDtypes)}.")
+        casted = []
+        for idx, (p, dtype) in enumerate(zip(leaves, self.paramDtypes)):
+            self._warn_if_unsafe_param_cast(p, dtype, idx)
+            casted.append(jnp.asarray(p, dtype=dtype))
+        payload = tree_unflatten(treedef, casted)
+        return {"params": payload} if isinstance(params, dict) and "params" in params else payload
  
     def _param_unflatten(self, P):
         """
@@ -443,4 +540,4 @@ class NQS:
                 PTreeShape.append(P[start:start + s[0]].reshape(s[1]))
                 start += s[0]
         
-        return tree_unflatten(self._netTreeDef, PTreeShape)
+        return self._cast_param_tree(tree_unflatten(self._netTreeDef, PTreeShape))
