@@ -15,7 +15,6 @@ sys.path.append(sys.path[0] + "/../..")
 import jVMC_exp
 import jVMC_exp.global_defs as global_defs
 from jVMC_exp.nets.initializers import init_fn_args
-from jVMC_exp.util.symmetries import LatticeSymmetry
 
 from functools import partial
 

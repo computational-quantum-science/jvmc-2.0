@@ -7,6 +7,7 @@ import flax.linen as nn
 import jVMC_exp
 import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
+from jVMC_exp.symmetry_projector import square_translation_symmetry
 from jVMC_exp.global_defs import DT_SAMPLES
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC
 import jVMC_exp.global_defs as global_defs
@@ -102,9 +103,8 @@ class TestGradients(unittest.TestCase):
             num_samples = 4
 
             rbm = nets.CpxRBM(numHidden=2**k, bias=True)
-            orbit = jVMC_exp.util.symmetries.get_orbit_1D(L)
-            net = nets.sym_wrapper.SymNet(net=rbm, orbit=orbit)
-            psiC = NQS(net, L, num_samples)
+            orbit = square_translation_symmetry(L, 1, "spin")
+            psiC = NQS(rbm, L, num_samples, orbit=orbit)
 
             self.assertTrue(psiC.holomorphic)
 
@@ -113,8 +113,8 @@ class TestGradients(unittest.TestCase):
         num_samples = 4
 
         rbm = nets.CpxRBM(numHidden=2, bias=True)
-        orbit = jVMC_exp.util.symmetries.get_orbit_1D(L)
-        model = nets.sym_wrapper.SymNet(net=rbm, orbit=orbit)
+        orbit = square_translation_symmetry(L, 1, "spin")
+        model = orbit * rbm
 
         _general_test_grad(model, num_samples, L, self)
 

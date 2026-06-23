@@ -28,13 +28,23 @@ def _as_h5_array(value: Any):
     return arr
 
 
+def check__network_parameter_shape(weights: Any) -> bool:
+    try:
+        _as_h5_array(weights)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 class OutputManager:
     """
     Collect observables, metadata, timings, and optional HDF5 output.
 
-    The manager can be used without a path for in-memory output. Once a path is
-    passed to the constructor, set_path(), or save_to_h5(), the path is stored on
-    the instance and reused by later path-dependent calls.
+    The manager can be used without a path for in-memory output. If a path is
+    passed to the constructor, writes are mirrored to HDF5 immediately. If no
+    path is passed at initialization, data stays in memory until save_to_h5() is
+    called. Passing a path to save_to_h5() stores that path on the instance and
+    makes it reusable by later save_to_h5() calls.
 
     Parameters
     ----------
@@ -58,17 +68,14 @@ class OutputManager:
     save_to_h5(path=None, append=False)
         Persist the in-memory data dictionary to HDF5. Passing ``path`` binds it
         for later calls.
-    write_dataset(name, data, group="/", path=None)
-        Write or replace an arbitrary dataset under ``group``.
-    write_parameters(step, params, attrs=None, path=None)
+    write_dataset(name, data, group="/")
+        Add or replace an arbitrary dataset under ``group``.
+    write_parameters(step, params, attrs=None)
         Save a Flax/JAX parameter tree under ``parameters/{step:08d}`` and mark
         it as the latest checkpoint.
-    load_parameters(template_params, step="latest", path=None)
-        Load a saved parameter checkpoint into the structure of
-        ``template_params``.
     start_timing(name), stop_timing(name), add_timing(name, elapsed),
     flush_timings()
-        Accumulate and persist timing totals and counts.
+        Accumulate timing totals and counts.
 
     Examples
     --------
@@ -89,8 +96,7 @@ class OutputManager:
         outp.flush_timings()
 
         outp.write_parameters(0, params, attrs={"optimizer": "SR"})
-        latest_params = outp.load_parameters(template_params, step="latest")
-        step_0_params = outp.load_parameters(template_params, step=0)
+        outp.save_to_h5()
     """
 
     def __init__(self, path: str | Path | None = None, group: str = "/", append: bool = True):
@@ -100,8 +106,10 @@ class OutputManager:
         self.data: dict[str, Any] = {}
         self._timings: dict[str, dict[str, float | int]] = {}
         self.timings = self._timings
+        self._parameter_attrs: dict[str, dict[str, Any]] = {}
+        self._parameter_latest: str | None = None
         if path is not None:
-            self.set_path(path, append=append)
+            self._set_path(path, append=append)
 
     @staticmethod
     def _normalize_group(group: str) -> str:
@@ -110,7 +118,7 @@ class OutputManager:
             return "/"
         return "/" + group.strip("/")
 
-    def set_path(self, path: str | Path, append: bool = True) -> None:
+    def _set_path(self, path: str | Path, append: bool = True) -> None:
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
@@ -118,18 +126,10 @@ class OutputManager:
             handle.require_group(self.group)
         self.mode = "a"
 
-    def _require_path(self, path: str | Path | None = None, append: bool = True) -> Path:
-        if path is not None:
-            self.set_path(path, append=append)
+    def _require_path(self) -> Path:
         if self.path is None:
-            raise ValueError("A path is required for this operation. Pass a path or call set_path() first.")
+            raise ValueError("A path is required for this operation. Pass a path to save_to_h5().")
         return self.path
-
-    def set_group(self, group: str) -> None:
-        self.group = self._normalize_group(group)
-        if self.path is not None:
-            with h5py.File(self.path, "a") as handle:
-                handle.require_group(self.group)
 
     def _root(self, handle):
         return handle[self.group]
@@ -171,7 +171,7 @@ class OutputManager:
             else:
                 self._append_h5(parent, str(key), value)
 
-    def _write(self, subgroup: str, time_val: float | int, **kwargs) -> None:
+    def _add(self, subgroup: str, time_val: float | int, **kwargs) -> None:
         if subgroup not in self.data:
             self.data[subgroup] = {}
         if "times" not in self.data[subgroup]:
@@ -191,7 +191,7 @@ class OutputManager:
                 store[key].append(value)
 
     def write_observables(self, step: int | float, **observables) -> None:
-        self._write("observables", step, **observables)
+        self._add("observables", step, **observables)
         if self.path is not None:
             with h5py.File(self.path, "a") as handle:
                 group = self._root(handle).require_group("observables")
@@ -200,7 +200,7 @@ class OutputManager:
 
     def write_metadata(self, step: int | float | None = None, **metadata) -> None:
         if step is not None:
-            self._write("metadata", step, **metadata)
+            self._add("metadata", step, **metadata)
         else:
             self.data.setdefault("metadata", {}).update(metadata)
 
@@ -218,38 +218,38 @@ class OutputManager:
                         group.create_dataset(str(key), data=arr)
 
     def write_network_checkpoint(self, time: float, weights) -> None:
-        self._write("network_checkpoints", time, checkpoints=weights)
+        if check__network_parameter_shape(weights):
+            self._add("network_checkpoints", time, checkpoints=weights)
+        else:
+            raise ValueError("Network weights must be serialized for checkpointing.")
         if self.path is not None:
             with h5py.File(self.path, "a") as handle:
                 group = self._root(handle).require_group("network_checkpoints")
                 self._append_h5(group, "times", time)
                 self._append_h5(group, "checkpoints", weights)
 
-    def get_network_checkpoint(self, time: float = None, idx: int = None):
-        if time is not None and idx is not None:
-            raise ValueError("Specify either 'time' or 'idx', not both.")
-
-        times = self.data["network_checkpoints"]["times"]
-        checkpoints = self.data["network_checkpoints"]["checkpoints"]
-
-        if not times:
-            raise RuntimeError("No checkpoints have been recorded yet.")
-
-        if time is not None:
-            idx = int(np.argmin(np.abs(np.array(times) - time)))
-        elif idx is None:
-            idx = -1
-
-        return times[idx], checkpoints[idx]
-
     def write_dataset(self, name: str, data: Any, group: str = "/", path: str | Path | None = None) -> None:
-        self._require_path(path)
-        with h5py.File(self.path, "a") as handle:
-            root = self._root(handle)
-            parent = root if group == "/" else root.require_group(group.strip("/"))
-            if name in parent:
-                del parent[name]
-            parent.create_dataset(name, data=_as_h5_array(data))
+        if path is not None:
+            raise ValueError("write_dataset() does not bind paths. Use save_to_h5(path=...) to choose an output file.")
+        self._store_dataset(name, data, group=group)
+        if self.path is not None:
+            with h5py.File(self.path, "a") as handle:
+                self._write_dataset_to_h5(handle, name, data, group=group)
+
+    def _store_dataset(self, name: str, data: Any, group: str = "/") -> None:
+        store = self.data
+        group = self._normalize_group(group)
+        if group != "/":
+            for part in group.strip("/").split("/"):
+                store = store.setdefault(part, {})
+        store[str(name)] = data
+
+    def _write_dataset_to_h5(self, handle, name: str, data: Any, group: str = "/") -> None:
+        root = self._root(handle)
+        parent = root if group == "/" else root.require_group(group.strip("/"))
+        if name in parent:
+            del parent[name]
+        parent.create_dataset(str(name), data=_as_h5_array(data))
 
     def _write_param_tree(self, group, tree: dict[str, Any]) -> None:
         for key, value in tree.items():
@@ -276,49 +276,51 @@ class OutputManager:
         attrs: dict[str, Any] | None = None,
         path: str | Path | None = None,
     ) -> str:
-        self._require_path(path)
+        if path is not None:
+            raise ValueError("write_parameters() does not bind paths. Use save_to_h5(path=...) to choose an output file.")
         state = flax.serialization.to_state_dict(params)
         group_name = f"{int(step):08d}"
-        with h5py.File(self.path, "a") as handle:
-            params_root = self._root(handle).require_group("parameters")
-            if group_name in params_root:
-                del params_root[group_name]
-            group = params_root.create_group(group_name)
-            group.attrs["step"] = int(step)
-            for key, value in (attrs or {}).items():
-                group.attrs[str(key)] = value
-            self._write_param_tree(group, state)
-            params_root.attrs["latest"] = group_name
+        self.data.setdefault("parameters", {})[group_name] = state
+        checkpoint_attrs = {"step": int(step)}
+        checkpoint_attrs.update(attrs or {})
+        self._parameter_attrs[group_name] = checkpoint_attrs
+        self._parameter_latest = group_name
+        if self.path is not None:
+            with h5py.File(self.path, "a") as handle:
+                self._write_parameters_to_h5(handle, group_name, state, checkpoint_attrs)
         return group_name
 
-    def load_parameters(self, template_params, step: int | str = "latest", path: str | Path | None = None):
-        self._require_path(path)
-        with h5py.File(self.path, "r") as handle:
-            params_root = self._root(handle)["parameters"]
-            group_name = params_root.attrs["latest"] if step == "latest" else f"{int(step):08d}"
-            state = self._read_param_tree(params_root[group_name])
-        return flax.serialization.from_state_dict(template_params, state)
-
     def save_to_h5(self, path: str | Path | None = None, append: bool = False) -> None:
-        self._require_path(path, append=append)
+        if path is not None:
+            self._set_path(path, append=append)
+        self._require_path()
         mode = "a" if append else "w"
         with h5py.File(self.path, mode) as handle:
             handle.require_group(self.group)
             self._write_dict_to_h5(self._root(handle), self.data)
+            self._write_parameter_attrs_to_h5(handle)
 
-    @staticmethod
-    def load_from_h5(path: str | Path) -> dict:
-        def read_recursive(group):
-            out = {}
-            for key, item in group.items():
-                if isinstance(item, h5py.Dataset):
-                    out[key] = item[()]
-                elif isinstance(item, h5py.Group):
-                    out[key] = read_recursive(item)
-            return out
+    def _write_parameters_to_h5(self, handle, group_name: str, state: dict[str, Any], attrs: dict[str, Any]) -> None:
+        params_root = self._root(handle).require_group("parameters")
+        if group_name in params_root:
+            del params_root[group_name]
+        group = params_root.create_group(group_name)
+        for key, value in attrs.items():
+            group.attrs[str(key)] = value
+        self._write_param_tree(group, state)
+        params_root.attrs["latest"] = group_name
 
-        with h5py.File(path, "r") as handle:
-            return read_recursive(handle)
+    def _write_parameter_attrs_to_h5(self, handle) -> None:
+        if "parameters" not in self.data:
+            return
+        params_root = self._root(handle).require_group("parameters")
+        if self._parameter_latest is not None:
+            params_root.attrs["latest"] = self._parameter_latest
+        for group_name, attrs in self._parameter_attrs.items():
+            if group_name not in params_root:
+                continue
+            for key, value in attrs.items():
+                params_root[group_name].attrs[str(key)] = value
 
     def _write_dict_to_h5(self, parent, data: dict) -> None:
         for key, value in data.items():
@@ -352,12 +354,28 @@ class OutputManager:
             item["last_total"] = item["total"]
 
     def flush_timings(self, path: str | Path | None = None) -> None:
-        self._require_path(path)
-        with h5py.File(self.path, "a") as handle:
-            group = self._root(handle).require_group("timings")
-            for key, value in self._timings.items():
-                sub = group.require_group(str(key))
-                for item_key in ("total", "count"):
-                    if item_key in sub:
-                        del sub[item_key]
-                    sub.create_dataset(item_key, data=_as_h5_array(value[item_key]))
+        if path is not None:
+            raise ValueError("flush_timings() does not bind paths. Use save_to_h5(path=...) to choose an output file.")
+        timings = self.data.setdefault("timings", {})
+        for key, value in self._timings.items():
+            timings[str(key)] = {
+                "total": value["total"],
+                "count": value["count"],
+            }
+        if self.path is not None:
+            with h5py.File(self.path, "a") as handle:
+                self._write_dict_to_h5(self._root(handle).require_group("timings"), timings)
+
+    def get_network_checkpoint(self, time: float | None = None, idx: int | None = None):
+        if time is not None and idx is not None:
+            raise ValueError("Specify either 'time' or 'idx', not both.")
+        checkpoints = self.data.get("network_checkpoints", {})
+        times = checkpoints.get("times", [])
+        weights = checkpoints.get("checkpoints", [])
+        if not times:
+            raise RuntimeError("No checkpoints have been recorded yet.")
+        if time is not None:
+            idx = int(np.argmin(np.abs(np.asarray(times) - time)))
+        elif idx is None:
+            idx = -1
+        return times[idx], weights[idx]

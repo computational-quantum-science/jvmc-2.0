@@ -1,14 +1,13 @@
 import unittest
 import jVMC_exp
 import jVMC_exp.nets as nets
+from jVMC_exp.symmetry_projector import square_translation_symmetry
 
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.random as random
 import jax.numpy as jnp
 import numpy as np
-
-import jVMC_exp.util.symmetries as symmetries
 
 
 class TestCNN(unittest.TestCase):
@@ -41,13 +40,13 @@ class TestCNN(unittest.TestCase):
 
         self.assertTrue(jnp.max(jnp.abs(psiS)) < 1e-12)
 
-class TestSymNet(unittest.TestCase):
+class TestProjectedOrbitNet(unittest.TestCase):
 
-    def test_sym_net(self):
+    def test_projected_orbit_net(self):
         L = 5
         rbm = nets.RBM(numHidden=5)
-        orbit = jVMC_exp.util.symmetries.get_orbit_1D(L, "translation")
-        rbm_sym = nets.sym_wrapper.SymNet(net=rbm, orbit=orbit)
+        orbit = square_translation_symmetry(L, 1, "spin")
+        rbm_sym = orbit * rbm
         params = rbm_sym.init(random.PRNGKey(0), jnp.zeros((L,), dtype=np.int32))
 
         S0 = jnp.pad(jnp.array([1, 0, 1, 1, 0]), (0, 4), 'wrap')
@@ -57,11 +56,11 @@ class TestSymNet(unittest.TestCase):
 
         self.assertTrue(jnp.max(jnp.abs(psiS)) < 1e-12)
 
-    # def test_sym_net_generative(self):
+    # def test_projected_orbit_net_generative(self):
     #     L=5
     #     rnn = nets.RNN1DGeneral(L=5)
-    #     orbit = jVMC_exp.util.symmetries.get_orbit_1D(L, "translation")
-    #     rnn_sym = nets.sym_wrapper.SymNet(net=rnn, orbit=orbit)
+    #     orbit = square_translation_symmetry(L, 1, "spin")
+    #     rnn_sym = orbit * rnn
     #     params = rnn_sym.init(random.PRNGKey(0), jnp.zeros((5,), dtype=np.int32))
 
     #     S0 = jnp.pad(jnp.array([1, 0, 1, 1, 0]), (0, 4), 'wrap')

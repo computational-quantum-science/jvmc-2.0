@@ -6,9 +6,9 @@ from functools import partial, cached_property
 from abc import ABC, abstractmethod
 from typing import Tuple
 
-from jVMC_exp.nets.sym_wrapper import SymNet
 from jVMC_exp.util.key_gen import format_key
 from jVMC_exp.vqs import NQS
+from jVMC_exp.symmetry_projector import SymmetryProjector
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING
 from jVMC_exp.sharding_config import distribute, broadcast_split_key
 from jVMC_exp.propose import AbstractProposer, AbstractProposeCont
@@ -117,8 +117,6 @@ class AbstractMCSampler(AbstractSampler):
         super().__init__(net)
 
         self.orbit = None
-        if isinstance(self.net.net, SymNet):
-            self.orbit = self.net.net.orbit.orbit
 
         self.initial_states = initState
         if initState is not None: 
@@ -378,6 +376,9 @@ class AbstractMCSampler(AbstractSampler):
         """ 
         For a given set of samples apply a random symmetry transformation to each sample
         """
+        if isinstance(orbit, SymmetryProjector):
+            return orbit.random_transformed_states(samples, key)
+
         orbit_indices = random.choice(key, orbit.shape[0], shape=(samples.shape[0],))
         samples = samples * 2 - 1
         return jax.vmap(lambda o, idx, s: (o[idx].dot(s.ravel()).reshape(s.shape) + 1) // 2, in_axes=(None, 0, 0))(orbit, orbit_indices, samples)
@@ -385,20 +386,9 @@ class AbstractMCSampler(AbstractSampler):
     def _get_samples_gen(self):
         self._key, sample_key, orbit_key = random.split(self.key, 3)
         samples = self.net.sample(self.numSamples, sample_key)
-        numSamplesStr = str(self.numSamples)
-
-        if numSamplesStr not in self._randomize_samples_jsh:
-             self._randomize_samples_jsh[numSamplesStr] = jax.jit(
-                jax.shard_map(
-                    self._randomize_samples,
-                    mesh=MESH,
-                    in_specs=(DEVICE_SPEC,) + (REPLICATED_SPEC,) * 2,
-                    out_specs=DEVICE_SPEC
-                )
-            )
 
         if self.orbit is not None:
-            samples = self._randomize_samples_jsh[numSamplesStr](samples, orbit_key, self.orbit)
+            samples = self._randomize_samples(samples, orbit_key, self.orbit)
         
         return samples, self.net(samples), jnp.ones(self.numSamples) / self.numSamples
 

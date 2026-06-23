@@ -8,17 +8,17 @@ import jax.numpy as jnp
 import numpy as np
 
 import jVMC_exp
-from jVMC_exp.util.symmetries import LatticeSymmetry
+from jVMC_exp.symmetry_projector import square_translation_symmetry
 
 L = 50
 g = -0.7
 
 # Initialize net
 # net = jVMC.nets.CpxCNN(F=[15,], channels=[100], bias=False)
-orbit = LatticeSymmetry(jnp.array([jnp.roll(jnp.identity(L, dtype=np.int32), l, axis=1) for l in range(L)]))
-net = jVMC_exp.nets.RNNsym(orbit=orbit, hiddenSize=15, L=L, depth=5)
+orbit = square_translation_symmetry(L, 1, "spin")
+net = jVMC_exp.nets.CpxRBM(numHidden=15, bias=False)
 
-psi = jVMC_exp.vqs.NQS(net, batchSize=500, seed=1234)  # Variational wave function
+psi = jVMC_exp.vqs.NQS(net, L, batchSize=500, seed=1234, orbit=orbit)  # Variational wave function
 print(f"The variational ansatz has {psi.numParameters} parameters.")
 
 # Set up hamiltonian

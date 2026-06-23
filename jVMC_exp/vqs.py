@@ -11,12 +11,23 @@ import copy
 import flax.linen as nn
 from flax import nnx
 
-from jVMC_exp.nets.sym_wrapper import avgFun_Coefficients_Exp, SymNet
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
+from jVMC_exp.symmetry_projector import SymmetryProjector, ProjectedOrbitNet
 from jVMC_exp.util.grads import pick_gradient
 from jVMC_exp.util.key_gen import generate_seed, format_key
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
 from jVMC_exp.sharding_config import broadcast_split_key, sharded
+
+
+def _has_sample_method(net):
+    if isinstance(net, ProjectedOrbitNet):
+        return callable(getattr(net.base_net, "sample", None))
+    return callable(getattr(net, "sample", None))
+
+
+def _has_eval_ratio_method(net):
+    return callable(getattr(net, "eval_ratio", None))
+
 
 def check_model(model, nnx_init_kwargs=None):
     if isinstance(model, nn.Module):
@@ -67,9 +78,9 @@ class NQS:
             is limited by memory access overheads, too large values can lead \
             to "out of memory" issues.
         * ``seed``: Seed for the PRNG to initialize the network parameters.
-        * ``orbit``: Orbit which defining the symmetry operations (instance of ``util.symmetries.LatticeSymmetry``). \
+        * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``symmetry_projector.SymmetryProjector``). \
             If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
-        * ``avgFun``: Reduction operation for the symmetrization.
+        * ``symmetry_average``: Built-in symmetry average name or callable passed to ``ProjectedOrbitNet``.
         * ``nnx_init``: Dictionary of keyword arguments passed to the ``flax.nnx.Module`` constructor, \
             excluding ``rngs`` (which is handled internally). Required when ``net`` is a \
             ``flax.nnx.Module`` subclass or a tuple thereof; ignored otherwise. \
@@ -93,7 +104,7 @@ class NQS:
                                 dict(in_features=10, numHidden=4)))
     """
     def __init__(self, net: nn.Module | Tuple[nn.Module, nn.Module], sampleShape, batchSize: int | None = None, batchSize_per_device: int | None = None, 
-                 logarithmic=True, seed: None | int = None, orbit=None, avgFun=avgFun_Coefficients_Exp, nnx_init=None):
+                 logarithmic=True, seed: None | int = None, orbit=None, symmetry_average="exp", nnx_init=None):
         if isinstance(net, collections.abc.Iterable):
             if len(net) != 2:
                 raise ValueError(f"If a tuple is passed for 'net', this must have len 2. Got {len(net)}.") 
@@ -110,17 +121,15 @@ class NQS:
         else:
             net = check_model(net, nnx_init)
             
-        self._isGenerator = False
-        if "sample" in dir(net):
-            if callable(net.sample):
-                self._isGenerator = True
-
-        self._eval_ratio = False
-        if "eval_ratio" in dir(net) and callable(net.eval_ratio):
-                self._eval_ratio = True
         if orbit is not None:
-            net = SymNet(net=net, orbit=orbit, avgFun=avgFun)
+            if not isinstance(orbit, SymmetryProjector):
+                raise TypeError(
+                    "To symmetrize the NQS pass a jVMC_exp.symmetry_projector.SymmetryProjector."
+                )
+            net = ProjectedOrbitNet(base_net=net, symmetry=orbit, symmetry_average=symmetry_average)
         self._net = net
+        self._isGenerator = _has_sample_method(net)
+        self._eval_ratio = _has_eval_ratio_method(net)
 
         if isinstance(sampleShape, tuple):
             self._sampleShape = sampleShape

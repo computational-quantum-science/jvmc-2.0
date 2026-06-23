@@ -415,9 +415,9 @@ class _Number(Operator):
 def _spin_index(spin):
     if isinstance(spin, str):
         spin_key = spin.lower()
-        if spin_key in {"up", "u"}:
+        if spin_key in {"up", "u", "↑"}:
             return 0
-        if spin_key in {"down", "dn", "d"}:
+        if spin_key in {"down", "dn", "d", "↓"}:
             return 1
         raise ValueError("spin must be 0/1 or 'up'/'down'.")
     spin_idx = int(spin)
