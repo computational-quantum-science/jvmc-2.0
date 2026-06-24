@@ -158,9 +158,9 @@ def measure(
             Oloc = op(**kwargs)
         
         result[name] = {}
-        result[name]["mean"] = jnp.real(Oloc.mean).item()
-        result[name]["variance"] = jnp.real(Oloc.var).item()
-        result[name]["MC_error"] = jnp.real(Oloc.error_of_mean).item()
+        result[name]["mean"] = jnp.real(Oloc.mean)#.item()
+        result[name]["variance"] = jnp.real(Oloc.var)#.item()
+        result[name]["MC_error"] = jnp.real(Oloc.error_of_mean)#.item()
 
     return result
 

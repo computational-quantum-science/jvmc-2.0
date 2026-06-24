@@ -279,9 +279,13 @@ class NQS:
         return self._numParameters
         
     def init_net(self, seed: int | None):
-        dummy_sample = jnp.ones(self.sampleShape)
         if seed == None:
             seed = generate_seed()
+
+        # TODO: this is fragile and is only needed for holo check. 
+        # Holo should be given by the user at init to make it more genera
+        # Otherwise another optional function, which would take an input state as well, could be used to check holo
+        dummy_sample = jax.random.normal(jax.random.PRNGKey(seed), self.sampleShape)
         self._parameters = jax.device_put(self.net.init(jax.random.PRNGKey(seed), dummy_sample), REPLICATED_SHARDING)
         self._out_dtype = self.net.apply(self._parameters, dummy_sample).dtype
         
