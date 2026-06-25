@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 OperatorWithKwargs = tuple[Any, dict[str, Any]]
 ObservableEntry = Union[Any, OperatorWithKwargs]
 
+def has_callable_attr(cls, attr: str):
+    return callable(getattr(cls, attr, None))
+
 def remove_double(arr, params_shape):
     new_arr = []
     start = 0
@@ -159,9 +162,9 @@ def measure(
             Oloc = op(**kwargs)
         
         result[name] = {}
-        result[name]["mean"] = jnp.real(Oloc.mean).item()
-        result[name]["variance"] = jnp.real(Oloc.var).item()
-        result[name]["MC_error"] = jnp.real(Oloc.error_of_mean).item()
+        result[name]["mean"] = jnp.real(Oloc.mean).squeeze()
+        result[name]["variance"] = jnp.real(Oloc.var).squeeze()
+        result[name]["MC_error"] = jnp.real(Oloc.error_of_mean).squeeze()
 
     return result
 

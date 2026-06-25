@@ -1,7 +1,6 @@
 import os
 import time
 import unittest
-
 import h5py
 import numpy as np
 

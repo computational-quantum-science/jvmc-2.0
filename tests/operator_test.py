@@ -4,18 +4,13 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 
-import jVMC_exp
 import jVMC_exp.operator.discrete as op
-import jVMC_exp.sampler
-import jVMC_exp.nets as nets
-from jVMC_exp.vqs import NQS
 from jVMC_exp.global_defs import DT_SAMPLES
 
 L = 4
 LDIM = 2
 KEY = random.PRNGKey(3)
 NUM_SAMPLES = 2 ** 6
-
 
 def _parity_between(state, i, j):
     if i == j:
@@ -26,7 +21,6 @@ def _parity_between(state, i, j):
         mask = ((1 << i) - 1) ^ ((1 << (j + 1)) - 1)
     return 1 - 2 * ((state & mask).bit_count() & 1)
 
-
 def _hop_reference(H, state, src, dst, amplitude):
     if ((state >> src) & 1) == 0 or ((state >> dst) & 1) == 1:
         return
@@ -34,10 +28,8 @@ def _hop_reference(H, state, src, dst, amplitude):
     new_state = state ^ (1 << src) ^ (1 << dst)
     H[new_state, state] += amplitude * sign
 
-
 def _spinless_orbital(site, L_chain):
     return L_chain - 1 - site
-
 
 def _spinful_orbital(site, spin, L_chain):
     if spin == "down":
@@ -46,10 +38,8 @@ def _spinful_orbital(site, spin, L_chain):
         return 2 * (L_chain - 1 - site) + 1
     raise ValueError(f"Unknown spin '{spin}'")
 
-
 def _spinless_config_from_state(state, L_chain):
     return [((state >> _spinless_orbital(site, L_chain)) & 1) for site in range(L_chain)]
-
 
 def _spinless_state_from_config(config):
     L_chain = len(config)
@@ -57,7 +47,6 @@ def _spinless_state_from_config(config):
     for site, occ in enumerate(config):
         state |= int(occ) << _spinless_orbital(site, L_chain)
     return state
-
 
 def _spinful_config_from_state(state, L_chain):
     config = []
@@ -67,7 +56,6 @@ def _spinful_config_from_state(state, L_chain):
         config.append(up + 2 * down)
     return config
 
-
 def _spinful_state_from_config(config):
     L_chain = len(config)
     state = 0
@@ -75,7 +63,6 @@ def _spinful_state_from_config(config):
         state |= (int(local_state) & 1) << _spinful_orbital(site, "up", L_chain)
         state |= ((int(local_state) >> 1) & 1) << _spinful_orbital(site, "down", L_chain)
     return state
-
 
 def _dense_matrix_from_operator(operator, configs, state_from_config):
     configs = np.asarray(configs, dtype=np.int32)
@@ -89,7 +76,6 @@ def _dense_matrix_from_operator(operator, configs, state_from_config):
         for row_config, mat_el in zip(sp[col], matEls[col]):
             H[state_from_config(row_config), col] += mat_el
     return H
-
 
 def _reference_spinful_hubbard(L_chain, t, U, mu):
     n_orbitals = 2 * L_chain
@@ -112,7 +98,6 @@ def _reference_spinful_hubbard(L_chain, t, U, mu):
 
     return H
 
-
 def _reference_spinless_tv(L_chain, t, V, mu):
     dim = 1 << L_chain
     H = np.zeros((dim, dim), dtype=np.float64)
@@ -131,7 +116,6 @@ def _reference_spinless_tv(L_chain, t, V, mu):
             H[state, state] -= mu * site_occ
 
     return H
-
 
 class Target(nn.Module):
   """
@@ -265,7 +249,6 @@ class TestOperator(unittest.TestCase):
         configs = [_spinful_config_from_state(state, L_chain) for state in range(dim)]
         H_jvmc = _dense_matrix_from_operator(h, configs, _spinful_state_from_config)
         H_ref = _reference_spinful_hubbard(L_chain, t, U, mu)
-
         self.assertTrue(np.allclose(H_jvmc, H_ref))
 
     ########################################################################

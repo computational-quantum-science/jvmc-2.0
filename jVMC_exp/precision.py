@@ -1,11 +1,8 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-
 import jax.numpy as jnp
 
 import jVMC_exp.global_defs as global_defs
-
 
 @dataclass(frozen=True)
 class PrecisionDTypes:
@@ -15,7 +12,6 @@ class PrecisionDTypes:
     compute_dtype: any
     observable_dtype: any
     complex_dtype: any
-
 
 def precision_dtypes(mode: str) -> PrecisionDTypes:
     key = str(mode).strip().lower()
@@ -38,7 +34,6 @@ def precision_dtypes(mode: str) -> PrecisionDTypes:
             complex_dtype=jnp.complex128,
         )
     raise ValueError("precision_mode must be 'mixed_fp32' or 'full_fp64'.")
-
 
 def set_precision_mode(mode: str) -> PrecisionDTypes:
     dtypes = precision_dtypes(mode)

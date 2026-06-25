@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from abc import abstractmethod
 import jax.numpy as jnp
 

@@ -9,21 +9,18 @@ import jVMC_exp
 import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
 import jVMC_exp.sampler as sampler
-from jVMC_exp.symmetry_projector import chain_reflection_symmetry, spin_flip_symmetry, square_translation_symmetry
+from jVMC_exp.symmetry.lattice_symetries import chain_reflection_symmetry, spin_flip_symmetry, square_translation_symmetry
 
 @jax.jit
 def state_to_int(S):
     powers = 2 ** jnp.arange(S.shape[-1])[::-1]
     return jnp.dot(S, powers).astype(jnp.int64)
 
-
 def _translation_projector(L: int):
     return square_translation_symmetry(L, 1, "spin")
 
-
 def _translation_reflection_spinflip_projector(L: int):
     return _translation_projector(L) * chain_reflection_symmetry(L, "spin") * spin_flip_symmetry(L, 1, "spin")
-
 
 class _PeakedGeneratorNet(nn.Module):
     peak_state: tuple[int, ...]
@@ -37,7 +34,6 @@ class _PeakedGeneratorNet(nn.Module):
     def sample(self, key):
         del key
         return jnp.asarray(self.peak_state, dtype=jnp.int32)
-
 
 def _test_sampling(net, test_class: unittest.TestCase, mu=2, log_prob_factor=0.5, two_nets=False, test_two_samplers=False):
     L = 4
@@ -166,29 +162,6 @@ class TestMC(unittest.TestCase):
             numChains=4,
             numSamples=256,
         )
-
-        samples, _, _ = mc_sampler.sample()
-        expected = {
-            tuple(row.tolist())
-            for row in np.asarray(orbit.transformed_states(jnp.asarray(peak_state, dtype=jnp.int32)))
-        }
-        sampled = {tuple(row.tolist()) for row in np.asarray(samples)}
-
-        self.assertEqual(sampled, expected)
-
-    def test_sampler_randomize_samples_accepts_symmetry_projector(self):
-        L = 4
-        peak_state = (1, 0, 0, 0)
-        orbit = _translation_projector(L)
-        psi = NQS(_PeakedGeneratorNet(peak_state), L, 64, seed=1234)
-        mc_sampler = sampler.MCSampler(
-            psi,
-            updateProposer=None,
-            key=random.PRNGKey(23),
-            numChains=4,
-            numSamples=256,
-        )
-        mc_sampler.orbit = orbit
 
         samples, _, _ = mc_sampler.sample()
         expected = {

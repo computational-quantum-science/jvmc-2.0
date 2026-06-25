@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import time
 from pathlib import Path
 from typing import Any
@@ -9,7 +8,6 @@ import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 
 def _as_h5_array(value: Any):
     try:
@@ -28,7 +26,7 @@ def _as_h5_array(value: Any):
     return arr
 
 
-def check__network_parameter_shape(weights: Any) -> bool:
+def check_network_parameter_shape(weights: Any) -> bool:
     try:
         _as_h5_array(weights)
     except (TypeError, ValueError):
@@ -125,12 +123,7 @@ class OutputManager:
         with h5py.File(self.path, mode) as handle:
             handle.require_group(self.group)
         self.mode = "a"
-
-    def _require_path(self) -> Path:
-        if self.path is None:
-            raise ValueError("A path is required for this operation. Pass a path to save_to_h5().")
-        return self.path
-
+        
     def _root(self, handle):
         return handle[self.group]
 
@@ -218,7 +211,7 @@ class OutputManager:
                         group.create_dataset(str(key), data=arr)
 
     def write_network_checkpoint(self, time: float, weights) -> None:
-        if check__network_parameter_shape(weights):
+        if check_network_parameter_shape(weights):
             self._add("network_checkpoints", time, checkpoints=weights)
         else:
             raise ValueError("Network weights must be serialized for checkpointing.")
@@ -293,7 +286,9 @@ class OutputManager:
     def save_to_h5(self, path: str | Path | None = None, append: bool = False) -> None:
         if path is not None:
             self._set_path(path, append=append)
-        self._require_path()
+        if self.path is None:
+            raise ValueError("A path is required for this operation. Pass a path to save_to_h5().")
+    
         mode = "a" if append else "w"
         with h5py.File(self.path, mode) as handle:
             handle.require_group(self.group)

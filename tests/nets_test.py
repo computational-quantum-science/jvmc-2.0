@@ -1,14 +1,12 @@
 import unittest
 import jVMC_exp
 import jVMC_exp.nets as nets
-from jVMC_exp.symmetry_projector import square_translation_symmetry
+from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
 
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.random as random
 import jax.numpy as jnp
 import numpy as np
-
 
 class TestCNN(unittest.TestCase):
 

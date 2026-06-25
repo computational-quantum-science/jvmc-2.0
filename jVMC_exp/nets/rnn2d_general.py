@@ -1,16 +1,10 @@
 import jax
-jax.config.update("jax_enable_x64", True)
-# config.update('jax_disable_jit', True)
 import flax
 import flax.linen as nn
 import numpy as np
 import jax.numpy as jnp
 
 from typing import Union
-
-import sys
-# Find jVMC package
-sys.path.append(sys.path[0] + "/../..")
 
 import jVMC_exp
 import jVMC_exp.global_defs as global_defs

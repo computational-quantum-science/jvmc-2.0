@@ -7,7 +7,7 @@ import flax.linen as nn
 import jVMC_exp
 import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
-from jVMC_exp.symmetry_projector import square_translation_symmetry
+from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
 from jVMC_exp.global_defs import DT_SAMPLES
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC
 import jVMC_exp.global_defs as global_defs
