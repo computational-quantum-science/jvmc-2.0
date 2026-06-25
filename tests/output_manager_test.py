@@ -1,11 +1,11 @@
 import os
 import time
 import unittest
-
 import h5py
 import numpy as np
 
-from jVMC_exp.util.output_manager import OutputManager  
+from jVMC_exp.util.input_manager import InputManager
+from jVMC_exp.util.output_manager import OutputManager
 
 
 class TestOutputManager(unittest.TestCase):
@@ -18,10 +18,6 @@ class TestOutputManager(unittest.TestCase):
         if os.path.exists(self.h5):
             os.remove(self.h5)
 
-    # ------------------------------------------------------------------
-    # metadata
-    # ------------------------------------------------------------------
-
     def test_metadata_times_recorded(self):
         self.outp.write_metadata(0.3, bla=1.0)
         self.outp.write_metadata(0.5, bla=2.0)
@@ -30,10 +26,6 @@ class TestOutputManager(unittest.TestCase):
         with h5py.File(self.h5) as f:
             times = f["metadata/times"][()]
             self.assertTrue(np.allclose(times, [0.3, 0.5]))
-
-    # ------------------------------------------------------------------
-    # observables
-    # ------------------------------------------------------------------
 
     def test_observables_nested_dict(self):
         """Nested dict kwargs must create sub-groups in the HDF5 file."""
@@ -67,10 +59,6 @@ class TestOutputManager(unittest.TestCase):
         with h5py.File(self.h5) as f:
             self.assertTrue(np.allclose(f["observables/bla/mean"][0], [99.1]))
 
-    # ------------------------------------------------------------------
-    # network checkpoints
-    # ------------------------------------------------------------------
-
     def test_network_checkpoint_roundtrip(self):
         """Checkpoint stored in memory and retrieved by index and time."""
         weights = np.random.uniform(size=(5,))
@@ -93,10 +81,6 @@ class TestOutputManager(unittest.TestCase):
             self.assertIn("network_checkpoints", f)
             self.assertTrue(np.allclose(f["network_checkpoints/checkpoints"][0], weights))
 
-    # ------------------------------------------------------------------
-    # append mode
-    # ------------------------------------------------------------------
-
     def test_save_append_overwrites_datasets(self):
         """Calling save_to_h5 twice with append=True should replace datasets."""
         self.outp.write_observables(0.1, energy=1.0)
@@ -107,9 +91,27 @@ class TestOutputManager(unittest.TestCase):
         with h5py.File(self.h5) as f:
             self.assertEqual(len(f["observables/times"][()]), 2)
 
-    # ------------------------------------------------------------------
-    # load roundtrip
-    # ------------------------------------------------------------------
+    def test_no_path_buffers_without_creating_file(self):
+        self.outp.write_observables(0.1, energy=1.0)
+        self.outp.write_metadata(model="RBM")
+        self.outp.write_dataset("samples", np.arange(4), group="diagnostics")
+
+        self.assertFalse(os.path.exists(self.h5))
+        self.assertIsNone(self.outp.path)
+        self.assertIn("observables", self.outp.data)
+        self.assertIn("diagnostics", self.outp.data)
+
+    def test_save_path_persists_for_later_saves(self):
+        self.outp.write_observables(0.1, energy=1.0)
+        self.outp.save_to_h5(self.h5)
+        self.assertEqual(str(self.outp.path), self.h5)
+
+        self.outp.write_observables(0.2, energy=2.0)
+        self.outp.save_to_h5(append=True)
+
+        with h5py.File(self.h5) as f:
+            self.assertTrue(np.allclose(f["observables/times"][()], [0.1, 0.2]))
+            self.assertTrue(np.allclose(f["observables/energy"][()], [1.0, 2.0]))
 
     def test_load_from_h5_roundtrip(self):
         """load_from_h5 should reconstruct the same arrays."""
@@ -117,13 +119,22 @@ class TestOutputManager(unittest.TestCase):
         self.outp.write_observables(0.5, energy=2.0)
         self.outp.save_to_h5(self.h5)
 
-        loaded = OutputManager.load_from_h5(self.h5)
+        loaded = InputManager.load_from_h5(self.h5)
         self.assertTrue(np.allclose(loaded["observables"]["times"], [0.1, 0.5]))
         self.assertTrue(np.allclose(loaded["observables"]["energy"], [1.0, 2.0]))
 
-    # ------------------------------------------------------------------
-    # timings
-    # ------------------------------------------------------------------
+    def test_parameter_roundtrip_uses_input_manager(self):
+        params = {"dense": {"kernel": np.arange(4).reshape(2, 2), "bias": np.ones(2)}}
+        template = {"dense": {"kernel": np.zeros((2, 2)), "bias": np.zeros(2)}}
+
+        self.outp.write_parameters(0, params, attrs={"optimizer": "SR"})
+        self.assertFalse(os.path.exists(self.h5))
+        self.outp.save_to_h5(self.h5)
+
+        inp = InputManager(self.h5)
+        loaded = inp.load_parameters(template, step="latest")
+        self.assertTrue(np.allclose(loaded["dense"]["kernel"], params["dense"]["kernel"]))
+        self.assertTrue(np.allclose(loaded["dense"]["bias"], params["dense"]["bias"]))
 
     def test_timings_accumulate(self):
         self.outp.start_timing("step")

@@ -5,15 +5,18 @@ from jVMC_exp.solver.pinv_snr import PinvSNR
 from jVMC_exp.objective_function import AbstractObjectiveFunction
 from jVMC_exp.stepper import AbstractStepper, Euler
 from jVMC_exp.util import ObservableEntry
+from jVMC_exp.util.output_manager import OutputManager
 
 class SR(Evolution):
     def __init__(
             self, sampler, psi, 
-            use_cross_valiadation=False, diagonalShift=0.001, diagonalScale=0., solver=PinvSNR()
+            use_cross_valiadation=False, diagonalShift=0.001, diagonalScale=0., solver=PinvSNR(),
+            output_manager: OutputManager | None = None
         ):
         super().__init__(
             sampler, psi, True, True, 
-            use_cross_valiadation, diagonalShift, diagonalScale, solver
+            use_cross_valiadation, diagonalShift, diagonalScale, solver,
+            output_manager=output_manager
         )
 
     def time_evolution(

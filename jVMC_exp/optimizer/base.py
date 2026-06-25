@@ -19,12 +19,15 @@ from jVMC_exp.solver.pinv_snr import PinvSNR
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
 
 class AbstractOptimizer(ABC):
-    def __init__(self, sampler: AbstractSampler, psi: NQS, use_cross_valiadation: bool=False):
+    def __init__(
+            self, sampler: AbstractSampler, psi: NQS,
+            use_cross_valiadation: bool=False, output_manager: OutputManager | None = None
+        ):
         self._sampler = sampler
         self._psi = psi
         self.use_cross_valiadation = use_cross_valiadation
         self.meta_data = {}
-        self._output_manager = OutputManager()
+        self._output_manager = output_manager if output_manager is not None else OutputManager()
         self.o_loc = None
         self._elapsed = 0
         self._sampler_out = (None,) * 3
@@ -230,7 +233,7 @@ class Evolution(AbstractOptimizer):
             self, sampler: AbstractSampler, psi: NQS, 
             imag_time: bool, make_real: bool, use_cross_valiadation: bool=False, 
             diagonalShift: float | Callable=1e-3, diagonalScale: float | Callable=0., 
-            solver: AbstractSolver=PinvSNR()
+            solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None
         ):
         self.rhsPrefactor = 1 if imag_time else 1j
         if psi.holomorphic:
@@ -257,7 +260,7 @@ class Evolution(AbstractOptimizer):
         self._solver = solver
         self._get_lhs = self._get_lhs_dense if solver._needs_dense_matrix else self._get_lhs_lazy
        
-        super().__init__(sampler, psi, use_cross_valiadation)
+        super().__init__(sampler, psi, use_cross_valiadation, output_manager=output_manager)
 
         self._solver_state = SolverState(
             covar_grad_o_loc=lambda: self._covar_grad_o_loc,

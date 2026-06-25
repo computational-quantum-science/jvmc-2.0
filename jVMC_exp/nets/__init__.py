@@ -5,5 +5,4 @@ from jVMC_exp.nets.rnn1d_general import *
 from jVMC_exp.nets.rnn2d_general import *
 from jVMC_exp.nets.two_nets_wrapper import *
 from . import initializers
-from . import sym_wrapper
 from .fullconfigurationstate import FullConfigurationState

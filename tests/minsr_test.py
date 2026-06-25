@@ -1,5 +1,4 @@
 import unittest
-import tqdm
 import jax.numpy as jnp
 
 import jVMC_exp
@@ -30,7 +29,7 @@ class TestGsSearch(unittest.TestCase):
                 H += J * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) + hx * op.SigmaX(l)
 
             # Set up exact sampler
-            exact_sampler = sampler.ExactSampler(psi, 2)
+            exact_sampler = sampler.ExactSampler(psi)
             
             loss_function = jVMC_exp.objective_function.Observable(H)
             stepper = jVMC_exp.stepper.Euler(timeStep=learning_rate)

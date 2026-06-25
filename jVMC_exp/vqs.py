@@ -11,14 +11,30 @@ import copy
 import flax.linen as nn
 from flax import nnx
 
-from jVMC_exp.nets.sym_wrapper import avgFun_Coefficients_Exp, SymNet
 from jVMC_exp.nets.two_nets_wrapper import TwoNets
+from jVMC_exp.symmetry import SymmetryProjector, ProjectedOrbitNet
 from jVMC_exp.util.grads import pick_gradient
 from jVMC_exp.util.key_gen import generate_seed, format_key
+from jVMC_exp.util.util import has_callable_attr
+import jVMC_exp.global_defs as global_defs
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
 from jVMC_exp.sharding_config import broadcast_split_key, sharded
 
-def check_model(model, nnx_init_kwargs=None):
+supported = (
+    jnp.dtype(jnp.float32),
+    jnp.dtype(jnp.complex64),
+    jnp.dtype(jnp.float64),
+    jnp.dtype(jnp.complex128),
+)
+
+def _cast_output(x):
+    x = jnp.asarray(x)
+    is_complex = jnp.issubdtype(jnp.dtype(x.dtype), jnp.complexfloating)
+    dtype = global_defs.DT_OPERATORS_CPX if is_complex else global_defs.DT_OPERATORS_REAL
+
+    return x.astype(dtype)
+
+def _check_model(model, nnx_init_kwargs=None):
     if isinstance(model, nn.Module):
         return model
     
@@ -67,9 +83,12 @@ class NQS:
             is limited by memory access overheads, too large values can lead \
             to "out of memory" issues.
         * ``seed``: Seed for the PRNG to initialize the network parameters.
-        * ``orbit``: Orbit which defining the symmetry operations (instance of ``util.symmetries.LatticeSymmetry``). \
+        * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``symmetry_projector.SymmetryProjector``). \
             If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
-        * ``avgFun``: Reduction operation for the symmetrization.
+        * ``symmetry_average``: Built-in symmetry average name or callable passed to ``ProjectedOrbitNet``.
+        * ``mixed_precision``: If ``True``, low-precision parameter storage is allowed while public \
+            amplitudes, ratios, flattened parameters, and gradients are cast to operator precision. \
+            If ``False``, fp32/complex64 parameter storage raises an error.
         * ``nnx_init``: Dictionary of keyword arguments passed to the ``flax.nnx.Module`` constructor, \
             excluding ``rngs`` (which is handled internally). Required when ``net`` is a \
             ``flax.nnx.Module`` subclass or a tuple thereof; ignored otherwise. \
@@ -92,8 +111,12 @@ class NQS:
                     nnx_init=(dict(in_features=10, numHidden=4),
                                 dict(in_features=10, numHidden=4)))
     """
-    def __init__(self, net: nn.Module | Tuple[nn.Module, nn.Module], sampleShape, batchSize: int | None = None, batchSize_per_device: int | None = None, 
-                 logarithmic=True, seed: None | int = None, orbit=None, avgFun=avgFun_Coefficients_Exp, nnx_init=None):
+    def __init__(
+            self, net: nn.Module | Tuple[nn.Module, nn.Module], 
+            sampleShape, batchSize: int | None = None, batchSize_per_device: int | None = None, 
+            logarithmic=True, seed: None | int = None, orbit=None, symmetry_average="exp", 
+            nnx_init=None, mixed_precision: bool = False
+        ):
         if isinstance(net, collections.abc.Iterable):
             if len(net) != 2:
                 raise ValueError(f"If a tuple is passed for 'net', this must have len 2. Got {len(net)}.") 
@@ -105,22 +128,26 @@ class NQS:
                                      f"Got {len(nnx_init)}")
             else:
                 nnx_init = (None, None)
-            net = tuple(check_model(n, i) for n, i in zip(net, nnx_init))
+            net = tuple(_check_model(n, i) for n, i in zip(net, nnx_init))
             net = TwoNets(net)
         else:
-            net = check_model(net, nnx_init)
+            net = _check_model(net, nnx_init)
             
-        self._isGenerator = False
-        if "sample" in dir(net):
-            if callable(net.sample):
-                self._isGenerator = True
-
-        self._eval_ratio = False
-        if "eval_ratio" in dir(net) and callable(net.eval_ratio):
-                self._eval_ratio = True
         if orbit is not None:
-            net = SymNet(net=net, orbit=orbit, avgFun=avgFun)
+            if not isinstance(orbit, SymmetryProjector):
+                raise TypeError(
+                    f"Orbit has to be an instance of jVMC_exp.symmetry_projector.SymmetryProjector, "
+                    f"got {orbit}"
+                )
+            net = ProjectedOrbitNet(base_net=net, symmetry=orbit, symmetry_average=symmetry_average)
         self._net = net
+
+        if isinstance(self._net, ProjectedOrbitNet):
+            self._is_generator = has_callable_attr(net.base_net, "sample")
+        else:
+            self._is_generator = has_callable_attr(net, "sample")
+        
+        self._eval_ratio = callable(getattr(net, "eval_ratio", None))
 
         if isinstance(sampleShape, tuple):
             self._sampleShape = sampleShape
@@ -136,8 +163,9 @@ class NQS:
             raise ValueError(f"The batch size ({batchSize}) has to be divisible by the number of devices ({num_devices})")
         self._batchSize = batchSize
 
-        self._logarithmic = logarithmic
-        if self.logarithmic:
+        self._mixed_precision = mixed_precision
+
+        if logarithmic:
             self.apply_fun = self.net.apply
         else:
             def apply_fun(parameters, s, method=None):
@@ -171,13 +199,14 @@ class NQS:
                     f"does not match the existing one ({len(self.parameters_flat)})"
                 )
             value = self._param_unflatten(value)
+
         if 'params' not in value.keys():
             value = {'params': value}
-        if jax.tree_util.tree_structure(value) != jax.tree_util.tree_structure(self.parameters):
+        if jax.tree_util.tree_structure(value["params"]) != self._netTreeDef:
             raise ValueError(
                 "Parameter tree structure mismatch.\n"
-                f"  Expected: {jax.tree_util.tree_structure(self.parameters)}\n"
-                f"  Received: {jax.tree_util.tree_structure(value)}"
+                f"  Expected: {self._netTreeDef}\n"
+                f"  Received: {jax.tree_util.tree_structure(value["params"])}"
             )
 
         if self._frozen_params is not None:
@@ -187,6 +216,7 @@ class NQS:
         if isinstance(self.parameters, flax.core.frozen_dict.FrozenDict):
             value = freeze(value)
 
+        value = jax.tree_util.tree_map(lambda x: x.astype(self._param_dtype), value)
         self._parameters = copy.deepcopy(value)
 
     @property
@@ -205,9 +235,19 @@ class NQS:
         Returns:
             Array holding current values of all variational parameters.
         """
-        if not self._realParams:
-            return jnp.concatenate([jnp.concatenate([p.ravel().real, p.ravel().imag]) for p in tree_flatten(self.params)[0]])
-        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]])
+        # TODO: the casting here might be useless since it is already handled in parameters setter
+        if not self.realParams:
+            return jnp.concatenate([
+                jnp.concatenate([
+                    p.ravel().real.astype(global_defs.DT_OPERATORS_REAL),
+                    p.ravel().imag.astype(global_defs.DT_OPERATORS_REAL),
+                ])
+                for p in tree_flatten(self.params)[0]
+            ])
+        
+        return jnp.concatenate([
+            p.ravel().astype(global_defs.DT_OPERATORS_REAL) for p in tree_flatten(self.params)[0]
+        ])
     
     @property
     def frozen_parameters(self):
@@ -241,18 +281,18 @@ class NQS:
     @property
     def sampleShape(self):
         return self._sampleShape
-    
-    @property
-    def logarithmic(self):
-        return self._logarithmic
 
     @property
     def is_generator(self):
-        return self._isGenerator
+        return self._is_generator
 
     @property
     def eval_ratio(self):
         return self._eval_ratio
+
+    @property
+    def mixed_precision(self):
+        return self._mixed_precision
     
     @property
     def holomorphic(self):
@@ -277,6 +317,10 @@ class NQS:
     @property
     def numParameters(self):
         return self._numParameters
+    
+    @property
+    def param_dtype(self):
+        return self._param_dtype
         
     def init_net(self, seed: int | None):
         if seed == None:
@@ -287,16 +331,28 @@ class NQS:
         # Otherwise another optional function, which would take an input state as well, could be used to check holo
         dummy_sample = jax.random.normal(jax.random.PRNGKey(seed), self.sampleShape)
         self._parameters = jax.device_put(self.net.init(jax.random.PRNGKey(seed), dummy_sample), REPLICATED_SHARDING)
-        self._out_dtype = self.net.apply(self._parameters, dummy_sample).dtype
-        
+        self._netTreeDef = jax.tree_util.tree_structure(self.params)
+
         self._realParams, self._holomorphic, self._flat_gradient_function, self._dict_gradient_function = pick_gradient(
             self.apply_fun, self.parameters, dummy_sample
         )
 
-        self._paramShapes = [(p.size, p.shape) for p in tree_flatten(self.parameters["params"])[0]]
-        self._netTreeDef = jax.tree_util.tree_structure(self.parameters["params"])
-        self._numParameters = jnp.sum(jnp.array([p.size for p in tree_flatten(self.parameters["params"])[0]]))
-    
+        self._paramShapes = []
+        self._numParameters = 0
+        low_precision = supported[:2]
+        for p in tree_flatten(self.params)[0]:
+            if jnp.dtype(p.dtype) not in supported:
+                raise TypeError(f"Unsupported parameter dtypes: {jnp.dtype(p.dtype)}")
+            if (not self.mixed_precision) and (jnp.dtype(p.dtype) in low_precision):
+                raise ValueError(
+                    f"NQS has {jnp.dtype(p.dtype)} parameters but mixed_precision=False. "
+                    "Pass mixed_precision=True or initialize the network with float64/complex128 parameters."
+                )
+            
+            self._paramShapes.append((p.size, p.shape))
+            self._numParameters += p.size 
+        self._param_dtype = p.dtype
+
     def __call__(self, s):
         """
         Evaluate variational wave function.
@@ -311,26 +367,13 @@ class NQS:
         
         :meta public:
         """ 
-        return self._apply_fun_sh(s, parameters=self.parameters, batch_size=self.batchSize)
+        return _cast_output(self._apply_fun_sh(s, parameters=self.parameters, batch_size=self.batchSize))
     
     @sharded()
     def _apply_fun_sh(self, s, *, parameters, batch_size):
         return self.apply_fun(parameters, s)
 
     def call_ratio(self, s, sp):
-        """
-        Evaluate variational wave function.
-        
-        Compute the logarithmic wave function coefficients :math:`\\ln\\psi(s)` for \
-        computational configurations :math:`s`.
-        
-        Args:
-            * ``s``: Array of computational basis states.
-        Returns:
-            Logarithmic wave function coefficients :math:`\\ln\\psi(s)`.
-        
-        :meta public:
-        """ 
         if self.eval_ratio:
             return self._apply_ratio_sh(s, sp, parameters=self.parameters, batch_size=self.batchSize)
         
@@ -338,7 +381,12 @@ class NQS:
     
     @sharded()
     def _apply_ratio_sh(self, s, sp, *, parameters, batch_size):
-        return self.apply_fun(parameters, s, sp, method=self.net.eval_ratio)
+        # TODO: is mixed precision skipping the custom ratio evalutaion??
+        if self._mixed_precision:
+            log_psi_s = _cast_output(self.apply_fun(parameters, s))
+            log_psi_sp = _cast_output(self.apply_fun(parameters, sp))
+            return _cast_output(jnp.exp(log_psi_sp - log_psi_s))
+        return _cast_output(self.apply_fun(parameters, s, sp, method=self.net.eval_ratio))
 
     def gradients(self, s):
         """
@@ -354,7 +402,7 @@ class NQS:
             with respect to each variational parameter :math:`\\theta_k` for each \
             input configuration :math:`s`.
         """
-        return self._gradients_sh(s, parameters=self.parameters, batch_size=self.batchSize)
+        return _cast_output(self._gradients_sh(s, parameters=self.parameters, batch_size=self.batchSize))
     
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_sh(self, s, *, parameters, batch_size):
@@ -362,10 +410,10 @@ class NQS:
     
     def gradients_dict(self, s):
         result = self._gradients_dict_sh(s, parameters=self.parameters, batch_size=self.batchSize)
-
         if self.holomorphic:
-            return self._append_gradients_dict_jsh(result, result)
-        return result
+            result = self._append_gradients_dict_jsh(result, result)
+
+        return tree_map(_cast_output, result)
     
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_dict_sh(self, s, *, parameters, batch_size):
@@ -396,15 +444,25 @@ class NQS:
         Returns:
             Real part of the NQS and current parameters
         """
-        if "eval_real" in dir(self.net) and callable(self.net.eval_real):
-            return lambda p, x: jnp.real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
-        elif self._eval_ratio:
-            return lambda p, x, y: self.apply_fun(p, x, y, method=self.net.eval_ratio), self.parameters
+        def _cast_real(x):
+            return jnp.real(x).astype(global_defs.DT_OPERATORS_REAL)
+
+        # TODO: does this work if self.net is a symmetric projector??
+        if has_callable_attr(self.net, "eval_real"):
+            return lambda p, x: _cast_real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
         
-        return lambda p, x: jnp.real(self.apply_fun(p, x)), self.parameters
+        elif self._eval_ratio:
+            if self._mixed_precision:
+                return lambda p, x, y: jnp.exp(
+                    _cast_output(self.apply_fun(p, y)) - _cast_output(self.apply_fun(p, x))
+                ), self.parameters
+                       
+            return lambda p, x, y: _cast_output(self.apply_fun(p, x, y, method=self.net.eval_ratio)), self.parameters
+        
+        return lambda p, x: _cast_real(self.apply_fun(p, x)), self.parameters
     
     def sample(self, numSamples, key=None, parameters=None):
-        if self._isGenerator:
+        if self.is_generator:
             params = parameters or self.parameters
             key = format_key(key) 
             if len(key.shape) > 1:
@@ -418,7 +476,7 @@ class NQS:
     @sharded()
     def _sample(self, keys, *, parameters, batch_size):
         return self.net.apply(parameters, keys, method=self.net.sample)
- 
+
     def _param_unflatten(self, P):
         """
         Reshape parameter array update according to net tree structure
@@ -428,6 +486,7 @@ class NQS:
                 return P['params']
             else:
                 return P
+            
         PTreeShape = []
         start = 0
         for s in self.paramShapes:

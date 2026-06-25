@@ -12,5 +12,6 @@ from . import optimizer
 from . import solver
 from . import objective_function
 from . import stepper
+from . import symmetry
 
 from .version import __version__

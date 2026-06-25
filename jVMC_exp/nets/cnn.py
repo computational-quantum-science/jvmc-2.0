@@ -1,15 +1,13 @@
 import jax
-jax.config.update("jax_enable_x64", True)
 import flax
 import flax.linen as nn
 import jax.numpy as jnp
 
 import jVMC_exp.global_defs as global_defs
 import jVMC_exp.nets.activation_functions as act_funs
-from jVMC_exp.util.symmetries import LatticeSymmetry
 
 from functools import partial
-from typing import List, Sequence
+from typing import Any, List, Sequence
 
 import jVMC_exp.nets.initializers
 from jVMC_exp.nets.initializers import init_fn_args
@@ -150,47 +148,3 @@ class CpxCNN(nn.Module):
         return jnp.sum(x, axis=reduceDims) / nrm
 
 # ** end class CpxCNN
-
-
-class CpxCNNSym(nn.Module):
-    """
-    Complex symmetric CNN.
-    It uses the CpxCNN class to compute probabilities and averages the outputs over all symmetry-invariant configurations.
-
-    Initialization arguments:
-        * ``orbit``: orbits which define the symmetry operations (instance of ``util.symmetries.LatticeSymmetry``)
-        * ``F``: Filter diameter
-        * ``channels``: Number of channels
-        * ``strides``: Number of pixels the filter shifts over
-        * ``actFun``: Non-linear activation function
-        * ``bias``: Whether to use biases
-        * ``firstLayerBias``: Whether to use biases in the first layer
-
-    """
-    orbit: LatticeSymmetry
-    F: Sequence[int] = (8,)
-    channels: Sequence[int] = (10,)
-    strides: Sequence[int] = (1,)
-    actFun: Sequence[callable] = (act_funs.poly6,)
-    bias: bool = True
-    firstLayerBias: bool = False
-
-    def setup(self):
-
-        self.cnn = CpxCNN(F=self.F, channels=self.channels,
-                          strides=self.strides, actFun=self.actFun,
-                          bias=self.bias, firstLayerBias=self.firstLayerBias)
-
-    def __call__(self, x):
-
-        inShape = x.shape
-        x = jax.vmap(lambda o, s: jnp.dot(o, s.ravel()).reshape(inShape), in_axes=(0, None))(self.orbit.orbit, x)
-
-        def evaluate(x):
-            return self.cnn(x)
-
-        res = jnp.mean(jax.vmap(evaluate)(x), axis=0)
-
-        return res
-
-# ** end class CpxCNNSym
