@@ -3,6 +3,7 @@ from typing import Callable
 
 from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
+from jVMC_exp.util import OutputManager
 
 class MinSR(AbstractOptimizer):
     """
@@ -16,12 +17,11 @@ class MinSR(AbstractOptimizer):
         * ``diagonalSchift``: Regularization parameter :math:`\\lambda`, see below.
         * ``diagonalizeOnDevice``: Choose whether to diagonalize :math:`S` on GPU or CPU.
     """
-    def __init__(self, sampler, psi, pinv_tol=1e-14, diagonalShift=1e-3):
+    def __init__(self, sampler, psi, pinv_tol=1e-14, diagonalShift=1e-3, output_manager: OutputManager | None = None):
         self.pinvTol = pinv_tol
         self.diag_shift = diagonalShift
-        self.diagonalShift = self._diag_shift_fn(0)
 
-        super().__init__(sampler, psi, use_cross_valiadation=False)
+        super().__init__(sampler, psi, use_cross_valiadation=False, output_manager=output_manager)
 
     @property
     def diag_shift(self):
@@ -33,7 +33,7 @@ class MinSR(AbstractOptimizer):
         self._diag_shift = self._diag_shift_fn(0)
 
     def update_hyperparams(self, step):
-        self.diagonalShift = self._diag_shift_fn(step)
+        self._diag_shift = self._diag_shift_fn(step)
 
     def get_update(self, objective_function_output: ObjectiveFunctionOutput):
         """
@@ -52,7 +52,7 @@ class MinSR(AbstractOptimizer):
         o_loc_all = jnp.concatenate([jnp.real(o_loc._normalized_obs), jnp.imag(o_loc._normalized_obs)]).squeeze()
 
         T = gradients_all @ gradients_all.T
-        T = T + self.diagonalShift * jnp.eye(T.shape[-1])
+        T = T + self._diag_shift * jnp.eye(T.shape[-1])
         T_inv = jnp.linalg.pinv(T, rtol=self.pinvTol, hermitian=True)
 
         return - gradients_all.T @ T_inv @ o_loc_all
@@ -62,7 +62,6 @@ class MinSR(AbstractOptimizer):
     
     def _update_meta_data(self):
         pass
-
 
 ###### TODO: still giving problems on bigger systems
 

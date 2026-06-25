@@ -6,14 +6,16 @@ from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction
 from jVMC_exp.util import ObservableEntry
+from jVMC_exp.util.output_manager import OutputManager
 from jVMC_exp.stepper import Euler
 
 class Adam(AbstractOptimizer):
     def __init__(
             self, sampler, psi,
-            learning_rate: float=1e-3, b1: float=0.9, b2: float=0.999, eps: float=1e-8
+            learning_rate: float=1e-3, b1: float=0.9, b2: float=0.999, eps: float=1e-8,
+            output_manager: OutputManager | None = None
     ):
-        super().__init__(sampler, psi, False)
+        super().__init__(sampler, psi, False, output_manager=output_manager)
 
         self._adam = adam(learning_rate, b1, b2, eps)
         self._opt_state = self._adam.init(self.psi.parameters_flat)

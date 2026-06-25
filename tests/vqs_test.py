@@ -7,10 +7,12 @@ import flax.linen as nn
 import jVMC_exp
 import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
+from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
 from jVMC_exp.global_defs import DT_SAMPLES
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC
 import jVMC_exp.global_defs as global_defs
 import jVMC_exp.nets.activation_functions as act_funs
+from jVMC_exp.precision import set_precision_mode
 
 def _general_test_grad(model, num_samples, L, test_class: unittest.TestCase):
     psi = NQS(model, L, num_samples)
@@ -102,9 +104,8 @@ class TestGradients(unittest.TestCase):
             num_samples = 4
 
             rbm = nets.CpxRBM(numHidden=2**k, bias=True)
-            orbit = jVMC_exp.util.symmetries.get_orbit_1D(L)
-            net = nets.sym_wrapper.SymNet(net=rbm, orbit=orbit)
-            psiC = NQS(net, L, num_samples)
+            orbit = square_translation_symmetry(L, 1, "spin")
+            psiC = NQS(rbm, L, num_samples, orbit=orbit)
 
             self.assertTrue(psiC.holomorphic)
 
@@ -113,8 +114,8 @@ class TestGradients(unittest.TestCase):
         num_samples = 4
 
         rbm = nets.CpxRBM(numHidden=2, bias=True)
-        orbit = jVMC_exp.util.symmetries.get_orbit_1D(L)
-        model = nets.sym_wrapper.SymNet(net=rbm, orbit=orbit)
+        orbit = square_translation_symmetry(L, 1, "spin")
+        model = orbit * rbm
 
         _general_test_grad(model, num_samples, L, self)
 
@@ -190,6 +191,48 @@ class TestEvaluation(unittest.TestCase):
         )(s)
 
         self.assertTrue(jnp.linalg.norm(jnp.real(cpxCoeffs) - realCoeffs) < 1e-6)
+
+    def test_mixed_precision_nqs_boundary(self):
+        old_dtypes = (
+            global_defs.DT_PARAMS_REAL,
+            global_defs.DT_PARAMS_CPX,
+            global_defs.DT_OPERATORS_REAL,
+            global_defs.DT_OPERATORS_CPX,
+        )
+        try:
+            set_precision_mode("mixed_fp32")
+            L = 3
+            num_samples = 4
+            model = nets.CpxRBM(numHidden=2, bias=True)
+            psi = NQS(model, L, num_samples, seed=1234, mixed_precision=True)
+            param_leaves = jax.tree_util.tree_leaves(psi.parameters["params"])
+            self.assertTrue(all(p.dtype == jnp.complex64 for p in param_leaves))
+
+            s = jnp.zeros((num_samples, L), dtype=DT_SAMPLES)
+            coeffs = psi(s)
+            gradients = psi.gradients(s)
+            self.assertEqual(coeffs.dtype, jnp.complex128)
+            self.assertEqual(gradients.dtype, jnp.complex128)
+            self.assertEqual(psi.parameters_flat.dtype, jnp.float64)
+
+            psi.parameters = psi.parameters_flat + jnp.asarray(1e-4, dtype=jnp.float64)
+            param_leaves = jax.tree_util.tree_leaves(psi.parameters["params"])
+            self.assertTrue(all(p.dtype == jnp.complex64 for p in param_leaves))
+
+            ratio_psi = NQS(nets.CpxRBM_ratio(numHidden=2, bias=True), L, num_samples, seed=1234, mixed_precision=True)
+            sp = s.at[:, 0].set(1)
+            ratio = ratio_psi.call_ratio(s, sp)
+            self.assertEqual(ratio.dtype, jnp.complex128)
+
+            with self.assertRaises(ValueError):
+                NQS(model, L, num_samples, seed=1234, mixed_precision=False)
+        finally:
+            (
+                global_defs.DT_PARAMS_REAL,
+                global_defs.DT_PARAMS_CPX,
+                global_defs.DT_OPERATORS_REAL,
+                global_defs.DT_OPERATORS_CPX,
+            ) = old_dtypes
 
 if __name__ == "__main__":
     unittest.main()

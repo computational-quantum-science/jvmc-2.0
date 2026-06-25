@@ -9,17 +9,17 @@ import jax
 import jVMC_exp
 from jVMC_exp.global_defs import DT_OPERATORS_CPX
 import jVMC_exp.nets.activation_functions as act_funs
-import jVMC_exp.util.symmetries as sym
-from jVMC_exp.vqs import NQS
-from jVMC_exp.sampler import AbstractMCSampler
-from jVMC_exp.operator.base import AbstractOperator
-import jVMC_exp.operator.discrete.branch_free as op
 
 if TYPE_CHECKING:
+    from jVMC_exp.sampler import AbstractMCSampler
+    from jVMC_exp.operator.base import AbstractOperator
     from jVMC_exp.optimizer import TDVP
 
-OperatorWithKwargs = tuple[AbstractOperator, dict[str, Any]]
-ObservableEntry = Union[AbstractOperator, OperatorWithKwargs]
+OperatorWithKwargs = tuple[Any, dict[str, Any]]
+ObservableEntry = Union[Any, OperatorWithKwargs]
+
+def has_callable_attr(cls, attr: str):
+    return callable(getattr(cls, attr, None))
 
 def remove_double(arr, params_shape):
     new_arr = []
@@ -57,6 +57,8 @@ def get_iterable(x):
         return (x,)
 
 def init_net(descr, dims, seed=0):
+    from jVMC_exp.vqs import NQS
+
     def get_activation_functions(actFuns):
         if type(actFuns) is list:
             return tuple([act_funs.activationFunctions[fn] for fn in actFuns])
@@ -88,10 +90,11 @@ def init_net(descr, dims, seed=0):
         fac_key = key + "_factor"
         symm_factors[fac_key] = descr[fac_key] if fac_key in descr else 1
 
-    if len(dims) == 2:
-        orbit = sym.get_orbit_2D_square(dims[0], *symms, **symm_factors)
-    if len(dims) == 1:
-        orbit = sym.get_orbit_1D(dims[0], *symms, **symm_factors)
+    if symms:
+        raise NotImplementedError(
+            "init_net no longer builds deprecated util.symmetries orbits. "
+            "Construct a jVMC_exp.symmetry_projector.SymmetryProjector and apply it to the network explicitly."
+        )
 
     if not "net2" in descr:
         model = get_net(descr["net1"], dims)
@@ -106,8 +109,6 @@ def init_net(descr, dims, seed=0):
         model = jVMC_exp.nets.two_nets_wrapper.TwoNets(net1=model1, net2=model2)
         isGenerator = "sample" in dir(model1)
 
-    avgFun = jVMC_exp.nets.sym_wrapper.avgFun_Coefficients_Sep if isGenerator else jVMC_exp.nets.sym_wrapper.avgFun_Coefficients_Exp
-    model = jVMC_exp.nets.sym_wrapper.SymNet(orbit=orbit, net=model, avgFun=avgFun)
     psi = NQS(model, sampleShape=dims, batchSize=descr["batch_size"], seed=seed) # TODO: is dims = sampleShape?
     psi(jnp.zeros((1,) + dims, dtype=np.int32))
 
@@ -143,6 +144,9 @@ def measure(
     Returns:
         Dictionary with "mean", "variance", "MC_error" for each observable.
     '''
+    # Local import to avoid circular import issues.
+    from jVMC_exp.operator.base import AbstractOperator
+
     result = {}
     for name, op in observables.items():
         kwargs = {}
@@ -158,9 +162,9 @@ def measure(
             Oloc = op(**kwargs)
         
         result[name] = {}
-        result[name]["mean"] = jnp.real(Oloc.mean)#.item()
-        result[name]["variance"] = jnp.real(Oloc.var)#.item()
-        result[name]["MC_error"] = jnp.real(Oloc.error_of_mean)#.item()
+        result[name]["mean"] = jnp.real(Oloc.mean).squeeze()
+        result[name]["variance"] = jnp.real(Oloc.var).squeeze()
+        result[name]["MC_error"] = jnp.real(Oloc.error_of_mean).squeeze()
 
     return result
 
@@ -170,6 +174,9 @@ def matrix_to_jvmc_operator(
     *,
     return_conjugate: bool = False,
 ):
+    # Local import to avoid circular import issues.
+    import jVMC_exp.operator.discrete.branch_free as op
+
     r"""Convert a dense one- or two-site matrix into a ``jVMC`` discrete operator.
 
     The matrix is expanded in the local operator basis
