@@ -1,13 +1,9 @@
 import jax
-import flax
 import flax.linen as nn
 import jax.numpy as jnp
-
-import jVMC_exp.global_defs as global_defs
-
-from functools import partial
 from typing import Sequence
 
+import jVMC_exp.global_defs as global_defs
 from jVMC_exp.nets.initializers import init_fn_args
 
 class FFN(nn.Module):
@@ -30,9 +26,11 @@ class FFN(nn.Module):
         for l in range(len(activationFunctions), len(self.layers) + 1):
             activationFunctions.append(self.actFun[-1])
         
-        init_args = init_fn_args(dtype=global_defs.DT_PARAMS_REAL, 
-                                    kernel_init=jax.nn.initializers.lecun_normal(), 
-                                    bias_init=jax.nn.initializers.zeros)
+        init_args = init_fn_args(
+            param_dtype=global_defs.DT_PARAMS_REAL, 
+            kernel_init=jax.nn.initializers.lecun_normal(), 
+            bias_init=jax.nn.initializers.zeros
+        )
 
         s = 2 * s.ravel() - 1
         for l, fun in zip(self.layers, activationFunctions[:-1]):
@@ -40,8 +38,8 @@ class FFN(nn.Module):
                 nn.Dense(features=l, use_bias=self.bias, **init_args)(s)
             )
 
-        return jnp.sum(activationFunctions[-1](
-                        nn.Dense(features=1, use_bias=self.bias, **init_args)(s)
-                      ))
-
-# ** end class FFN
+        return jnp.sum(
+            activationFunctions[-1](
+                nn.Dense(features=1, use_bias=self.bias, **init_args)(s)
+            )
+        )

@@ -131,7 +131,7 @@ class Infidelity(AbstractObjectiveFunction):
             self.reference_sampler.sample()
 
         o_loc = self.conjugated_operator.get_O_loc(
-            self.reference_sampler.samples, sampler.net, logPsiS=self.reference_sampler.logPsi
+            self.reference_sampler.samples, sampler.psi, logPsiS=self.reference_sampler.logPsi
         )
 
         if self.control_variate is not None:
@@ -142,7 +142,7 @@ class Infidelity(AbstractObjectiveFunction):
             self._ref_f_loc = _weighted_mean(o_loc, self.reference_sampler.weights)
 
         o_loc = self.operator.get_O_loc(
-            sampler.samples, self.reference_sampler.net, logPsiS=sampler.logPsi
+            sampler.samples, self.reference_sampler.psi, logPsiS=sampler.logPsi
         )
 
         if self.control_variate is not None:
@@ -171,7 +171,7 @@ class Infidelity(AbstractObjectiveFunction):
             **kwargs
         ) -> ObjectiveFunctionOutput:
         value = self(sampler, sample_ref_state=sample_ref_state, **kwargs)
-        grad_log_psi = SampledObs(sampler.net.gradients(sampler.samples), sampler.weights)
+        grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
         f_loc = SampledObs(self._psi_f_loc, sampler.weights)
         grad = grad_log_psi.get_covar_obs(f_loc)
         grad._observations *= - 2.0 * self._ref_f_loc

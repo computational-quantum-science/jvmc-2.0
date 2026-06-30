@@ -8,16 +8,14 @@ import jVMC_exp
 import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
 from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
-from jVMC_exp.global_defs import DT_SAMPLES
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC
-import jVMC_exp.global_defs as global_defs
+from jVMC_exp import global_defs
 import jVMC_exp.nets.activation_functions as act_funs
-from jVMC_exp.precision import set_precision_mode
 
 def _general_test_grad(model, num_samples, L, test_class: unittest.TestCase):
     psi = NQS(model, L, num_samples)
 
-    s = jnp.zeros((num_samples, L), dtype=DT_SAMPLES)
+    s = jnp.zeros((num_samples, L), dtype=global_defs.DT_SAMPLES)
     s = s.at[0, 1].set(1)
     s = s.at[2, 2].set(1)
 
@@ -57,7 +55,7 @@ class CpxRBM_nonHolomorphic(nn.Module):
             **jVMC_exp.nets.initializers.init_fn_args(
                 kernel_init=jVMC_exp.nets.initializers.cplx_init,
                 bias_init=jax.nn.initializers.zeros,
-                dtype=global_defs.DT_PARAMS_CPX
+                param_dtype=global_defs.DT_PARAMS_CPX
             )
         )
 
@@ -97,7 +95,6 @@ class MatrixMultiplication_NonHolomorphic(nn.Module):
         return jnp.sum(out)
     
 class TestGradients(unittest.TestCase):
-
     def test_automatic_holomorphicity_recognition(self):
         for k in range(10):
             L = 3
@@ -150,7 +147,7 @@ class TestGradients(unittest.TestCase):
         model = MatrixMultiplication_NonHolomorphic(holo=False)
 
         psi = NQS(model, 1, num_samples)
-        s= jnp.zeros((num_samples, 1), dtype=DT_SAMPLES)
+        s= jnp.zeros((num_samples, 1), dtype=global_defs.DT_SAMPLES)
         G = psi.gradients(s)
         ref = jnp.array([-1.1+0.j, -1.1+0.j, -1.1+0.j, -1.1+0.j, -0.-1.j, -0.-1.j, -0.-1.j, -0.-1.j])
         self.assertTrue(jnp.allclose(G.T.ravel(), ref))
@@ -168,71 +165,42 @@ class TestGradients(unittest.TestCase):
         self.assertTrue(isclose(jnp.linalg.norm(g1 - g2), 0.0))
 
 class TestEvaluation(unittest.TestCase):
-
-    def test_evaluation_cpx(self):
+    def test_mixed_precision_nqs_boundary(self):
         L = 3
         num_samples = 4
         model = nets.CpxRBM(numHidden=2, bias=True)
-        psiC = NQS(model, L, num_samples)
-
-        s = jnp.zeros((num_samples, L), dtype=DT_SAMPLES)
-        s = s.at[0, 1].set(1)
-        s = s.at[2, 2].set(1)
-
-        cpxCoeffs = psiC(s)
-        f, p = psiC.get_sampler_net()
-        realCoeffs = jax.jit(
-            jax.shard_map(
-                jax.vmap(lambda y: f(p, y)), 
-                mesh=MESH, 
-                in_specs=(DEVICE_SPEC,), 
-                out_specs=(DEVICE_SPEC)
-            )
-        )(s)
-
-        self.assertTrue(jnp.linalg.norm(jnp.real(cpxCoeffs) - realCoeffs) < 1e-6)
-
-    def test_mixed_precision_nqs_boundary(self):
-        old_dtypes = (
-            global_defs.DT_PARAMS_REAL,
-            global_defs.DT_PARAMS_CPX,
-            global_defs.DT_OPERATORS_REAL,
-            global_defs.DT_OPERATORS_CPX,
+        psi = NQS(
+            model, 
+            L, 
+            num_samples, 
+            seed=1234, 
+            sampler_dtype=jnp.complex64,
+            eval_dtype=jnp.complex64,
+            grad_dtype=jnp.complex64
         )
-        try:
-            set_precision_mode("mixed_fp32")
-            L = 3
-            num_samples = 4
-            model = nets.CpxRBM(numHidden=2, bias=True)
-            psi = NQS(model, L, num_samples, seed=1234, mixed_precision=True)
-            param_leaves = jax.tree_util.tree_leaves(psi.parameters["params"])
-            self.assertTrue(all(p.dtype == jnp.complex64 for p in param_leaves))
 
-            s = jnp.zeros((num_samples, L), dtype=DT_SAMPLES)
-            coeffs = psi(s)
-            gradients = psi.gradients(s)
-            self.assertEqual(coeffs.dtype, jnp.complex128)
-            self.assertEqual(gradients.dtype, jnp.complex128)
-            self.assertEqual(psi.parameters_flat.dtype, jnp.float64)
+        s = jnp.zeros((num_samples, L), dtype=global_defs.DT_SAMPLES)
+        out = psi(s)
+        gradients = psi.gradients(s)
+        self.assertEqual(out.dtype, global_defs.DT_OUT_CPX)
+        self.assertEqual(gradients.dtype, global_defs.DT_OUT_CPX)
 
-            psi.parameters = psi.parameters_flat + jnp.asarray(1e-4, dtype=jnp.float64)
-            param_leaves = jax.tree_util.tree_leaves(psi.parameters["params"])
-            self.assertTrue(all(p.dtype == jnp.complex64 for p in param_leaves))
+        psi.parameters = psi.parameters_flat + jnp.asarray(1e-4, dtype=jnp.float64)
+        param_leaves = jax.tree_util.tree_leaves(psi.parameters["params"])
+        self.assertTrue(all(p.dtype == global_defs.DT_PARAMS_CPX for p in param_leaves))
 
-            ratio_psi = NQS(nets.CpxRBM_ratio(numHidden=2, bias=True), L, num_samples, seed=1234, mixed_precision=True)
-            sp = s.at[:, 0].set(1)
-            ratio = ratio_psi.call_ratio(s, sp)
-            self.assertEqual(ratio.dtype, jnp.complex128)
-
-            with self.assertRaises(ValueError):
-                NQS(model, L, num_samples, seed=1234, mixed_precision=False)
-        finally:
-            (
-                global_defs.DT_PARAMS_REAL,
-                global_defs.DT_PARAMS_CPX,
-                global_defs.DT_OPERATORS_REAL,
-                global_defs.DT_OPERATORS_CPX,
-            ) = old_dtypes
+        ratio_psi = NQS(
+            nets.CpxRBM_ratio(numHidden=2, bias=True), 
+            L, 
+            num_samples, 
+            seed=1234, 
+            sampler_dtype=jnp.complex64,
+            eval_dtype=jnp.complex64,
+            grad_dtype=jnp.complex64
+        )
+        sp = s.at[:, 0].set(1)
+        ratio = ratio_psi.call_ratio(s, sp)
+        self.assertEqual(ratio.dtype, global_defs.DT_OUT_CPX)
 
 if __name__ == "__main__":
     unittest.main()

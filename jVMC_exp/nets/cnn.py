@@ -1,14 +1,10 @@
 import jax
-import flax
 import flax.linen as nn
 import jax.numpy as jnp
+from typing import Sequence
 
 import jVMC_exp.global_defs as global_defs
 import jVMC_exp.nets.activation_functions as act_funs
-
-from functools import partial
-from typing import Any, List, Sequence
-
 import jVMC_exp.nets.initializers
 from jVMC_exp.nets.initializers import init_fn_args
 
@@ -26,7 +22,6 @@ class CNN(nn.Module):
         * ``periodicBoundary``: Whether to use periodic boundary conditions
 
     """
-
     F: Sequence[int] = (8,)
     channels: Sequence[int] = (10,)
     strides: Sequence[int] = (1,)
@@ -53,14 +48,13 @@ class CNN(nn.Module):
         bias[0] = self.firstLayerBias
 
         activationFunctions = [f for f in self.actFun]
-        for l in range(len(activationFunctions), len(self.channels)):
+        for _ in range(len(activationFunctions), len(self.channels)):
             activationFunctions.append(self.actFun[-1])
 
         # List of axes that will be summed for symmetrization
         reduceDims = tuple([-i - 1 for i in range(len(self.strides) + 2)])
 
-        init_args = init_fn_args(dtype=global_defs.DT_PARAMS_REAL, kernel_init=initFunction)
-        # init_args = dict(dtype=global_defs.DT_PARAMS_REAL, kernel_init=initFunction)
+        init_args = init_fn_args(param_dtype=global_defs.DT_PARAMS_REAL, kernel_init=initFunction)
 
         # Add feature dimension
         x = jnp.expand_dims(jnp.expand_dims(2 * x - 1, axis=0), axis=-1)
@@ -77,9 +71,6 @@ class CNN(nn.Module):
         nrm = jnp.sqrt(jnp.prod(jnp.array(x.shape[reduceDims[-1]:])))
 
         return jnp.sum(x, axis=reduceDims) / nrm
-
-# ** end class CNN
-
 
 class CpxCNN(nn.Module):
     """Convolutional neural network with complex parameters.
@@ -105,7 +96,6 @@ class CpxCNN(nn.Module):
     @nn.compact
     def __call__(self, x):
 
-        #initFunction = jax.nn.initializers.variance_scaling(scale=1.0, mode="fan_avg", distribution="uniform", dtype=global_defs.DT_PARAMS_REAL)
         initFunction = jVMC_exp.nets.initializers.cplx_variance_scaling
 
         # Set up padding for periodic boundary conditions
@@ -125,8 +115,7 @@ class CpxCNN(nn.Module):
         for l in range(len(activationFunctions), len(self.channels)):
             activationFunctions.append(self.actFun[-1])
         
-        init_args = init_fn_args(dtype=global_defs.DT_PARAMS_CPX, kernel_init=initFunction)
-        # init_args = dict(dtype=global_defs.DT_PARAMS_CPX, kernel_init=initFunction)
+        init_args = init_fn_args(param_dtype=global_defs.DT_PARAMS_CPX, kernel_init=initFunction)
 
         # List of axes that will be summed for symmetrization
         reduceDims = tuple([-i - 1 for i in range(len(self.strides) + 2)])
@@ -136,15 +125,10 @@ class CpxCNN(nn.Module):
         for c, f, b in zip(self.channels, activationFunctions, bias):
             if self.periodicBoundary:
                 x = jnp.pad(x, pads, 'wrap')
-            # else:
-            #    x = jnp.pad(x, pads, 'constant', constant_values=0)
             x = f(nn.Conv(features=c, kernel_size=tuple(self.F),
                           strides=self.strides, padding=[(0, 0)] * len(self.strides),
                           use_bias=b, **init_args)(x))
-
-        # strides=self.strides, padding=[(0, 0)] * len(self.strides),
+            
         nrm = jnp.sqrt(jnp.prod(jnp.array(x.shape[reduceDims[-1]:])))
 
         return jnp.sum(x, axis=reduceDims) / nrm
-
-# ** end class CpxCNN

@@ -5,9 +5,7 @@ import jax.numpy as jnp
 import jVMC_exp.global_defs as global_defs
 import jVMC_exp.nets.activation_functions as act_funs
 from jVMC_exp.nets.initializers import init_fn_args
-
 import jVMC_exp.nets.initializers
-
 
 class CpxRBM(nn.Module):
     """Restricted Boltzmann machine with complex parameters.
@@ -23,14 +21,18 @@ class CpxRBM(nn.Module):
 
     @nn.compact
     def __call__(self, s):
+        layer = nn.Dense(
+            self.numHidden, use_bias=self.bias,
+            **init_fn_args(
+                kernel_init=jVMC_exp.nets.initializers.cplx_init,
+                bias_init=jax.nn.initializers.zeros,
+                param_dtype=global_defs.DT_PARAMS_CPX
+            )
+        )
 
-        layer = nn.Dense(self.numHidden, use_bias=self.bias,
-                         **init_fn_args(kernel_init=jVMC_exp.nets.initializers.cplx_init,
-                                        bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.DT_PARAMS_CPX)
-                         )
+        x = act_funs.log_cosh(layer(2 * s.ravel() - 1)) 
 
-        return jnp.sum(act_funs.log_cosh(layer(2 * s.ravel() - 1)))
+        return jnp.sum(x, dtype=x.dtype)
 
 class CpxRBM_Nospinflip(nn.Module):
     """Restricted Boltzmann machine with complex parameters.
@@ -46,15 +48,18 @@ class CpxRBM_Nospinflip(nn.Module):
 
     @nn.compact
     def __call__(self, s):
+        layer = nn.Dense(
+            self.numHidden, use_bias=self.bias,
+            **init_fn_args(
+                kernel_init=jVMC_exp.nets.initializers.cplx_init,
+                bias_init=jax.nn.initializers.zeros,
+                param_dtype=global_defs.DT_PARAMS_CPX
+            )
+        )
 
-        layer = nn.Dense(self.numHidden, use_bias=self.bias,
-                         **init_fn_args(kernel_init=jVMC_exp.nets.initializers.cplx_init,
-                                        bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.DT_PARAMS_CPX)
-                         )
+        x = act_funs.log_cosh(layer(s.ravel()))
 
-        return jnp.sum(act_funs.log_cosh(layer(s.ravel())))
-
+        return jnp.sum(x, dtype=x.dtype)
 
 class RBM(nn.Module):
     """Restricted Boltzmann machine with real parameters.
@@ -70,15 +75,20 @@ class RBM(nn.Module):
 
     @nn.compact
     def __call__(self, s):
+        layer = nn.Dense(
+            self.numHidden, use_bias=self.bias,
+            **init_fn_args(
+                kernel_init=jax.nn.initializers.lecun_normal(dtype=global_defs.DT_PARAMS_REAL),
+                bias_init=jax.nn.initializers.zeros,
+                param_dtype=global_defs.DT_PARAMS_REAL
+            )
+        )
 
-        layer = nn.Dense(self.numHidden, use_bias=self.bias,
-                         **init_fn_args(kernel_init=jax.nn.initializers.lecun_normal(dtype=global_defs.DT_PARAMS_REAL),
-                                        bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.DT_PARAMS_REAL)
-                        )
+        x = act_funs.log_cosh(layer(2 * s.ravel() - 1)) 
 
-        return jnp.sum(jnp.log(jnp.cosh(layer(2 * s - 1))))
+        return jnp.sum(x, dtype=x.dtype)
 
+# TODO: isn't this class completely useless? 
 class CpxRBM_ratio(nn.Module):
     """Restricted Boltzmann machine with complex parameters.
 
@@ -93,14 +103,18 @@ class CpxRBM_ratio(nn.Module):
 
     @nn.compact
     def __call__(self, s):
+        layer = nn.Dense(
+            self.numHidden, use_bias=self.bias,
+            **init_fn_args(
+                kernel_init=jVMC_exp.nets.initializers.cplx_init,
+                bias_init=jax.nn.initializers.zeros,
+                param_dtype=global_defs.DT_PARAMS_CPX
+            )
+        )
 
-        layer = nn.Dense(self.numHidden, use_bias=self.bias,
-                         **init_fn_args(kernel_init=jVMC_exp.nets.initializers.cplx_init,
-                                        bias_init=jax.nn.initializers.zeros,
-                                        dtype=global_defs.DT_PARAMS_CPX)
-                         )
+        x = act_funs.log_cosh(layer(2 * s.ravel() - 1)) 
 
-        return jnp.sum(act_funs.log_cosh(layer(2 * s.ravel() - 1)))
+        return jnp.sum(x, dtype=x.dtype)
 
     def eval_ratio(self, s, sp):
         return jnp.exp(self(sp) - self(s))

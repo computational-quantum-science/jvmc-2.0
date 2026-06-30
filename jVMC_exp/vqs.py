@@ -16,23 +16,28 @@ from jVMC_exp.symmetry import SymmetryProjector, ProjectedOrbitNet
 from jVMC_exp.util.grads import pick_gradient
 from jVMC_exp.util.key_gen import generate_seed, format_key
 from jVMC_exp.util.util import has_callable_attr
-import jVMC_exp.global_defs as global_defs
+from jVMC_exp import global_defs
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
 from jVMC_exp.sharding_config import broadcast_split_key, sharded
 
-supported = (
-    jnp.dtype(jnp.float32),
-    jnp.dtype(jnp.complex64),
-    jnp.dtype(jnp.float64),
-    jnp.dtype(jnp.complex128),
-)
+def _check_dtype(dtype: jnp.dtype | None, dtype_ref: jnp.dtype, label: str):
+    if dtype is None:
+        return dtype_ref
+    ref_is_real = jnp.issubdtype(dtype_ref, jnp.floating)
+    given_is_real = jnp.issubdtype(dtype, jnp.floating) 
+    if ref_is_real and not given_is_real:
+        raise TypeError(
+            f"The given dtype for {label} is complex but the parameters are real"
+        )
+    if not ref_is_real and given_is_real:
+        raise TypeError(
+            f"The given dtype for {label} is real but the parameters are complex"
+        )
+    
+    return dtype
 
-def _cast_output(x):
-    x = jnp.asarray(x)
-    is_complex = jnp.issubdtype(jnp.dtype(x.dtype), jnp.complexfloating)
-    dtype = global_defs.DT_OPERATORS_CPX if is_complex else global_defs.DT_OPERATORS_REAL
-
-    return x.astype(dtype)
+def _cast_pytree(pytree, dtype):
+    return jax.tree_util.tree_map(lambda x: x.astype(dtype), pytree)
 
 def _check_model(model, nnx_init_kwargs=None):
     if isinstance(model, nn.Module):
@@ -113,9 +118,15 @@ class NQS:
     """
     def __init__(
             self, net: nn.Module | Tuple[nn.Module, nn.Module], 
-            sampleShape, batchSize: int | None = None, batchSize_per_device: int | None = None, 
-            logarithmic=True, seed: None | int = None, orbit=None, symmetry_average="exp", 
-            nnx_init=None, mixed_precision: bool = False
+            sampleShape: int | tuple, 
+            batchSize: int | None = None, batchSize_per_device: int | None = None, 
+            logarithmic=True, 
+            seed: None | int = None, 
+            orbit=None, symmetry_average="exp",
+            sampler_dtype: jnp.dtype |None = None, 
+            eval_dtype: jnp.dtype |None = None,
+            grad_dtype: jnp.dtype |None = None,
+            nnx_init=None
         ):
         if isinstance(net, collections.abc.Iterable):
             if len(net) != 2:
@@ -163,18 +174,25 @@ class NQS:
             raise ValueError(f"The batch size ({batchSize}) has to be divisible by the number of devices ({num_devices})")
         self._batchSize = batchSize
 
-        self._mixed_precision = mixed_precision
-
         if logarithmic:
             self.apply_fun = self.net.apply
         else:
             def apply_fun(parameters, s, method=None):
                 return jnp.log(self.net.apply(parameters, s, method))
             self.apply_fun = apply_fun
+        
         self.init_net(seed)
 
-        self._append_gradients_dict_single = lambda x, y: tree_map(lambda a, b: jnp.concatenate((a, 1.j * b)), x, y)
-        self._append_gradients_dict = lambda x, y: tree_map(lambda a, b: jnp.concatenate((a[:, :], 1.j * b[:, :]), axis=1), x, y)
+        self._sampler_dtype = _check_dtype(sampler_dtype, self.param_dtype, "sampler")
+        self._eval_dtype = _check_dtype(eval_dtype, self.param_dtype, "eval")
+        self._grad_dtype = _check_dtype(grad_dtype, self.param_dtype, "grad") 
+
+        self._append_gradients_dict_single = lambda x, y: tree_map(
+            lambda a, b: jnp.concatenate((a, 1.j * b)), x, y
+        )
+        self._append_gradients_dict = lambda x, y: tree_map(
+            lambda a, b: jnp.concatenate((a[:, :], 1.j * b[:, :]), axis=1), x, y
+        )
         self._append_gradients_dict_jsh = jax.jit(
             jax.shard_map(
                 self._append_gradients_dict, 
@@ -206,7 +224,7 @@ class NQS:
             raise ValueError(
                 "Parameter tree structure mismatch.\n"
                 f"  Expected: {self._netTreeDef}\n"
-                f"  Received: {jax.tree_util.tree_structure(value["params"])}"
+                f"  Received: {jax.tree_util.tree_structure(value['params'])}"
             )
 
         if self._frozen_params is not None:
@@ -216,7 +234,7 @@ class NQS:
         if isinstance(self.parameters, flax.core.frozen_dict.FrozenDict):
             value = freeze(value)
 
-        value = jax.tree_util.tree_map(lambda x: x.astype(self._param_dtype), value)
+        value = jax.tree_util.tree_map(lambda x: x.astype(self.param_dtype), value)
         self._parameters = copy.deepcopy(value)
 
     @property
@@ -235,19 +253,12 @@ class NQS:
         Returns:
             Array holding current values of all variational parameters.
         """
-        # TODO: the casting here might be useless since it is already handled in parameters setter
         if not self.realParams:
             return jnp.concatenate([
-                jnp.concatenate([
-                    p.ravel().real.astype(global_defs.DT_OPERATORS_REAL),
-                    p.ravel().imag.astype(global_defs.DT_OPERATORS_REAL),
-                ])
-                for p in tree_flatten(self.params)[0]
+                jnp.concatenate([p.ravel().real,p.ravel().imag,]) for p in tree_flatten(self.params)[0]
             ])
         
-        return jnp.concatenate([
-            p.ravel().astype(global_defs.DT_OPERATORS_REAL) for p in tree_flatten(self.params)[0]
-        ])
+        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]])
     
     @property
     def frozen_parameters(self):
@@ -271,6 +282,18 @@ class NQS:
             self._frozen_params = None
 
     @property
+    def sampler_parameters(self):
+        return _cast_pytree(self.parameters, self.sampler_dtype)
+    
+    @property
+    def eval_parameters(self):
+        return _cast_pytree(self.parameters, self.eval_dtype)
+    
+    @property
+    def grad_parameters(self):
+        return _cast_pytree(self.parameters, self.grad_dtype)
+    
+    @property
     def batchSize(self):
         return self._batchSize
         
@@ -289,10 +312,6 @@ class NQS:
     @property
     def eval_ratio(self):
         return self._eval_ratio
-
-    @property
-    def mixed_precision(self):
-        return self._mixed_precision
     
     @property
     def holomorphic(self):
@@ -321,6 +340,22 @@ class NQS:
     @property
     def param_dtype(self):
         return self._param_dtype
+    
+    @property
+    def sampler_dtype(self):
+        return self._sampler_dtype
+    
+    @property
+    def eval_dtype(self):
+        return self._eval_dtype
+    
+    @property
+    def grad_dtype(self):
+        return self._grad_dtype
+    
+    @property
+    def out_dtype(self):
+        return self._out_dtype
         
     def init_net(self, seed: int | None):
         if seed == None:
@@ -332,6 +367,9 @@ class NQS:
         dummy_sample = jax.random.normal(jax.random.PRNGKey(seed), self.sampleShape)
         self._parameters = jax.device_put(self.net.init(jax.random.PRNGKey(seed), dummy_sample), REPLICATED_SHARDING)
         self._netTreeDef = jax.tree_util.tree_structure(self.params)
+        out = self.apply_fun(self.parameters, dummy_sample)
+        is_complex = jnp.issubdtype(out.dtype, jnp.complexfloating)
+        self._out_dtype = global_defs.DT_OUT_CPX if is_complex else global_defs.DT_OUT_REAL
 
         self._realParams, self._holomorphic, self._flat_gradient_function, self._dict_gradient_function = pick_gradient(
             self.apply_fun, self.parameters, dummy_sample
@@ -339,16 +377,7 @@ class NQS:
 
         self._paramShapes = []
         self._numParameters = 0
-        low_precision = supported[:2]
         for p in tree_flatten(self.params)[0]:
-            if jnp.dtype(p.dtype) not in supported:
-                raise TypeError(f"Unsupported parameter dtypes: {jnp.dtype(p.dtype)}")
-            if (not self.mixed_precision) and (jnp.dtype(p.dtype) in low_precision):
-                raise ValueError(
-                    f"NQS has {jnp.dtype(p.dtype)} parameters but mixed_precision=False. "
-                    "Pass mixed_precision=True or initialize the network with float64/complex128 parameters."
-                )
-            
             self._paramShapes.append((p.size, p.shape))
             self._numParameters += p.size 
         self._param_dtype = p.dtype
@@ -367,7 +396,9 @@ class NQS:
         
         :meta public:
         """ 
-        return _cast_output(self._apply_fun_sh(s, parameters=self.parameters, batch_size=self.batchSize))
+        return self._apply_fun_sh(
+            s, parameters=self.eval_parameters, batch_size=self.batchSize
+        ).astype(self.out_dtype)
     
     @sharded()
     def _apply_fun_sh(self, s, *, parameters, batch_size):
@@ -375,18 +406,15 @@ class NQS:
 
     def call_ratio(self, s, sp):
         if self.eval_ratio:
-            return self._apply_ratio_sh(s, sp, parameters=self.parameters, batch_size=self.batchSize)
-        
+            return self._apply_ratio_sh(
+                s, sp, parameters=self.eval_parameters, batch_size=self.batchSize
+            ).astype(self.out_dtype)
+
         return jnp.exp(self(sp) - self(s))
     
     @sharded()
     def _apply_ratio_sh(self, s, sp, *, parameters, batch_size):
-        # TODO: is mixed precision skipping the custom ratio evalutaion??
-        if self._mixed_precision:
-            log_psi_s = _cast_output(self.apply_fun(parameters, s))
-            log_psi_sp = _cast_output(self.apply_fun(parameters, sp))
-            return _cast_output(jnp.exp(log_psi_sp - log_psi_s))
-        return _cast_output(self.apply_fun(parameters, s, sp, method=self.net.eval_ratio))
+        return self.apply_fun(parameters, s, sp, method=self.net.eval_ratio)
 
     def gradients(self, s):
         """
@@ -402,18 +430,20 @@ class NQS:
             with respect to each variational parameter :math:`\\theta_k` for each \
             input configuration :math:`s`.
         """
-        return _cast_output(self._gradients_sh(s, parameters=self.parameters, batch_size=self.batchSize))
+        return self._gradients_sh(
+            s, parameters=self.grad_parameters, batch_size=self.batchSize
+        ).astype(self.out_dtype)
     
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_sh(self, s, *, parameters, batch_size):
         return self.flat_gradient_function(self.apply_fun, parameters, s)
     
     def gradients_dict(self, s):
-        result = self._gradients_dict_sh(s, parameters=self.parameters, batch_size=self.batchSize)
+        result = self._gradients_dict_sh(s, parameters=self.grad_parameters, batch_size=self.batchSize)
         if self.holomorphic:
             result = self._append_gradients_dict_jsh(result, result)
 
-        return tree_map(_cast_output, result)
+        return _cast_pytree(result, self.out_dtype)
     
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_dict_sh(self, s, *, parameters, batch_size):
@@ -433,43 +463,15 @@ class NQS:
                 start += s[0]
         
         return tree_unflatten(self._netTreeDef, PTreeShape)
-
-    def get_sampler_net(self):
-        """
-        Get real part of NQS and current parameters
-
-        This function returns a function that evaluates the real part of the NQS,
-        :math:`\\text{Re}(\\log\\psi(s))`, and the current parameters.
-
-        Returns:
-            Real part of the NQS and current parameters
-        """
-        def _cast_real(x):
-            return jnp.real(x).astype(global_defs.DT_OPERATORS_REAL)
-
-        # TODO: does this work if self.net is a symmetric projector??
-        if has_callable_attr(self.net, "eval_real"):
-            return lambda p, x: _cast_real(self.apply_fun(p, x, method=self.net.eval_real)), self.parameters
-        
-        elif self._eval_ratio:
-            if self._mixed_precision:
-                return lambda p, x, y: jnp.exp(
-                    _cast_output(self.apply_fun(p, y)) - _cast_output(self.apply_fun(p, x))
-                ), self.parameters
-                       
-            return lambda p, x, y: _cast_output(self.apply_fun(p, x, y, method=self.net.eval_ratio)), self.parameters
-        
-        return lambda p, x: _cast_real(self.apply_fun(p, x)), self.parameters
     
-    def sample(self, numSamples, key=None, parameters=None):
+    def sample(self, numSamples, key=None):
         if self.is_generator:
-            params = parameters or self.parameters
             key = format_key(key) 
             if len(key.shape) > 1:
                 key = key[0]
             keys = jax.device_put(broadcast_split_key(key, numSamples), DEVICE_SHARDING)
 
-            return self._sample(keys, parameters=params, batch_size=self.batchSize)
+            return self._sample(keys, parameters=self.sampler_parameters, batch_size=self.batchSize)
 
         return None
     

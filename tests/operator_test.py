@@ -5,7 +5,7 @@ import flax.linen as nn
 import numpy as np
 
 import jVMC_exp.operator.discrete as op
-from jVMC_exp.global_defs import DT_SAMPLES
+from jVMC_exp import global_defs
 
 L = 4
 LDIM = 2
@@ -66,7 +66,7 @@ def _spinful_state_from_config(config):
 
 def _dense_matrix_from_operator(operator, configs, state_from_config):
     configs = np.asarray(configs, dtype=np.int32)
-    sp, matEls = operator.get_conn_elements(jnp.asarray(configs, dtype=DT_SAMPLES), configs.shape[0])
+    sp, matEls = operator.get_conn_elements(jnp.asarray(configs, dtype=global_defs.DT_SAMPLES), configs.shape[0])
     sp = np.asarray(sp)
     matEls = np.asarray(matEls)
 
@@ -142,7 +142,7 @@ class Target(nn.Module):
 class TestOperator(unittest.TestCase):
 
     def test_nonzeros(self):
-        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2, dtype=DT_SAMPLES)
+        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2, dtype=global_defs.DT_SAMPLES)
 
         h = 0
         h += 2. * op.SigmaPlus(0)
@@ -157,7 +157,7 @@ class TestOperator(unittest.TestCase):
         self.assertTrue(jnp.sum(jnp.abs(E_loc - 2. * jnp.sum(-(s[..., :3] - 1), axis=-1))) < 1e-7)
 
     def test_op_with_arguments(self):
-        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2, dtype=DT_SAMPLES)
+        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2, dtype=global_defs.DT_SAMPLES)
         
         def f(t, **kwargs):
             return 2.0 * t
@@ -174,7 +174,7 @@ class TestOperator(unittest.TestCase):
             self.assertTrue(jnp.sum(jnp.abs(E_loc - f(t) * jnp.sum(-(s[..., :3] - 1), axis=-1))) < 1e-7)
 
     def test_op_2d(self):
-        s = random.randint(KEY, (NUM_SAMPLES, L, L), 0, 2, dtype=DT_SAMPLES)
+        s = random.randint(KEY, (NUM_SAMPLES, L, L), 0, 2, dtype=global_defs.DT_SAMPLES)
 
         h = 0.3 * op.SigmaPlus(0) + 1.1 * op.SigmaPlus(1) + 0.15 * op.SigmaPlus(4)
 
@@ -192,12 +192,12 @@ class TestOperator(unittest.TestCase):
     def test_spinful_fermionic_onsite_anticommutators(self):
         for spin in ["up", "down"]:
             anti = op.Creation(0, spin) * op.Annihilation(0, spin) + op.Annihilation(0, spin) * op.Creation(0, spin)
-            sp, matEls = anti.get_conn_elements(jnp.array([[0], [1], [2], [3]], dtype=DT_SAMPLES), 4)
+            sp, matEls = anti.get_conn_elements(jnp.array([[0], [1], [2], [3]], dtype=global_defs.DT_SAMPLES), 4)
             loc = jnp.sum(matEls, axis=1)
             self.assertTrue(jnp.allclose(loc, jnp.ones(4)))
 
     def test_spinful_fermionic_onsite_cross_anticommutator(self):
-        s = jnp.array([[0], [1], [2], [3]], dtype=DT_SAMPLES)
+        s = jnp.array([[0], [1], [2], [3]], dtype=global_defs.DT_SAMPLES)
 
         anti = (
             op.Creation(0, "up") * op.Creation(0, "down")
@@ -217,7 +217,7 @@ class TestOperator(unittest.TestCase):
                 [0, 2],
                 [3, 1],
             ],
-            dtype=DT_SAMPLES,
+            dtype=global_defs.DT_SAMPLES,
         )
 
         anti = (
@@ -256,7 +256,7 @@ class TestOperator(unittest.TestCase):
     ########################################################################
     def test_spinless_fermionic_onsite_anticommutators(self):
         anti = op.Creation(0) * op.Annihilation(0) + op.Annihilation(0) * op.Creation(0)
-        sp, matEls = anti.get_conn_elements(jnp.array([[0], [1]], dtype=DT_SAMPLES), 4)
+        sp, matEls = anti.get_conn_elements(jnp.array([[0], [1]], dtype=global_defs.DT_SAMPLES), 4)
         loc = jnp.sum(matEls, axis=1)
         self.assertTrue(jnp.allclose(loc, jnp.ones(2)))
 
@@ -266,7 +266,7 @@ class TestOperator(unittest.TestCase):
                 [0, 0],
                 [1, 0],
             ],
-            dtype=DT_SAMPLES,
+            dtype=global_defs.DT_SAMPLES,
         )
 
         anti = (
@@ -274,7 +274,7 @@ class TestOperator(unittest.TestCase):
             + op.Creation(1) * op.Creation(0)
         )
 
-        sp, matEls = anti.get_conn_elements(s, s.shape[0])
+        _, matEls = anti.get_conn_elements(s, s.shape[0])
         loc = jnp.sum(matEls, axis=1)
 
         self.assertTrue(jnp.allclose(loc, jnp.zeros(s.shape[0])))
