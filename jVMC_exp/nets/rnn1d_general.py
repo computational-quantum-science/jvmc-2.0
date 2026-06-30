@@ -1,18 +1,12 @@
 import jax
-import flax
 import flax.linen as nn
-import numpy as np
 import jax.numpy as jnp
-
-import jVMC_exp
-import jVMC_exp.global_defs as global_defs
-from jVMC_exp.nets.initializers import init_fn_args
-from jVMC_exp.global_defs import DT_SAMPLES
-
 from typing import Union
-
 from functools import partial
 
+import jVMC_exp
+from jVMC_exp import global_defs
+from jVMC_exp.nets.initializers import init_fn_args
 
 class RNNCellStack(nn.Module):
     """
@@ -27,7 +21,6 @@ class RNNCellStack(nn.Module):
     Returns:
     New set of hidden states (one for each layer), as well as the last hidden state, that serves as input to the output layer
     """
-
     cells: list
     dtype: type = global_defs.DT_PARAMS_REAL
     actFun: callable = nn.elu
@@ -37,18 +30,18 @@ class RNNCellStack(nn.Module):
     def __call__(self, carry, newR):
         newCarry = jnp.zeros_like(carry)
        
-        newR = nn.Dense(features=carry.shape[-1], use_bias=False,
-                        **init_fn_args(kernel_init=self.initFun, dtype=self.dtype), 
-                        name="data_in_dense")(newR)
+        newR = nn.Dense(
+            features=carry.shape[-1], 
+            use_bias=False,
+            **init_fn_args(kernel_init=self.initFun, param_dtype=self.dtype), 
+            name="data_in_dense"
+        )(newR)
         newR = self.actFun(newR)
 
         for j, (c, cell) in enumerate(zip(carry, self.cells)):
             current_carry, newR = cell(c, newR)
             newCarry = newCarry.at[j].set(current_carry)
         return newCarry, newR
-
-# ** end class RNNCellStack
-
 
 class RNN1DGeneral(nn.Module):
     """
@@ -85,7 +78,6 @@ class RNN1DGeneral(nn.Module):
         * ``cell``: String ("RNN", "LSTM", or "GRU") or custom definition indicating which type of cell to use for hidden state  transformations.
     
     """
-
     L: int = 10
     hiddenSize: int = 10
     depth: int = 1
@@ -103,7 +95,9 @@ class RNN1DGeneral(nn.Module):
 
         if self.realValuedParams:
             self.dtype = global_defs.DT_PARAMS_REAL
-            self.initFunction = jax.nn.initializers.variance_scaling(scale=self.initScale, mode="fan_avg", distribution="uniform", dtype=self.dtype)
+            self.initFunction = jax.nn.initializers.variance_scaling(
+                scale=self.initScale, mode="fan_avg", distribution="uniform", dtype=self.dtype
+            )
         else:
             self.dtype = global_defs.DT_PARAMS_CPX
             self.initFunction = jVMC_exp.nets.initializers.cplx_variance_scaling 
@@ -111,7 +105,11 @@ class RNN1DGeneral(nn.Module):
         if isinstance(self.cell, str):
             self.zero_carry = jnp.zeros((self.depth, 1, self.hiddenSize), dtype=self.dtype)
             if self.cell == "RNN":
-                self.cells = [RNNCell(actFun=self.actFun, initFun=self.initFunction, dtype=self.dtype) for _ in range(self.depth)]
+                self.cells = [
+                    RNNCell(
+                        actFun=self.actFun, initFun=self.initFunction, dtype=self.dtype
+                    ) for _ in range(self.depth)
+                ]
             elif self.cell == "LSTM":
                 self.cells = [LSTMCell(features=self.hiddenSize) for _ in range(self.depth)]
                 self.zero_carry = jnp.zeros((self.depth, 2, self.hiddenSize), dtype=self.dtype)
@@ -124,9 +122,14 @@ class RNN1DGeneral(nn.Module):
             self.zero_carry = self.cell[1]
 
         self.rnnCell = RNNCellStack(self.cells, actFun=self.actFun, dtype=self.dtype)
-        init_args = init_fn_args(dtype=self.dtype, bias_init=jax.nn.initializers.zeros, kernel_init=self.initFunction)
-        self.outputDense = nn.Dense(features=(self.inputDim-1) * (2 - self.realValuedOutput),
-                                    use_bias=True, **init_args)
+        init_args = init_fn_args(
+            param_dtype=self.dtype, 
+            bias_init=jax.nn.initializers.zeros, 
+            kernel_init=self.initFunction
+        )
+        self.outputDense = nn.Dense(
+            features=(self.inputDim - 1) * (2 - self.realValuedOutput), use_bias=True, **init_args
+        )
 
     def log_coeffs_to_log_probs(self, logCoeffs):
         phase = jnp.zeros((self.inputDim))
@@ -164,27 +167,38 @@ class RNN1DGeneral(nn.Module):
     def rnn_cell_sample(self, carry, x):
         newCarry, out = self.rnnCell(carry[0], carry[1])
         logCoeffs = self.log_coeffs_to_log_probs(self.outputDense(out))
-        sampleOut = jax.random.categorical(x, jnp.real(logCoeffs) / self.logProbFactor).astype(DT_SAMPLES)
+        sampleOut = jax.random.categorical(x, jnp.real(logCoeffs) / self.logProbFactor).astype(global_defs.DT_SAMPLES)
         return (newCarry, jax.nn.one_hot(sampleOut, self.inputDim)), (jnp.nan_to_num(logCoeffs, nan=-35), sampleOut)
-
 
 class GRUCell(nn.Module):
     features: int
 
     @nn.compact
     def __call__(self, carry, state):
-        current_carry, newR = nn.GRUCell(features=self.features, **init_fn_args(param_dtype=global_defs.DT_PARAMS_REAL, recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.DT_PARAMS_REAL)))(carry, state)
-        return current_carry, newR[0]
+        current_carry, newR = nn.GRUCell(
+            features=self.features, 
+            **init_fn_args(
+                param_dtype=global_defs.DT_PARAMS_REAL, 
+                recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.DT_PARAMS_REAL)
+            )
+        )(carry, state)
 
+        return current_carry, newR[0]
 
 class LSTMCell(nn.Module):
     features: int
 
     @nn.compact
     def __call__(self, carry, state):
-        current_carry, newR = nn.OptimizedLSTMCell(features=self.features, **init_fn_args(param_dtype=global_defs.DT_PARAMS_REAL, recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.DT_PARAMS_REAL)))(carry, state)
-        return jnp.asarray(current_carry), newR
+        current_carry, newR = nn.OptimizedLSTMCell(
+            features=self.features, 
+            **init_fn_args(
+                param_dtype=global_defs.DT_PARAMS_REAL, 
+                recurrent_kernel_init=jax.nn.initializers.orthogonal(dtype=global_defs.DT_PARAMS_REAL)
+            )
+        )(carry, state)
 
+        return jnp.asarray(current_carry), newR
 
 class RNNCell(nn.Module):
     """
@@ -201,19 +215,22 @@ class RNNCell(nn.Module):
     Returns:
         New hidden state
     """
-
     initFun: callable = jax.nn.initializers.variance_scaling(scale=1e-1, mode="fan_avg", distribution="uniform")
     actFun: callable = nn.elu
     dtype: type = global_defs.DT_PARAMS_REAL
 
     @nn.compact
     def __call__(self, carry, state):
-        cellCarry = nn.Dense(features=carry.shape[-1],
-                             use_bias=False,
-                             **init_fn_args(dtype=self.dtype,
-                                            bias_init=jax.nn.initializers.zeros,
-                                            kernel_init=self.initFun),
-                             name="cell_carry_dense")
+        cellCarry = nn.Dense(
+            features=carry.shape[-1],
+            use_bias=False,
+            **init_fn_args(
+                param_dtype=self.dtype,
+                bias_init=jax.nn.initializers.zeros,
+                kernel_init=self.initFun
+            ),
+            name="cell_carry_dense"
+        )
 
         newCarry = (self.actFun(cellCarry(carry[0])) + state)[None, :]
 

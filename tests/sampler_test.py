@@ -35,7 +35,7 @@ class _PeakedGeneratorNet(nn.Module):
         del key
         return jnp.asarray(self.peak_state, dtype=jnp.int32)
 
-def _test_sampling(net, test_class: unittest.TestCase, mu=2, log_prob_factor=0.5, two_nets=False, test_two_samplers=False):
+def _test_sampling(net, test_class: unittest.TestCase, mu=2, log_prob_factor=0.5):
     L = 4
     num_samples = 2 ** 18
     num_chains = 2 ** 16
@@ -81,23 +81,7 @@ def _test_sampling(net, test_class: unittest.TestCase, mu=2, log_prob_factor=0.5
     # Compare histogram to exact probabilities
     test_class.assertTrue(jnp.max(jnp.abs(pmc - pex)) < 2e-3)
 
-    if test_two_samplers:
-        num_samples = 2 ** 6
-        num_chains = 2 ** 4
-        psi1 = NQS(net, L, num_samples, seed=1234)
-        # Set up another MCMC sampler
-        proposer = jVMC_exp.propose.SpinFlip()
-        mc_sampler = sampler.MCSampler(
-            psi1, updateProposer=proposer, key=random.PRNGKey(0), 
-            numChains=num_chains, numSamples=num_samples,
-            mu=mu, logProbFactor=log_prob_factor
-        )
-        s, psi_s, _ = mc_sampler.sample(parameters=psi.parameters)
-        psi_s1 = psi(s)
-        
-        test_class.assertTrue(jnp.max(jnp.abs((psi_s - psi_s1) / psi_s)) < 1e-14)
-
-def _test_autoreg_sampling(net, test_class: unittest.TestCase, L=(4,), mu=2, log_prob_factor=0.5, test_two_samplers=False):
+def _test_autoreg_sampling(net, test_class: unittest.TestCase, L=(4,), mu=2, log_prob_factor=0.5):
     num_samples = 2 ** 18
     num_chains = 2 ** 16
 
@@ -131,22 +115,6 @@ def _test_autoreg_sampling(net, test_class: unittest.TestCase, L=(4,), mu=2, log
 
     test_class.assertTrue(jnp.max(jnp.abs(pmc - pex.reshape((-1,))[:16])) < 1.1e-3)
 
-    if test_two_samplers:
-        num_samples = 2 ** 6
-        num_chains = 2 ** 4
-        psi1 = NQS(net, L, num_samples, seed=1234)
-        # Set up another MCMC sampler
-        proposer = jVMC_exp.propose.SpinFlip()
-        mc_sampler = sampler.MCSampler(
-            psi1, updateProposer=proposer, key=random.PRNGKey(0), 
-            numChains=num_chains, numSamples=num_samples,
-            mu=mu, logProbFactor=log_prob_factor
-        )
-        s, psi_s, _ = mc_sampler.sample(parameters=psi.parameters)
-        psi_s1 = psi(s)
-        
-        test_class.assertTrue(jnp.max(jnp.abs((psi_s - psi_s1) / psi_s)) < 1e-14)
-
 class TestMC(unittest.TestCase):
 
     def test_direct_sampling_randomizes_projected_generator_over_symmetry_orbit(self):
@@ -177,7 +145,7 @@ class TestMC(unittest.TestCase):
         orbit = _translation_reflection_spinflip_projector(4)
         net = orbit * rbm
         
-        _test_sampling(net, self, test_two_samplers=True)
+        _test_sampling(net, self)
 
     def test_MCMC_sampling_with_mu(self):
         rbm = nets.CpxRBM(numHidden=2, bias=False)
@@ -200,14 +168,14 @@ class TestMC(unittest.TestCase):
         orbit = _translation_projector(4)
         net = orbit * model
 
-        _test_sampling(net, self, two_nets=True)
+        _test_sampling(net, self)
 
     def test_MCMC_sampling_ratio(self):
-        rbm = nets.rbm.CpxRBM_ratio(numHidden=2, bias=False)
+        rbm = nets.CpxRBM_ratio(numHidden=2, bias=False)
         orbit = _translation_reflection_spinflip_projector(4)
         net = orbit * rbm
         
-        _test_sampling(net, self, test_two_samplers=True)
+        _test_sampling(net, self)
 
 
     # def test_autoregressive_sampling(self):
@@ -217,7 +185,7 @@ class TestMC(unittest.TestCase):
     #     orbit = _translation_projector(4)
     #     net = orbit * model
         
-    #     _test_autoreg_sampling(net, self, test_two_samplers=True)
+    #     _test_autoreg_sampling(net, self)
 
     # def test_autoregressive_sampling_with_symmetries(self):
     #     rnn = nets.RNN1DGeneral(L=4, hiddenSize=5, realValuedOutput=True)
@@ -268,7 +236,6 @@ class TestMC(unittest.TestCase):
 #         _test_autoreg_sampling(net, self, L=(4, 4))
 
 class TestExactSampler(unittest.TestCase):
-
     def test_exact_sampler(self):
         L = 4
 
@@ -280,21 +247,14 @@ class TestExactSampler(unittest.TestCase):
 
         # Set up variational wave function
         rbm = nets.CpxRBM(numHidden=2, bias=False)
-        psi = NQS(rbm, L, 2 ** L)
+        psi = NQS(rbm, L, 2**L)
+        psi.parameters = weights
 
         # Set up exact sampler
-        exact_sampler = sampler.ExactSampler(psi)
-
-        p0 = psi.parameters
-        psi.parameters = weights
+        exact_sampler = sampler.ExactSampler(psi)  
 
         # Compute exact probabilities
         s, psi_s, _ = exact_sampler.sample()
-        self.assertTrue(jnp.max(jnp.abs((psi(s) - psi_s) / psi_s)) < 1e-14)
-        
-        s, psi_s, _ = exact_sampler.sample(parameters=p0)
-
-        psi.parameters = p0
         self.assertTrue(jnp.max(jnp.abs((psi(s) - psi_s) / psi_s)) < 1e-14)
 
 if __name__ == "__main__":

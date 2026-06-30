@@ -7,29 +7,31 @@ from abc import ABC, abstractmethod
 from typing import Tuple
 
 from jVMC_exp.util.key_gen import format_key
+from jVMC_exp.util.util import has_callable_attr
 from jVMC_exp.vqs import NQS
-from jVMC_exp.symmetry import SymmetryProjector
-from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING
-from jVMC_exp.sharding_config import distribute, broadcast_split_key
+from jVMC_exp.sharding_config import (
+    MESH, DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING, 
+    distribute, broadcast_split_key
+)
 from jVMC_exp.propose import AbstractProposer, AbstractProposeCont
 from jVMC_exp.operator.base import AbstractOperator
 from jVMC_exp.stats import SampledObs
-from jVMC_exp.global_defs import DT_SAMPLES, DT_SAMPLES_CONT
+from jVMC_exp import global_defs
 
 class AbstractSampler(ABC):
-    def __init__(self, net: NQS):
-        self._net = net
+    def __init__(self, psi: NQS):
+        self._psi = psi
         self._samples = None
         self._logPsi = None
         self._weights = None
 
     @property
-    def net(self):
-        return self._net
+    def psi(self):
+        return self._psi
     
     @property
     def sampleShape(self):
-        return self.net.sampleShape
+        return self.psi.sampleShape
     
     @property
     def logPsi(self):
@@ -57,12 +59,11 @@ class AbstractSampler(ABC):
         pass
 
     @abstractmethod
-    def sample(self, parameters=None, numSamples=None) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def sample(self, numSamples=None) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         '''
         Sample configurations from the distribution defined by the network.
         
         Args.:
-            parameters: Optional network parameters to use for sampling. If None, the current network parameters are used.
             numSamples: Optional number of samples to generate. If None, the default number of samples is used.
         Returns:
             A tuple of (configs, logPsi, p), where:
@@ -108,22 +109,31 @@ class AbstractMCSampler(AbstractSampler):
         ``mu`` parameter must be set to 1.0, to sample the unchanged POVM distribution.
     """
 
-    def __init__(self, net: NQS, updateProposer: None | AbstractProposer, key=None, numChains=32, numSamples=128, 
-                 thermalizationSweeps=10, sweepSteps=None, initState=None, mu=2, logProbFactor=0.5):
-        if (not net.is_generator) and (not isinstance(updateProposer, AbstractProposer)):
-            raise RuntimeError("Instantiation of MCSampler: `updateProposer` is `None` and cannot be used for MCMC sampling." \
-                                "'updateProposer' must be an instance of 'jVMC.propose.AbstractProposer'.")
-        super().__init__(net)
+    def __init__(
+            self, psi: NQS, updateProposer: None | AbstractProposer, key=None, 
+            numChains=32, numSamples=128, thermalizationSweeps=10, sweepSteps=None, 
+            initState=None, mu=2, logProbFactor=0.5
+        ):
+        if (not psi.is_generator) and (not isinstance(updateProposer, AbstractProposer)):
+            raise RuntimeError(
+                "Instantiation of MCSampler: `updateProposer` is `None` and cannot be used for MCMC sampling. "
+                "'updateProposer' must be an instance of 'jVMC.propose.AbstractProposer'."
+            )
+        super().__init__(psi)
 
         self.initial_states = initState
         if initState is not None: 
             self.initial_states = jnp.array(initState)
             if self.initial_states.shape[1:] != self.sampleShape:
-                raise ValueError(f"The provided initState has the wrog sample shape. \
-                                Got {self.initial_states.shape[1:]}, while sampleShape is {self.sampleShape}.")
+                raise ValueError(
+                    f"The provided initState has the wrog sample shape. "
+                    f"Got {self.initial_states.shape[1:]}, while sampleShape is {self.sampleShape}."
+                )
             elif numChains - self.initial_states[0] < 0:
-                raise ValueError(f"The number of chain in initState ({self.states.shape[0]}) \
-                                 is greater than the provided numChains ({numChains}).")
+                raise ValueError(
+                    f"The number of chain in initState ({self.states.shape[0]}) "
+                    f"is greater than the provided numChains ({numChains})."
+                )
 
         self.logProbFactor = logProbFactor
         self.mu = mu
@@ -140,7 +150,38 @@ class AbstractMCSampler(AbstractSampler):
         self.numSamples = numSamples
         self.numChains = numChains
 
-        self.sampler_net, _ = self.net.get_sampler_net()
+        if has_callable_attr(self.psi.net, "eval_real"):
+            def log_prob_fun(p, s):
+                return (self.mu * self.psi.apply_fun(p, s, method=self.psi.net.eval_real)
+                        .astype(global_defs.DT_OUT_REAL))
+        else:
+            def log_prob_fun(p, s):
+                return (self.mu * jnp.real(self.psi.apply_fun(p, s))
+                        .astype(global_defs.DT_OUT_REAL))
+        self._log_prob_fun_jsh = jax.jit(
+            jax.shard_map(
+                jax.vmap(log_prob_fun, in_axes=(None, 0)),
+                mesh=MESH,
+                in_specs=(REPLICATED_SPEC, DEVICE_SPEC),
+                out_specs=DEVICE_SPEC
+            )
+        )
+
+        if self.psi.eval_ratio:
+            def get_ratio(log_prob, log_prob_correction, params, state, new_state):
+                abs_ratio = jnp.abs(
+                    self.psi.apply_fun(
+                        params, state, new_state, method=self.psi.net.eval_ratio
+                    )
+                ).astype(global_defs.DT_OUT_REAL)
+
+                return abs_ratio**self.mu * jnp.exp(log_prob_correction), log_prob
+        else:
+            def get_ratio(log_prob, log_prob_correction, params, state, new_state):
+                new_log_prob = log_prob_fun(params, new_state)
+
+                return jnp.exp(new_log_prob - log_prob + log_prob_correction), new_log_prob
+        self._get_ratio = get_ratio
 
     @property
     def thermalizationSweeps(self):
@@ -170,19 +211,20 @@ class AbstractMCSampler(AbstractSampler):
     
     @numChains.setter
     def numChains(self, value):
-        if value > self.net.batchSize:
+        if value > self.psi.batchSize:
             Warning(
-                f"numChains ({value}) is larger than the batch size ({self.net.batchSize}), "
+                f"numChains ({value}) is larger than the batch size ({self.psi.batchSize}), "
                 "which may lead to an out-of-memory error. "
                 "Automatically setting numChains = batchSize."
             )
-            value = self.net.batchSize
+            value = self.psi.batchSize
             if self.initial_states is not None:
                 if value - self.initial_states[0] < 0:
                     self.initial_states = self.initial_states[:value]
         if self.numSamples < value:
             raise ValueError(
-                f"The provided number of chains {value} is bigger than the number of samples {self.numSamples}. "
+                f"The provided number of chains {value} is bigger "
+                f"than the number of samples {self.numSamples}."
             )
 
         self._numChains = value
@@ -240,7 +282,7 @@ class AbstractMCSampler(AbstractSampler):
         )
         if needs_resample:
             self._samples, self._logPsi, self._weights = self.sample(num_samples)
-        raw_data = observable.get_O_loc(self.samples, self.net, logPsiS=self.logPsi, **obs_kwargs)
+        raw_data = observable.get_O_loc(self.samples, self.psi, logPsiS=self.logPsi, **obs_kwargs)
 
         return SampledObs(raw_data, self.weights)
   
@@ -267,25 +309,8 @@ class AbstractMCSampler(AbstractSampler):
         else:
             self.states = initializer(initStateKey, (self.numChains,) + self.sampleShape, dtype)
         self.states = jax.device_put(self.states, DEVICE_SHARDING)
-
-        if self.net.eval_ratio:
-            def _log_prob_fun(s, mu, p):
-                # vmap is over parallel MC chains
-                return jax.vmap(lambda x: 1)(s)
-        else:
-            def _log_prob_fun(s, mu, p):
-                # vmap is over parallel MC chains
-                return jax.vmap(lambda x: mu * self.sampler_net(p, x))(s)
-        self._log_prob_fun_jsh = jax.jit(
-            jax.shard_map(
-                _log_prob_fun,
-                mesh=MESH,
-                in_specs=(DEVICE_SPEC,) + (REPLICATED_SPEC,) * 2,
-                out_specs=DEVICE_SPEC
-            )
-        )
         
-        self.updateProposer.init_arg(self.net, self.numChains)
+        self.updateProposer.init_arg(self.psi, self.numChains)
 
         self._is_state_initialized = True
     
@@ -319,7 +344,7 @@ class AbstractMCSampler(AbstractSampler):
             print(f"INFO: Total samples adjusted: {self.numSamples} -> {totalSamples}")
         self.numSamples = totalSamples
 
-    def sample(self, numSamples=None, parameters=None):
+    def sample(self, numSamples=None):
         """
         Generate random samples from wave function.
 
@@ -332,7 +357,6 @@ class AbstractMCSampler(AbstractSampler):
         devices. In that case the number of samples returned might exceed ``numSamples``.
 
         Arguments:
-            * ``parameters``: Network parameters to use for sampling.
             * ``numSamples``: Number of samples to generate. When running multiple processes \
             or on multiple devices per process, the number of samples returned is \
             ``numSamples`` or more. If ``None``, the default number of samples is returned \
@@ -349,19 +373,14 @@ class AbstractMCSampler(AbstractSampler):
         if numSamples is not None:
             samples_tmp = self.numSamples 
             self.numSamples = numSamples
-        if parameters is not None:
-            parameters_tmp = self.net.params
-            self.net.parameters = parameters
 
-        if self.net.is_generator:
+        if self.psi.is_generator:
             configs, logPsi, p = self._get_samples_gen()
         else:
             configs, logPsi, p = self._get_samples_mcmc()
              
         if numSamples is not None:
             self.numSamples = samples_tmp
-        if parameters is not None:
-            self.net.parameters = parameters_tmp
 
         self._samples = configs
         self._logPsi = logPsi
@@ -369,35 +388,36 @@ class AbstractMCSampler(AbstractSampler):
 
         return configs, logPsi, p
 
-
     def _get_samples_gen(self):
         self._key, sample_key = random.split(self.key)
-        samples = self.net.sample(self.numSamples, sample_key)
+        samples = self.psi.sample(self.numSamples, sample_key)
         
-        return samples, self.net(samples), jnp.ones(self.numSamples) / self.numSamples
+        return samples, self.psi(samples), jnp.ones(self.numSamples) / self.numSamples
 
     def _get_samples_mcmc(self):
         self._distribute_sampling()
         if not self._is_state_initialized:
             self._init_state()
-        self.updateProposer.update_arg(self.net)
-        self.logProb = self._log_prob_fun_jsh(self.states, self.mu, self.net.parameters)
+        self.updateProposer.update_arg(self.psi)
+        self.logProb = self._log_prob_fun_jsh(self.psi.sampler_parameters, self.states)
         self.numProposed = jax.device_put(jnp.zeros((self.numChains,), dtype=np.int64), DEVICE_SHARDING)
         self.numAccepted = jax.device_put(jnp.zeros((self.numChains,), dtype=np.int64), DEVICE_SHARDING)
 
         numSamplesStr = str(self._samplePerChain)
 
-        # check whether _get_samples is already compiled for given number of samples
+        # check whether _get_samples is already compiled for given number of samples.
+        # partial over numSamples, thermSweeps and sweepSteps is needed cause these must be static
+        # at the level of the shard_map, as they are used in the jax loops.
         if numSamplesStr not in self._get_samples_jsh:
             get_samples = partial(
-                        self._get_samples, 
-                        sweepFunction=partial(self._sweep, net=self.sampler_net), 
-                        updateProposer=self.updateProposer,
-                        numSamples=self._samplePerChain,
-                        thermSweeps=self.thermalizationSweeps,
-                        sweepSteps=self.sweepSteps,
-                        sampleShape=self.sampleShape,
-                        )
+                self._get_samples, 
+                sweepFunction=partial(self._sweep, get_ratio=self._get_ratio), 
+                updateProposer=self.updateProposer,
+                numSamples=self._samplePerChain,
+                thermSweeps=self.thermalizationSweeps,
+                sweepSteps=self.sweepSteps,
+                sampleShape=self.sampleShape, 
+            )
 
             self._get_samples_jsh[numSamplesStr] = jax.jit(
                 jax.shard_map(
@@ -409,17 +429,20 @@ class AbstractMCSampler(AbstractSampler):
             )
 
         (self.states, self.logProb, self._key, self.numProposed, self.numAccepted), configs, self.updateProposer._arg =\
-            self._get_samples_jsh[numSamplesStr](self.net.parameters, self.states, self.logProb, self.key, 
-                                                 self.numProposed, self.numAccepted, self.updateProposer._arg)
+            self._get_samples_jsh[numSamplesStr](
+                self.psi.sampler_parameters, self.states, self.logProb, self.key, 
+                self.numProposed, self.numAccepted, self.updateProposer._arg
+            )
 
-        coeffs = self.net(configs)
+        coeffs = self.psi(configs)
         p = jnp.exp((1.0 / self.logProbFactor - self.mu) * jnp.real(coeffs))
 
         return configs, coeffs, p / jnp.sum(p)
 
-    def _get_samples(self, params, states, logProb, key, numProposed, numAccepted, updateProposerArg,
-                     numSamples, thermSweeps, sweepSteps, updateProposer, sweepFunction, sampleShape):
-
+    def _get_samples(    
+            self, params, states, logProb, key, numProposed, numAccepted, updateProposerArg,
+            numSamples, thermSweeps, sweepSteps, updateProposer, sweepFunction, sampleShape
+        ):
         # Thermalize
         if self.thermalizationSweeps is not None:
             if updateProposer._use_custom_thermalization:
@@ -446,19 +469,17 @@ class AbstractMCSampler(AbstractSampler):
         # Reshape in from (numChains, numSamplesPerChain, sampleShape) to (numChains * numSamplesPerChain, sampleShape)
         return meta, configs.reshape((configs.shape[0] * configs.shape[1],) + sampleShape), updateProposerArg
 
-    def _sweep(self, states, logProb, key, numProposed, numAccepted, params, numSteps, updateProposer, updateProposerArg, net=None):
+    def _sweep(
+            self, states, logProb, key, numProposed, numAccepted, params, 
+            numSteps, updateProposer, updateProposerArg, get_ratio
+        ):
         def perform_mc_update_single_chain(state, logProb, key_single, ProposerArg):
             # Generate update proposal
             proposerKey, newKey = random.split(key_single)
-            newState, log_prob_correction = updateProposer(proposerKey, state, ProposerArg)
+            newState, log_prob_correction = updateProposer(proposerKey, state, ProposerArg)  
             
             # Compute acceptance probability
-            if self.net.eval_ratio:
-                newLogProb = logProb
-                P = jnp.abs(net(params, state, newState)) ** self.mu
-            else:
-                newLogProb = self.mu * net(params, newState)
-                P = jnp.exp(newLogProb - logProb + log_prob_correction)
+            P, newLogProb = get_ratio(logProb, log_prob_correction, params, state, newState)
             
             # Roll dice
             acceptKey, newKey = random.split(newKey)
@@ -472,17 +493,23 @@ class AbstractMCSampler(AbstractSampler):
         
         def sweep_step(carry, _):
             states, logProb, keys, numProposed, numAccepted = carry
+
             newStates, newLogProb, newKeys, accepted = jax.vmap(
                 perform_mc_update_single_chain,
                 in_axes=(0, 0, 0, self.updateProposer.arg_in_axes)
             )(states, logProb, keys, updateProposerArg)
+
             numProposed = numProposed + 1
             numAccepted = numAccepted + accepted
 
             return (newStates, newLogProb, newKeys, numProposed, numAccepted), None
 
-        (states, logProb, key, numProposed, numAccepted), _ = \
-            jax.lax.scan(sweep_step, (states, logProb, key, numProposed, numAccepted), None, length=numSteps)
+        (states, logProb, key, numProposed, numAccepted), _ = jax.lax.scan(
+            sweep_step, 
+            (states, logProb, key, numProposed, numAccepted),
+            None,
+            length=numSteps
+        )
 
         return states, logProb, key, numProposed, numAccepted
         
@@ -508,18 +535,21 @@ class MCSampler(AbstractMCSampler):
     def _init_state(self):
         initializer = lambda key, shape, dtype: jax.random.bernoulli(key, 0.5, shape).astype(dtype)
         
-        return self._init_state_general(initializer, DT_SAMPLES)
+        return self._init_state_general(initializer, global_defs.DT_SAMPLES)
     
 class MCSamplerCont(AbstractMCSampler):
-    def __init__(self, net: NQS, updateProposer:None | AbstractProposeCont, key=None, numChains=32, numSamples=128, 
-                 thermalizationSweeps=10, sweepSteps=None, initState=None, mu=2, logProbFactor=0.5):
+    def __init__(
+        self, psi: NQS, updateProposer: None | AbstractProposeCont, key=None, 
+        numChains=32, numSamples=128, thermalizationSweeps=10, sweepSteps=None, 
+        initState=None, mu=2, logProbFactor=0.5
+    ):
         if sweepSteps is None:
             sweepSteps = updateProposer.geometry.n_particles * updateProposer.geometry.n_dim
-        super().__init__(net, updateProposer, key , numChains, numSamples, 
+        super().__init__(psi, updateProposer, key , numChains, numSamples, 
                          thermalizationSweeps, sweepSteps, initState, mu, logProbFactor)
         
     def _init_state(self):
-        return self._init_state_general(self.updateProposer.geometry.uniform_populate, DT_SAMPLES_CONT)
+        return self._init_state_general(self.updateProposer.geometry.uniform_populate, global_defs.DT_SAMPLES_CONT)
 
 class ExactSampler(AbstractSampler):
     """
@@ -536,8 +566,8 @@ class ExactSampler(AbstractSampler):
         distribution. For pure wave functions this should be 0.5, and 1.0 for POVMs.
     """
 
-    def __init__(self, net: NQS, lDim=2, logProbFactor=0.5):
-        super().__init__(net)
+    def __init__(self, psi: NQS, lDim=2, logProbFactor=0.5):
+        super().__init__(psi)
 
         self._lDim = lDim
         self._logProbFactor = logProbFactor
@@ -561,10 +591,6 @@ class ExactSampler(AbstractSampler):
         return self.lDim ** self.num_sites
     
     @property
-    def net(self):
-        return self._net
-    
-    @property
     def lDim(self):
         return self._lDim
     
@@ -575,7 +601,7 @@ class ExactSampler(AbstractSampler):
     @cached_property
     def basis(self):
         adjusted_dof = distribute(self.num_states)
-        int_repr = jax.device_put(jnp.arange(adjusted_dof, dtype=DT_SAMPLES), DEVICE_SHARDING)
+        int_repr = jax.device_put(jnp.arange(adjusted_dof, dtype=global_defs.DT_SAMPLES), DEVICE_SHARDING)
 
         def get_basis(int_repr, n_sites):
             def make_state(int_repr, n_sites):
@@ -586,7 +612,7 @@ class ExactSampler(AbstractSampler):
                     return c, locState
                 _, state = jax.lax.scan(scan_fun, int_repr, jnp.arange(n_sites))
 
-                return state[::-1].reshape(self.net.sampleShape)
+                return state[::-1].reshape(self.psi.sampleShape)
             basis = jax.vmap(make_state, in_axes=(0, None))(int_repr, n_sites)
 
             return basis
@@ -596,36 +622,29 @@ class ExactSampler(AbstractSampler):
         )(int_repr)[:self.num_states]
     
     def __call__(self, observable: AbstractOperator, **obs_kwargs) -> SampledObs:
-        raw_data = observable.get_O_loc(self.samples, self.net, logPsiS=self.logPsi, **obs_kwargs)
+        raw_data = observable.get_O_loc(self.samples, self.psi, logPsiS=self.logPsi, **obs_kwargs)
 
         return SampledObs(raw_data, self.weights)
     
-    def sample(self, parameters=None, numSamples=None):
+    def sample(self, numSamples=None):
         """
         Return all computational basis states.
 
         Sampling is automatically distributed accross processes and available devices.
 
         Arguments:
-            * ``parameters``: Dummy argument to provide identical interface as the ``MCSampler`` class.
             * ``numSamples``: Dummy argument to provide identical interface as the ``MCSampler`` class.
 
         Returns:
             ``configs, logPsi, p``: All computational basis configurations, \
             corresponding wave function coefficients, and probabilities :math:`|\\psi(s)|^2` (normalized).
         """
-        if parameters is not None:
-            parameters_tmp = self.net.params
-            self.net.parameters = parameters
 
-        logPsi = self.net(self.basis)
+        logPsi = self.psi(self.basis)
         p = self.get_probabilities(logPsi, self._lastNorm)
         norm = jnp.sum(p)
         p = p / norm
         self._lastNorm += self.logProbFactor * jnp.log(norm)
-
-        if parameters is not None:
-            self.net.parameters = parameters_tmp
 
         self._samples = self.basis
         self._logPsi = logPsi

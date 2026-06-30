@@ -7,17 +7,16 @@ from functools import partial
 import jax
 
 import jVMC_exp
-from jVMC_exp.global_defs import DT_OPERATORS_CPX
+from jVMC_exp import global_defs
 import jVMC_exp.nets.activation_functions as act_funs
 
 if TYPE_CHECKING:
     from jVMC_exp.sampler import AbstractMCSampler
-    from jVMC_exp.operator.base import AbstractOperator
     from jVMC_exp.optimizer import TDVP
 
 OperatorWithKwargs = tuple[Any, dict[str, Any]]
 ObservableEntry = Union[Any, OperatorWithKwargs]
-
+    
 def has_callable_attr(cls, attr: str):
     return callable(getattr(cls, attr, None))
 
@@ -202,10 +201,10 @@ def matrix_to_jvmc_operator(
             number of sites.
     """
     local_basis = [
-        np.eye(2, dtype=DT_OPERATORS_CPX),
-        np.array([[0.0, 1.0], [1.0, 0.0]], dtype=DT_OPERATORS_CPX),
-        np.array([[0.0, 1.0j], [-1.0j, 0.0]], dtype=DT_OPERATORS_CPX),
-        np.array([[1.0, 0.0], [0.0, -1.0]], dtype=DT_OPERATORS_CPX),
+        np.eye(2, dtype=global_defs.DT_OPERATORS_CPX),
+        np.array([[0.0, 1.0], [1.0, 0.0]], dtype=global_defs.DT_OPERATORS_CPX),
+        np.array([[0.0, 1.0j], [-1.0j, 0.0]], dtype=global_defs.DT_OPERATORS_CPX),
+        np.array([[1.0, 0.0], [0.0, -1.0]], dtype=global_defs.DT_OPERATORS_CPX),
     ]
     jvmc_basis = [
         lambda i: op.IdentityOperator(2, i),
@@ -222,7 +221,7 @@ def matrix_to_jvmc_operator(
     if len(sites) not in (1, 2):
         raise ValueError("sites must be an int or a sequence of length 2.")
 
-    matrix = np.asarray(matrix, dtype=DT_OPERATORS_CPX)
+    matrix = np.asarray(matrix, dtype=global_defs.DT_OPERATORS_CPX)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         raise ValueError("matrix must be square.")
 

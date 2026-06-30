@@ -7,7 +7,7 @@ from functools import partial
 from jVMC_exp.geometry import AbstractGeometry
 from jVMC_exp.util.key_gen import format_key
 from jVMC_exp.sharding_config import DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING
-from jVMC_exp.global_defs import DT_SAMPLES_CONT
+from jVMC_exp import global_defs
 
 def shard_array_across_chains(arr, numChains, dtype):
     arr_atleast_1d = jnp.atleast_1d(arr)
@@ -197,7 +197,7 @@ class RWM(AbstractProposeCont):
                     f"'sigma' must have the same dimension as 'geometry.n_dim' "
                     f"(expected {self.geometry.n_dim}, got {sigma.size})."
                 )
-        sigma = shard_array_across_chains(jnp.asarray(sigma), numChains, dtype=DT_SAMPLES_CONT)
+        sigma = shard_array_across_chains(jnp.asarray(sigma), numChains, dtype=global_defs.DT_SAMPLES_CONT)
 
         self._arg = {"sigma": sigma}
     
@@ -278,7 +278,7 @@ class MALA(AbstractProposeCont):
             raise ValueError('"tau" can not be negative.')
         else:
             tau = self._tau
-        tau = shard_array_across_chains(jnp.asarray(tau), numChains, dtype=DT_SAMPLES_CONT)
+        tau = shard_array_across_chains(jnp.asarray(tau), numChains, dtype=global_defs.DT_SAMPLES_CONT)
 
         self._arg = {"params": vqs.parameters, "tau": tau}
     

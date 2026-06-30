@@ -4,11 +4,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import PartitionSpec as P
 from functools import partial, wraps
-import os
 
-USE_DISTRIBUTED = os.environ.get('JVMC_USE_DISTRIBUTED', 'false').lower() == 'true'
+from jVMC_exp import global_defs
 
-if USE_DISTRIBUTED:
+if global_defs.USE_DISTRIBUTED:
     try:
         jax.distributed.initialize()
         num_processes = jax.process_count()

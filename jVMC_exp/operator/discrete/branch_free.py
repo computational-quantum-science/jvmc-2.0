@@ -4,7 +4,7 @@ import inspect
 import jax
 
 from jVMC_exp.operator.discrete.base import Operator as BaseOperator
-from jVMC_exp.global_defs import DT_OPERATORS_CPX
+from jVMC_exp import global_defs
 from jVMC_exp.sharding_config import MESH
 
 def _has_kwargs(fun):
@@ -38,7 +38,10 @@ class OperatorString(list):
 
     @property
     def scale(self):
-        return lambda kw: jnp.prod(jnp.array([s(**kw) if callable(s) else s for s in self._scale]), dtype=DT_OPERATORS_CPX)
+        return lambda kw: jnp.prod(
+            jnp.array([s(**kw) if callable(s) else s for s in self._scale]), 
+            dtype=global_defs.DT_OPERATORS_CPX
+        )
     
     @property
     def diagonal(self):
@@ -243,7 +246,9 @@ class Operator(BaseOperator):
                 onsite_count = jnp.where(spin == 0, down_occ[idx], 0)
                 spinful_parity = jnp.bitwise_and(right_count + onsite_count, 1)
 
-                sign = (1 - 2 * fermionic * (spinful * spinful_parity + (1 - spinful) * spinless_parity)).astype(DT_OPERATORS_CPX)
+                sign = (
+                    1 - 2 * fermionic * (spinful * spinful_parity + (1 - spinful) * spinless_parity)
+                ).astype(global_defs.DT_OPERATORS_CPX)
                 carry_matEl_new = carry_matEl * matEl[carry_sample[idx]] * sign
                 carry_sample_new = carry_sample.at[idx].set(map[carry_sample[idx]])
 
@@ -302,7 +307,9 @@ class CompositeOperator(Operator):
 class ScaledOperator(Operator):
     def  __init__(self, O: Operator, scalar):
         if callable(scalar) and (not _has_kwargs(scalar)):
-            raise ValueError('Any callable that multiplies an operator has to have **kwargs in its argument.')
+            raise ValueError(
+                'Any callable that multiplies an operator has to have **kwargs in its argument.'
+            )
 
         super().__init__(None, None, None, None)
         self._site_ldim = O._site_ldim
@@ -323,7 +330,7 @@ class IdentityOperator(Operator):
 
     @property
     def mat_els(self):
-        return jnp.ones(self.ldim, dtype=DT_OPERATORS_CPX)
+        return jnp.ones(self.ldim, dtype=global_defs.DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -335,7 +342,7 @@ class _Creation(Operator):
 
     @property
     def mat_els(self):
-        return jnp.array([1, 0], dtype=DT_OPERATORS_CPX)
+        return jnp.array([1, 0], dtype=global_defs.DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -347,7 +354,7 @@ class _Annihilation(Operator):
 
     @property
     def mat_els(self):
-        return jnp.array([0, 1], dtype=DT_OPERATORS_CPX)
+        return jnp.array([0, 1], dtype=global_defs.DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -359,7 +366,7 @@ class SigmaX(Operator):
 
     @property
     def mat_els(self):
-        return jnp.ones(self.ldim, dtype=DT_OPERATORS_CPX)
+        return jnp.ones(self.ldim, dtype=global_defs.DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -371,7 +378,7 @@ class SigmaY(Operator):
 
     @property
     def mat_els(self):
-        return jnp.array([1j, -1j], dtype=DT_OPERATORS_CPX)
+        return jnp.array([1j, -1j], dtype=global_defs.DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -383,7 +390,7 @@ class SigmaZ(Operator):
 
     @property
     def mat_els(self):
-        return jnp.array([1, -1], dtype=DT_OPERATORS_CPX)
+        return jnp.array([1, -1], dtype=global_defs.DT_OPERATORS_CPX)
     
     @property
     def map(self):
@@ -403,7 +410,7 @@ class _Number(Operator):
 
     @property
     def mat_els(self):
-        return jnp.array([0, 1], dtype=DT_OPERATORS_CPX)
+        return jnp.array([0, 1], dtype=global_defs.DT_OPERATORS_CPX)
 
     @property
     def map(self):
@@ -416,8 +423,8 @@ class _SpinfulCreation(Operator):
     @property
     def mat_els(self):
         if self.spin == 0:
-            return jnp.array([1, 0, 1, 0], dtype=DT_OPERATORS_CPX)
-        return jnp.array([1, 1, 0, 0], dtype=DT_OPERATORS_CPX)
+            return jnp.array([1, 0, 1, 0], dtype=global_defs.DT_OPERATORS_CPX)
+        return jnp.array([1, 1, 0, 0], dtype=global_defs.DT_OPERATORS_CPX)
 
     @property
     def map(self):
@@ -432,8 +439,8 @@ class _SpinfulAnnihilation(Operator):
     @property
     def mat_els(self):
         if self.spin == 0:
-            return jnp.array([0, 1, 0, 1], dtype=DT_OPERATORS_CPX)
-        return jnp.array([0, 0, 1, 1], dtype=DT_OPERATORS_CPX)
+            return jnp.array([0, 1, 0, 1], dtype=global_defs.DT_OPERATORS_CPX)
+        return jnp.array([0, 0, 1, 1], dtype=global_defs.DT_OPERATORS_CPX)
 
     @property
     def map(self):
@@ -448,8 +455,8 @@ class _SpinfulNumber(Operator):
     @property
     def mat_els(self):
         if self.spin == 0:
-            return jnp.array([0, 1, 0, 1], dtype=DT_OPERATORS_CPX)
-        return jnp.array([0, 0, 1, 1], dtype=DT_OPERATORS_CPX)
+            return jnp.array([0, 1, 0, 1], dtype=global_defs.DT_OPERATORS_CPX)
+        return jnp.array([0, 0, 1, 1], dtype=global_defs.DT_OPERATORS_CPX)
 
     @property
     def map(self):

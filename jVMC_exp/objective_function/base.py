@@ -49,7 +49,7 @@ class Observable(AbstractObjectiveFunction):
     
     def value_and_grad(self, sampler: AbstractSampler, **op_kwargs):
         o_loc = self(sampler, **op_kwargs)
-        grad_log_psi = SampledObs(sampler.net.gradients(sampler.samples), sampler.weights)
+        grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
         grad_obs = grad_log_psi.get_covar_obs(o_loc)
 
         return ObjectiveFunctionOutput(o_loc=o_loc, grad=grad_obs, grad_log_psi=grad_log_psi)
@@ -64,20 +64,20 @@ class Estimator(AbstractObjectiveFunction):
         return self._estimator_fn
     
     def __call__(self, sampler: AbstractSampler):
-        observations = self.estimator_fn(sampler.net.parameters, sampler.samples)
+        observations = self.estimator_fn(sampler.psi.parameters, sampler.samples)
 
         return SampledObs(observations, sampler.weights)
     
     def value_and_grad(self, sampler: AbstractSampler):
         if not self._is_grad_init:
-            _, _, self._grad_fn, _ = pick_gradient(self.estimator_fn, sampler.net.parameters, sampler.samples[0])
+            _, _, self._grad_fn, _ = pick_gradient(self.estimator_fn, sampler.psi.parameters, sampler.samples[0])
             self._is_grad_init = True
 
         value = self(sampler)
         grad = SampledObs(self._get_estimator_grad(
             sampler.samples, 
-            parameters=sampler.net.parameters, 
-            batch_size=sampler.net.batchSize
+            parameters=sampler.psi.parameters, 
+            batch_size=sampler.psi.batchSize
         ), sampler.weights)
 
         return ObjectiveFunctionOutput(o_loc=value, grad=grad)
@@ -100,7 +100,7 @@ class ParametricObservable(AbstractObjectiveFunction):
 
     def value_and_grad(self, sampler: AbstractSampler, **op_kwargs):
         o_loc = self(sampler, **op_kwargs)
-        grad_log_psi = SampledObs(sampler.net.gradients(sampler.samples), sampler.weights)
+        grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
 
         term1 = grad_log_psi.get_covar(o_loc).ravel()
         estimator_out = self._estimator.value_and_grad(sampler)

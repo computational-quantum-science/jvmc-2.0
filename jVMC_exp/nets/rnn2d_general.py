@@ -1,17 +1,13 @@
 import jax
-import flax
 import flax.linen as nn
 import numpy as np
 import jax.numpy as jnp
-
 from typing import Union
+from functools import partial
 
 import jVMC_exp
 import jVMC_exp.global_defs as global_defs
 from jVMC_exp.nets.initializers import init_fn_args
-
-from functools import partial
-
 
 class RNNCellStack(nn.Module):
     """
@@ -26,7 +22,6 @@ class RNNCellStack(nn.Module):
     Returns:
         New set of hidden states (one for each layer), as well as the last hidden state, that serves as input to the output layer
     """
-
     cells: list
     dtype: type = global_defs.DT_PARAMS_REAL
     initFun: callable = jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform")
@@ -34,25 +29,20 @@ class RNNCellStack(nn.Module):
 
     @nn.compact
     def __call__(self, carryH, carryV, xH, xV):
-
         newCarry = jnp.zeros_like(carryH, dtype=self.dtype)
 
         newR = jnp.concatenate([xH, xV])
-        newR = nn.Dense(features=carryH.shape[-1], use_bias=False,
-                        **init_fn_args(kernel_init=self.initFun, dtype=self.dtype), 
-                        name="data_in_dense")(newR)
+        newR = nn.Dense(
+            features=carryH.shape[-1], use_bias=False,
+            **init_fn_args(kernel_init=self.initFun, param_dtype=self.dtype), 
+            name="data_in_dense"
+        )(newR)
         newR = self.actFun(newR)
         
         for j, (cH, cV, cell) in enumerate(zip(carryH, carryV, self.cells)):
-            #carry = jnp.concatenate([cH, cV], axis=-1)
-            #current_carry, newR = cell(carry, newR)
             current_carry, newR = cell(cH, cV, newR)
-            #newCarry = jax.ops.index_update(newCarry, j, current_carry)
             newCarry = newCarry.at[j].set(current_carry)
         return newCarry, newR
-
-# ** end class RNNCellStack
-
 
 class RNN2DGeneral(nn.Module):
     """
@@ -91,7 +81,6 @@ class RNN2DGeneral(nn.Module):
         * ``cell``: String ("RNN", "LSTM", or "GRU") or custom definition indicating which type of cell to use for hidden state  transformations.
 
     """
-
     L: int = 10
     hiddenSize: int = 10
     depth: int = 1
@@ -106,7 +95,9 @@ class RNN2DGeneral(nn.Module):
     def setup(self):
         if self.realValuedParams:
             self.dtype = global_defs.DT_PARAMS_REAL
-            self.initFunction = jax.nn.initializers.variance_scaling(scale=self.initScale, mode="fan_avg", distribution="uniform", dtype=self.dtype)
+            self.initFunction = jax.nn.initializers.variance_scaling(
+                scale=self.initScale, mode="fan_avg", distribution="uniform", dtype=self.dtype
+            )
         else:
             self.dtype = global_defs.DT_PARAMS_CPX
             self.initFunction = jVMC_exp.nets.initializers.cplx_variance_scaling
@@ -256,7 +247,6 @@ class LSTMCell(nn.Module):
 
         return jnp.asarray(current_carry), newR
 
-
 class RNNCell(nn.Module):
     """
     Implementation of a 'vanilla' RNN-cell, that is part of an RNNCellStack which is scanned over an input sequence.
@@ -279,8 +269,10 @@ class RNNCell(nn.Module):
 
     @nn.compact
     def __call__(self, carryH, carryV, state):
-        kernel_init_fun = partial(jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform"),
-                                  dtype=global_defs.DT_PARAMS_REAL)
+        kernel_init_fun = partial(
+            jax.nn.initializers.variance_scaling(scale=0.1, mode="fan_avg", distribution="uniform"),
+            dtype=global_defs.DT_PARAMS_REAL
+        )
         cellCarryH = nn.Dense(features=carryH.shape[-1],
                               use_bias=False,
                               **init_fn_args(bias_init=jax.nn.initializers.zeros,
