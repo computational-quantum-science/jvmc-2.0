@@ -51,7 +51,6 @@ class MinSR(AbstractOptimizer):
         Uses the techique proposed in arXiv:2302.01941 to compute the updates.
         Efficient only if number of samples :math:`\\ll` number of parameters.
         """
-        # FIX this with normalized obs not centered (!!!)
         grad_log_psi = objective_function_output.grad_log_psi._normalized_obs  # (Ns, Np)
         o_loc = objective_function_output.o_loc._normalized_obs.reshape(-1)    # (Ns,)
         
