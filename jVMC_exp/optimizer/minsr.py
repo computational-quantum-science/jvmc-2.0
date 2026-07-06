@@ -5,8 +5,9 @@ from typing import Callable
 from jVMC_exp.sampler import AbstractSampler
 from jVMC_exp.vqs import NQS
 from jVMC_exp.optimizer.base import AbstractOptimizer
-from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
+from jVMC_exp.objective_function.base import ObjectiveFunctionOutput, AbstractObjectiveFunction
 from jVMC_exp.sharding_config import DEVICE_SPEC, REPLICATED_SPEC, MESH, sharded
+from functools import partial
 
 @jax.jit
 def _concat_nonholo(arr):
@@ -34,6 +35,27 @@ class MinSR(AbstractOptimizer):
 
         super().__init__(sampler, psi, use_cross_valiadation=False)
 
+    def __call__(
+            self, parameters, t, *, numSamples=None, intStep=None,
+            objective_function: AbstractObjectiveFunction, **objective_function_kwargs
+    ):
+        """ 
+        Arguments:
+            * ``parameters``: Parameters of the NQS.
+            * ``t``: Current time.
+            * ``hamiltonian``: Hamiltonian operator, i.e., an instance of a derived class of ``jVMC.operator.Operator``. \
+                                *Notice:* Current time ``t`` is by default passed as argument when computing matrix elements. 
+
+        Further optional keyword arguments:
+            * ``numSamples``: Number of samples to be used by MC sampler.
+            * ``outp``: An instance of ``jVMC.OutputManager``. If ``outp`` is given, timings of the individual steps \
+                are recorded using the ``OutputManger``.
+            * ``intStep``: Integration step number of multi step method like Runge-Kutta. This information is used to store \
+                quantities like energy or residuals at the initial integration step.
+        """
+        return super().__call__(parameters, t, numSamples=numSamples, intStep=intStep, 
+                                objective_function=objective_function, compute_grad_covar=False, **objective_function_kwargs)
+
     @property
     def diag_shift(self):
         return self._diag_shift
@@ -51,7 +73,7 @@ class MinSR(AbstractOptimizer):
         Uses the techique proposed in arXiv:2302.01941 to compute the updates.
         Efficient only if number of samples :math:`\\ll` number of parameters.
         """
-        grad_log_psi = objective_function_output.grad_log_psi._normalized_obs  # (Ns, Np)
+        grad_log_psi = objective_function_output.grad_log_psi._normalized_obs_no_copy  # (Ns, Np)
         o_loc = objective_function_output.o_loc._normalized_obs.reshape(-1)    # (Ns,)
         
         if not self.psi.holomorphic and not self.psi.realParams:

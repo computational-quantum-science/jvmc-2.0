@@ -47,12 +47,15 @@ class Observable(AbstractObjectiveFunction):
     def __call__(self, sampler: AbstractSampler, **op_kwargs):
         return sampler(self.operator, **op_kwargs)
     
-    def value_and_grad(self, sampler: AbstractSampler, **op_kwargs):
+    def value_and_grad(self, sampler: AbstractSampler, compute_grad_covar: bool = True, **op_kwargs):
         o_loc = self(sampler, **op_kwargs)
         grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
-        grad_obs = grad_log_psi.get_covar_obs(o_loc)
 
-        return ObjectiveFunctionOutput(o_loc=o_loc, grad=grad_obs, grad_log_psi=grad_log_psi)
+        if compute_grad_covar:
+            grad_obs = grad_log_psi.get_covar_obs(o_loc)
+            return ObjectiveFunctionOutput(o_loc=o_loc, grad=grad_obs, grad_log_psi=grad_log_psi)
+        else:
+            return ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=grad_log_psi)
 
 class Estimator(AbstractObjectiveFunction):
     def __init__(self, estimator_fn: callable):

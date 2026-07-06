@@ -25,6 +25,11 @@ def _center(data, mean):
 def _normalize(data, weights, mean):
     return jnp.einsum("i, i... -> i...", jnp.sqrt(weights), data - mean)
 
+@partial(jax.jit, donate_argnums=(0,))
+def _normalize_no_copy(data, weights):
+    mean = jnp.tensordot(weights, data, axes=(0, 0))
+    return jnp.einsum("i, i... -> i...", jnp.sqrt(weights), data - mean)
+
 @jax.jit
 def _get_covar(norm_data_1, norm_data_2):
     return jnp.tensordot(jnp.conj(norm_data_1), norm_data_2, axes=(0, 0))
@@ -94,7 +99,7 @@ class SampledObs():
             weights = jnp.pad(weights, (0, num_pad), constant_values=0)
         
         self._weights = jax.device_put(weights, DEVICE_SHARDING)
-        self._observations = jax.device_put(observations, DEVICE_SHARDING)
+        self._observations = jax.device_put(observations, DEVICE_SHARDING, donate=True)
 
     def __repr__(self):
         return self.__str__()
@@ -124,6 +129,11 @@ class SampledObs():
     @property
     def _normalized_obs(self):
         return _normalize(self.observations, self.weights, self.mean)
+    
+    @property
+    def _normalized_obs_no_copy(self):
+        # careful, it deletes self._observations, so it can't be accessed later
+        return _normalize_no_copy(self.observations, self.weights)
     
     @property
     def var(self):

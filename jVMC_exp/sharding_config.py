@@ -133,7 +133,8 @@ class sharded:
             use_vmap=True, vmap_in_axes=None, # If None, default to (0,) * num_args
             in_specs=None,                    # If None, default to (DEVICE_SPEC,) * num_args
             out_specs=DEVICE_SPEC,
-            automatic_sharding=False
+            automatic_sharding=False,
+            donate_argnums=None
     ):
         self.static_argnums = static_argnums
         self.static_kwarg_names = set(static_kwarg_names + ('batch_size',))
@@ -143,6 +144,7 @@ class sharded:
         self.in_sharding = None
         self.out_specs = out_specs
         self.automatic_sharding = automatic_sharding
+        self.donate_argnums = donate_argnums
         
     def __call__(self, method: Callable[P, R]) -> Callable[P, R]:
         @wraps(method)
@@ -198,7 +200,8 @@ class sharded:
                     in_specs=(REPLICATED_SPEC,) + self.in_specs, 
                     out_specs=self.out_specs
                 ),
-                static_argnums=self.static_argnums
+                static_argnums=self.static_argnums,
+                donate_argnums=self.donate_argnums
             )
 
         batched_fn = partial(self._batched_wrapper, jsh_fn=jsh_fn)
@@ -212,26 +215,36 @@ class sharded:
         if batch_size is None:
             batch_size = num_samples
             trim = False
-        append = (-num_samples) % batch_size
-        total_sumples = num_samples + append
 
-        if (total_sumples > batch_size) and is_on_device(args):
-            args = tuple(jax.device_put(a, REPLICATED_SHARDING) for a in args)
-       
-        batched_args = tuple(
-            jnp.pad(a, [(0, append),] + [(0, 0)] * (len(a.shape) - 1)).reshape((-1, batch_size) + a.shape[1:]) 
-            for a in args
-        )
-
-        results = []
-        num_batches = batched_args[0].shape[0]
-        for batch_idx in range(num_batches):
-            batch_args = tuple(
-                jax.device_put(ba[batch_idx], self.in_sharding[arg_idx]) for arg_idx, ba in enumerate(batched_args)
+            results = []
+            args = tuple(
+                # jax.device_put(ba, self.in_sharding[arg_idx]) if ba.sharding != self.in_sharding[arg_idx] else ba for arg_idx, ba in enumerate(args)
+                jax.device_put(ba, self.in_sharding[arg_idx]) for arg_idx, ba in enumerate(args)
             )
-            results.append(jsh_fn(kwargs, *batch_args))
+            results.append(jsh_fn(kwargs, *args))
+        else:
+            append = (-num_samples) % batch_size
+            total_sumples = num_samples + append
+
+            if (total_sumples > batch_size) and is_on_device(args):
+                args = tuple(jax.device_put(a, REPLICATED_SHARDING) for a in args)
+            
+            batched_args = tuple(
+                jnp.pad(a, [(0, append),] + [(0, 0)] * (len(a.shape) - 1)).reshape((-1, batch_size) + a.shape[1:]) 
+                for a in args
+            )
+
+            results = []
+            num_batches = batched_args[0].shape[0]
+            for batch_idx in range(num_batches):
+                batch_args = tuple(
+                    jax.device_put(ba[batch_idx], self.in_sharding[arg_idx]) for arg_idx, ba in enumerate(batched_args)
+                )
+                results.append(jsh_fn(kwargs, *batch_args))
 
         def stack_reshape_trim(*xs):
+            if len(xs) == 1 and xs[0].shape[0] == num_samples:
+                return xs[0]
             x = jnp.stack(xs)
             if trim:
                 x = x.reshape((-1,) + x.shape[2:])
@@ -239,3 +252,8 @@ class sharded:
             return x
 
         return jax.tree_util.tree_map(stack_reshape_trim, *results)
+    
+def print_once(string: str, **kwargs):
+    """Print only from the main process in a multi-process setting."""
+    if jax.process_index() == 0:
+        print(string, **kwargs)
