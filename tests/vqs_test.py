@@ -13,7 +13,7 @@ from jVMC_exp import global_defs
 import jVMC_exp.nets.activation_functions as act_funs
 
 def _general_test_grad(model, num_samples, L, test_class: unittest.TestCase):
-    psi = NQS(model, L, num_samples)
+    psi = NQS(model, L, num_samples, seed=1234)
 
     s = jnp.zeros((num_samples, L), dtype=global_defs.DT_SAMPLES)
     s = s.at[0, 1].set(1)
@@ -21,10 +21,15 @@ def _general_test_grad(model, num_samples, L, test_class: unittest.TestCase):
 
     psi0 = psi(s)
     G = psi.gradients(s)
-    delta = 1e-6
+    if jnp.dtype(psi.param_dtype).itemsize < 4:
+        delta = 5e-2
+        atol = 2e-1
+    else:
+        delta = 1e-6
+        atol = 1e-2
     params = psi.parameters
     for j in range(G.shape[-1]):
-        u = jnp.zeros(G.shape[-1], dtype=global_defs.DT_PARAMS_REAL).at[j].set(1)
+        u = jnp.zeros(G.shape[-1], dtype=psi.parameters_flat.dtype).at[j].set(1)
         psi.parameters = delta * u + psi.parameters_flat
         psi1 = psi(s)
         psi.parameters = params
@@ -32,7 +37,7 @@ def _general_test_grad(model, num_samples, L, test_class: unittest.TestCase):
         # Finite difference gradients
         Gfd = (psi1 - psi0) / delta
         with test_class.subTest(i=j):
-            test_class.assertTrue(jnp.max(jnp.abs(Gfd - G[..., j])) < 1e-2)
+            test_class.assertTrue(jnp.max(jnp.abs(Gfd - G[..., j])) < atol)
 
 class CpxRBM_nonHolomorphic(nn.Module):
     """
@@ -93,8 +98,34 @@ class MatrixMultiplication_NonHolomorphic(nn.Module):
             out = out + 1e-1 * jnp.real(out)
     
         return jnp.sum(out)
+
+class TinyRealParamNet(nn.Module):
+    param_dtype: object = jnp.float16
+
+    @nn.compact
+    def __call__(self, s):
+        w = self.param("w", nn.initializers.ones, (s.size,), self.param_dtype)
+        return jnp.dot(w.astype(jnp.float32), s.ravel().astype(jnp.float32))
     
 class TestGradients(unittest.TestCase):
+    def test_fp16_parameters_are_real_parameters(self):
+        L = 3
+        num_samples = 4
+        psi = NQS(TinyRealParamNet(param_dtype=jnp.float16), L, num_samples, seed=1234)
+        samples = jnp.ones((num_samples, L), dtype=global_defs.DT_SAMPLES)
+        gradients = psi.gradients(samples)
+
+        self.assertTrue(psi.realParams)
+        self.assertEqual(psi.param_dtype, jnp.dtype(jnp.float16))
+        self.assertEqual(psi.parameters_flat.dtype, global_defs.DT_OUT_REAL)
+        self.assertEqual(gradients.shape[-1], psi.numParameters)
+
+    def test_low_precision_real_initializers(self):
+        for dtype in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64):
+            init = jVMC_exp.nets.initializers.real_uniform(dtype=dtype)
+            values = init(jax.random.PRNGKey(0), (2, 3))
+            self.assertEqual(values.dtype, jnp.dtype(dtype))
+
     def test_automatic_holomorphicity_recognition(self):
         for k in range(10):
             L = 3

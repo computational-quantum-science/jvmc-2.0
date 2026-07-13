@@ -23,11 +23,15 @@ def _drop_flax_initializer_dtype(init):
 
 def _canonical_real_dtype(dtype=None):
     dtype = jnp.dtype(global_defs.DT_PARAMS_REAL if dtype is None else dtype)
+    if dtype == jnp.dtype(jnp.float16):
+        return jnp.float16
+    if dtype == jnp.dtype(jnp.bfloat16):
+        return jnp.bfloat16
     if dtype == jnp.dtype(jnp.float32):
         return jnp.float32
     if dtype == jnp.dtype(jnp.float64):
         return jnp.float64
-    raise TypeError(f"Expected real parameter dtype float32 or float64, got {dtype}.")
+    raise TypeError(f"Expected real parameter dtype float16, bfloat16, float32, or float64, got {dtype}.")
 
 def _canonical_complex_dtype(dtype=None):
     dtype = jnp.dtype(global_defs.DT_PARAMS_CPX if dtype is None else dtype)

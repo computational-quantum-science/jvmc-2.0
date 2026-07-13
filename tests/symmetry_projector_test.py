@@ -24,6 +24,13 @@ class _DummyNet(nn.Module):
         return jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
 
 
+class _ZeroSupportNet(nn.Module):
+    @nn.compact
+    def __call__(self, s):
+        del s
+        return jnp.asarray(-jnp.inf + 0.0j, dtype=jnp.complex128)
+
+
 class _FirstSiteNet(nn.Module):
     @nn.compact
     def __call__(self, s):
@@ -388,13 +395,6 @@ class Test(unittest.TestCase):
         _assert_allclose(symm.fermion_signs(jnp.asarray(state)), np.asarray([1.0 + 0.0j, expected_sign]))
 
 
-    def test_plural_spinful_particle_type_and_projector_weight_alias(self):
-        symm = particle_hole_symmetry(2, 1, "spinful_fermions")
-        assert symm.particle_type == "spinful_fermion"
-        assert symm.has_nontrivial_projector_weights
-        assert symm.has_nontrivial_factors == symm.has_nontrivial_projector_weights
-
-
     def test_spinful_particle_hole_uses_canonical_fock_sign(self):
         state = np.array([3, 1, 2, 0], dtype=np.int32)
         symm = particle_hole_symmetry(2, 2, "spinful_fermion")
@@ -611,6 +611,23 @@ class Test(unittest.TestCase):
 
         projected = ProjectedOrbitNet(base_net=_DummyNet(), symmetry=symm, symmetry_average="exp")
         got = np.asarray(projected.apply({}, state))
+        assert np.isneginf(np.real(got))
+
+
+    def test_exp_average_handles_all_zero_orbit_without_nan(self):
+        state = jnp.asarray([0, 0], dtype=jnp.int32)
+        symm = SymmetryProjector(
+            Lx=2,
+            Ly=1,
+            particle_type="spin",
+            perm=((0, 1), (1, 0)),
+            character=(1.0 + 0.0j, 1.0 + 0.0j),
+            name="zero_support",
+        )
+
+        projected = ProjectedOrbitNet(base_net=_ZeroSupportNet(), symmetry=symm, symmetry_average="exp")
+        got = np.asarray(projected.apply({}, state))
+        assert not np.isnan(got)
         assert np.isneginf(np.real(got))
 
 

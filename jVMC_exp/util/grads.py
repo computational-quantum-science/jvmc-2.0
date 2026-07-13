@@ -62,7 +62,7 @@ def pick_gradient(fn, params, single_input):
     if not all(d == dtypes[0] for d in dtypes):
         raise Exception("Network uses different parameter data types. This is not supported.")
 
-    real_params = dtypes[0] in [jnp.single, jnp.double]
+    real_params = jnp.issubdtype(dtypes[0], jnp.floating)
 
     def make_flat(t):
         return jnp.concatenate([p.ravel() for p in tree_flatten(t)[0]])

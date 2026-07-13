@@ -255,7 +255,8 @@ class Operator(BaseOperator):
                 return (carry_sample_new, carry_matEl_new), None
             
             prefactor = jax.lax.switch(id, self.prefactorsC, kwargs)
-            prefactor = jax.lax.pcast(prefactor, MESH.axis_names, to='varying')
+            if hasattr(jax.lax, "pcast"):
+                prefactor = jax.lax.pcast(prefactor, MESH.axis_names, to='varying')
             (s_p, matEl), _ = jax.lax.scan(
                 apply_operator, (s, prefactor), (idx, map, matEls, fermionic, spin, spinful)
             )

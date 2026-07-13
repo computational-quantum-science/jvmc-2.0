@@ -88,7 +88,7 @@ class NQS:
             is limited by memory access overheads, too large values can lead \
             to "out of memory" issues.
         * ``seed``: Seed for the PRNG to initialize the network parameters.
-        * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``symmetry_projector.SymmetryProjector``). \
+        * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``jVMC_exp.symmetry.SymmetryProjector``). \
             If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
         * ``symmetry_average``: Built-in symmetry average name or callable passed to ``ProjectedOrbitNet``.
         * ``mixed_precision``: If ``True``, low-precision parameter storage is allowed while public \
@@ -147,7 +147,7 @@ class NQS:
         if orbit is not None:
             if not isinstance(orbit, SymmetryProjector):
                 raise TypeError(
-                    f"Orbit has to be an instance of jVMC_exp.symmetry_projector.SymmetryProjector, "
+                    f"Orbit has to be an instance of jVMC_exp.symmetry.SymmetryProjector, "
                     f"got {orbit}"
                 )
             net = ProjectedOrbitNet(base_net=net, symmetry=orbit, symmetry_average=symmetry_average)
@@ -254,11 +254,12 @@ class NQS:
             Array holding current values of all variational parameters.
         """
         if not self.realParams:
-            return jnp.concatenate([
+            flat = jnp.concatenate([
                 jnp.concatenate([p.ravel().real,p.ravel().imag,]) for p in tree_flatten(self.params)[0]
             ])
+            return flat.astype(global_defs.DT_OUT_REAL)
         
-        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]])
+        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]]).astype(global_defs.DT_OUT_REAL)
     
     @property
     def frozen_parameters(self):

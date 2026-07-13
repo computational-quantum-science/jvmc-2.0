@@ -2,6 +2,7 @@ import jax.numpy as jnp
 import warnings
 import numpy as np
 import jax
+from functools import partial
 
 from jVMC_exp.solver.base import SolverState, AbstractSolver
 
@@ -13,7 +14,7 @@ def _eigh_numpy(S):
 def smooth_cutoff_fn(x, c, exp=6):
     return 1 / (1 + (c / x)**exp)
 
-@jax.jit(static_argnums=(2,))
+@partial(jax.jit, static_argnums=(2,))
 def get_snr(VtF, rho_var, num_samples):
     return jnp.sqrt(jnp.abs(num_samples * (jnp.conj(VtF) * VtF) / (rho_var + 1e-10))).ravel()
     
@@ -112,7 +113,7 @@ class PinvSNR(AbstractSolver):
 
         return update, info
     
-    @jax.jit(static_argnums=(0, 7))
+    @partial(jax.jit, static_argnums=(0, 7))
     def _regularizer_step(self, cutoff, snr, eigenvalues, invEv, VtF, F_norm, exact_sampler):
         # Set regularizer for singular value cutoff
         cutoff = jnp.max(jnp.array([0.8 * cutoff, self.pinv_cutoff]))

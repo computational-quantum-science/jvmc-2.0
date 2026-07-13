@@ -7,7 +7,7 @@ import warnings
 from typing import Callable
 from functools import partial
 
-from jVMC_exp.stats import SampledObs
+from jVMC_exp.stats import BatchedJacobian, SampledObs
 from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler import AbstractSampler, ExactSampler
 from jVMC_exp.util import make_cmplx_array, make_real_array, remove_double
@@ -43,6 +43,9 @@ class AbstractOptimizer(ABC):
     @property
     def psi(self):
         return self._psi
+
+    def _objective_function_kwargs(self, objective_function: AbstractObjectiveFunction):
+        return {}
     
     def __call__(
             self, parameters, t, *, numSamples=None, intStep=None,
@@ -78,8 +81,10 @@ class AbstractOptimizer(ABC):
 
         # Evaluate local observables and their gradient 
         self.output_manager.start_timing("compute objective function and gradient")
-        objective_fn_out = objective_function.value_and_grad(self.sampler, t=t, **objective_function_kwargs)
-        self._elapsed += stop_timing("compute objective function and gradient", wait_for=objective_fn_out.grad_log_psi.observations)
+        value_and_grad_kwargs = dict(objective_function_kwargs)
+        value_and_grad_kwargs.update(self._objective_function_kwargs(objective_function))
+        objective_fn_out = objective_function.value_and_grad(self.sampler, t=t, **value_and_grad_kwargs)
+        self._elapsed += stop_timing("compute objective function and gradient", wait_for=objective_fn_out.sync_target)
 
         # Obtain the update from the gradients
         self.output_manager.start_timing("solve")
@@ -121,7 +126,7 @@ class AbstractOptimizer(ABC):
         ):
         if not hasattr(stepper, "update_dt"):
             raise ValueError("For ground state search the stepper must " \
-                            f"implement a mehod called 'update_dt'")
+                            f"implement a method called 'update_dt'")
 
         pbar = tqdm.tqdm(range(steps))
         for n in pbar: 
@@ -233,8 +238,17 @@ class Evolution(AbstractOptimizer):
             self, sampler: AbstractSampler, psi: NQS, 
             imag_time: bool, make_real: bool, use_cross_valiadation: bool=False, 
             diagonalShift: float | Callable=1e-3, diagonalScale: float | Callable=0., 
-            solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None
+            solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None,
+            jacobian_mode: str = "dense",
         ):
+        if jacobian_mode not in ("dense", "batched"):
+            raise ValueError(f"Unknown jacobian_mode '{jacobian_mode}'")
+        if jacobian_mode == "batched" and solver._needs_dense_matrix:
+            raise NotImplementedError(
+                "jacobian_mode='batched' requires a lazy solver. Use a solver such as CG."
+            )
+        self.jacobian_mode = jacobian_mode
+
         self.rhsPrefactor = 1 if imag_time else 1j
         if psi.holomorphic:
             self._lhs_trans_fn = lambda x: x
@@ -271,6 +285,11 @@ class Evolution(AbstractOptimizer):
 
         self._F0 = None
         self._S0 = None
+
+    def _objective_function_kwargs(self, objective_function: AbstractObjectiveFunction):
+        if self.jacobian_mode == "dense":
+            return {}
+        return dict(jacobian_mode="batched", compute_grad=False)
 
     @property
     def solver(self):
@@ -310,7 +329,7 @@ class Evolution(AbstractOptimizer):
         self._covar_grad_o_loc = grad
 
         S = self._get_lhs(grad_log_psi)
-        F = self._get_rhs(grad)   
+        F = self._get_rhs(grad, grad_log_psi, objective_function_output.o_loc)
         update, self._additional_info = self.solver(S, F, self.solver_state)
         self.update = self._make_real_fn(update) if self.psi.holomorphic else update
 
@@ -327,7 +346,7 @@ class Evolution(AbstractOptimizer):
         if self.psi.holomorphic:
             update_1 = self._make_cmplx_fn(update_1)
             objective_fn_out_2 = objective_fn_out_2.transform(self._remove_double_trans)
-        F2 = self._get_rhs(objective_fn_out_2.grad)
+        F2 = self._get_rhs(objective_fn_out_2.grad, objective_fn_out_2.grad_log_psi, objective_fn_out_2.o_loc)
         S2 = self._get_lhs(objective_fn_out_2.grad_log_psi)
         Sv = S2(update_1) if callable(S2) else S2.dot(update_1)
         validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / residual
@@ -357,21 +376,26 @@ class Evolution(AbstractOptimizer):
 
         return S
     
-    def _get_lhs_lazy(self, grad_log_psi: SampledObs):
+    def _get_lhs_lazy(self, grad_log_psi: SampledObs | BatchedJacobian):
         '''
         Returns a function that computes the matrix vector product with the left hand side of the TDVP equation
         '''
-        O = grad_log_psi._normalized_obs
+        if isinstance(grad_log_psi, BatchedJacobian):
+            raw_matvec = grad_log_psi.matvec
+            diagonal = grad_log_psi.diagonal
+        else:
+            O = grad_log_psi._normalized_obs
 
-        def raw_matvec(v):
-            return (O.conj().T @ (O @ v))
+            def raw_matvec(v):
+                return (O.conj().T @ (O @ v))
+
+            diagonal = lambda: jnp.sum(jnp.abs(O) ** 2, axis=0)
         self._S0 = raw_matvec
 
         def matvec(v):
             Sv = self._lhs_trans_fn(raw_matvec(v))
             if self.diag_scale > 1e-15:
-                diag = jnp.sum(jnp.abs(O) ** 2, axis=0)
-                Sv = Sv + self.diag_scale * diag * v
+                Sv = Sv + self.diag_scale * diagonal() * v
             if self.diag_shift > 1e-15:
                 Sv = Sv + self.diag_shift * v
 
@@ -379,8 +403,18 @@ class Evolution(AbstractOptimizer):
 
         return matvec 
     
-    def _get_rhs(self, grad: SampledObs):
-        self._F0 = - self.rhsPrefactor * grad.mean.ravel()
+    def _get_rhs(
+            self,
+            grad: SampledObs | None,
+            grad_log_psi: SampledObs | BatchedJacobian | None = None,
+            o_loc: SampledObs | None = None,
+        ):
+        if grad is None:
+            if not isinstance(grad_log_psi, BatchedJacobian) or o_loc is None:
+                raise ValueError("A dense gradient or a BatchedJacobian with local observables is required.")
+            self._F0 = - self.rhsPrefactor * grad_log_psi.conj_transpose_matvec(o_loc._normalized_obs.reshape(-1))
+        else:
+            self._F0 = - self.rhsPrefactor * grad.mean.ravel()
         F = self._lhs_trans_fn(self._F0)
         F.block_until_ready()
 

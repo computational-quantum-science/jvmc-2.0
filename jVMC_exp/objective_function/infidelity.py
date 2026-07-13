@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import warnings
+from functools import partial
 
 from jVMC_exp.sampler import AbstractSampler
 from jVMC_exp.operator.discrete.base import AbstractOperator
@@ -14,7 +15,7 @@ class MovingAverage:
     def __init__(self, width=10, init=0.0):
         self.values = jnp.full((width,), init)
 
-    @jax.jit(static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0,))
     def update(self, x):
         self.values = jnp.roll(self.values, -1)
         self.values = self.values.at[-1].set(x)
@@ -167,11 +168,18 @@ class Infidelity(AbstractObjectiveFunction):
     def value_and_grad(
             self, 
             sampler: AbstractSampler, 
-            sample_ref_state: bool=True, 
+            sample_ref_state: bool=True,
+            jacobian_mode: str = "dense",
+            compute_grad: bool = True,
             **kwargs
         ) -> ObjectiveFunctionOutput:
+        if jacobian_mode != "dense":
+            raise NotImplementedError("Batched Jacobians are only implemented for Observable objectives.")
         value = self(sampler, sample_ref_state=sample_ref_state, **kwargs)
         grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
+        if not compute_grad:
+            return ObjectiveFunctionOutput(o_loc=value, grad_log_psi=grad_log_psi)
+
         f_loc = SampledObs(self._psi_f_loc, sampler.weights)
         grad = grad_log_psi.get_covar_obs(f_loc)
         grad._observations *= - 2.0 * self._ref_f_loc

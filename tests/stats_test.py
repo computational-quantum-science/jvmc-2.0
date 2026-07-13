@@ -2,10 +2,68 @@ import unittest
 import jax
 import jax.numpy as jnp
 
-from jVMC_exp.stats import SampledObs
+import jVMC_exp.nets as nets
+from jVMC_exp.stats import BatchedJacobian, SampledObs
+from jVMC_exp.vqs import NQS
+import jVMC_exp.sampler as sampler
 
 
 class TestStats(unittest.TestCase):
+    def _make_batched_jacobian_reference(self):
+        L = 3
+        psi = NQS(nets.CpxRBM(numHidden=2, bias=True), L, 4, seed=1234)
+        exact_sampler = sampler.ExactSampler(psi)
+        exact_sampler.sample()
+        dense = SampledObs(psi.gradients(exact_sampler.samples), exact_sampler.weights)
+        batched = BatchedJacobian(psi, exact_sampler.samples, exact_sampler.weights, batch_size=4)
+
+        return dense, batched
+
+    def test_batched_jacobian_materialize_matches_dense(self):
+        dense, batched = self._make_batched_jacobian_reference()
+
+        self.assertTrue(jnp.allclose(batched.materialize().observations, dense.observations))
+        self.assertTrue(jnp.allclose(batched.materialize().weights, dense.weights))
+
+    def test_batched_jacobian_normalized_blocks_match_dense(self):
+        dense, batched = self._make_batched_jacobian_reference()
+        normalized = jnp.concatenate(tuple(batched.iter_normalized_blocks()), axis=0)
+
+        self.assertTrue(jnp.allclose(normalized, dense._normalized_obs))
+
+    def test_batched_jacobian_linear_operations_match_dense(self):
+        dense, batched = self._make_batched_jacobian_reference()
+        normalized = dense._normalized_obs
+        v = jnp.arange(normalized.shape[1]).astype(normalized.dtype)
+        y = jnp.arange(normalized.shape[0]).astype(normalized.dtype)
+
+        self.assertTrue(jnp.allclose(batched.get_covar(), dense.get_covar()))
+        self.assertTrue(jnp.allclose(batched.tangent_kernel(), dense.tangent_kernel))
+        self.assertTrue(jnp.allclose(batched.matvec(v), dense.get_covar() @ v))
+        self.assertTrue(jnp.allclose(
+            batched.conj_transpose_matvec(y),
+            jnp.conj(jnp.transpose(normalized)) @ y,
+        ))
+
+    def test_batched_jacobian_subset_matches_dense(self):
+        dense, batched = self._make_batched_jacobian_reference()
+        dense_subset = dense.get_subset(0, 4)
+        batched_subset = batched.get_subset(0, 4)
+
+        self.assertTrue(jnp.allclose(batched_subset.materialize().get_covar(), dense_subset.get_covar()))
+
+    def test_real_imag_doubled_batched_jacobian_matches_dense_blocks(self):
+        dense, batched = self._make_batched_jacobian_reference()
+        doubled = batched.real_imag_doubled()
+        expected_blocks = []
+        for idx in range(batched.num_blocks):
+            sl = batched._slice(idx)
+            block = dense._normalized_obs[sl]
+            expected_blocks.append(jnp.concatenate([jnp.real(block), jnp.imag(block)], axis=0))
+        expected = jnp.concatenate(tuple(expected_blocks), axis=0)
+
+        self.assertTrue(jnp.allclose(doubled._normalized_obs, expected))
+        self.assertTrue(jnp.allclose(doubled.tangent_kernel(), expected @ jnp.transpose(expected)))
         
     def test_subset_function(self):
 

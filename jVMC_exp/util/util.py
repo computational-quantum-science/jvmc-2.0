@@ -92,7 +92,7 @@ def init_net(descr, dims, seed=0):
     if symms:
         raise NotImplementedError(
             "init_net no longer builds deprecated util.symmetries orbits. "
-            "Construct a jVMC_exp.symmetry_projector.SymmetryProjector and apply it to the network explicitly."
+            "Construct a jVMC_exp.symmetry.SymmetryProjector and apply it to the network explicitly."
         )
 
     if not "net2" in descr:
