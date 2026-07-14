@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from abc import ABC, abstractmethod
 import tqdm
-from typing import Dict
+from typing import Dict, List
 import warnings
 from typing import Callable
 from functools import partial
@@ -20,11 +20,12 @@ from jVMC_exp.objective_function.base import AbstractObjectiveFunction, Objectiv
 
 class AbstractOptimizer(ABC):
     def __init__(
-            self, sampler: AbstractSampler, psi: NQS,
+            self, sampler: AbstractSampler, psi: NQS, resample_stepper: bool=True,
             use_cross_valiadation: bool=False, output_manager: OutputManager | None = None
         ):
         self._sampler = sampler
         self._psi = psi
+        self._resample = resample_stepper
         self.use_cross_valiadation = use_cross_valiadation
         self.meta_data = {}
         self._output_manager = output_manager if output_manager is not None else OutputManager()
@@ -45,7 +46,8 @@ class AbstractOptimizer(ABC):
         return self._psi
     
     def __call__(
-            self, parameters, t, *, numSamples=None, intStep=None,
+            self, parameters, t, *,
+            numSamples=None, intStep=None, resample=True,
             objective_function: AbstractObjectiveFunction, **objective_function_kwargs
     ):
         """ 
@@ -72,11 +74,17 @@ class AbstractOptimizer(ABC):
             return self.output_manager.stop_timing(name)
 
         # Get sample
-        self.output_manager.start_timing("sampling")
-        sampler_out = self.sampler.sample(numSamples=numSamples)
-        self._elapsed += stop_timing("sampling", wait_for=sampler_out[0])
+        if self._resample or intStep == 0:
+            self.output_manager.start_timing("sampling")
+            sampler_out = self.sampler.sample(numSamples=numSamples)
+            self._elapsed += stop_timing("sampling", wait_for=sampler_out[0])
+        # Importance sampling
+        elif not self._resample and intStep != 0:
+            self.sampler._weights = jnp.exp(
+                2 * jnp.real(self.psi(self.sampler.samples) - self.sampler.logPsi)
+            )
 
-        # Evaluate local observables and their gradient 
+        # Evaluate local observables and their gradient
         self.output_manager.start_timing("compute objective function and gradient")
         objective_fn_out = objective_function.value_and_grad(self.sampler, t=t, **objective_function_kwargs)
         self._elapsed += stop_timing("compute objective function and gradient", wait_for=objective_fn_out.grad_log_psi.observations)
@@ -116,6 +124,7 @@ class AbstractOptimizer(ABC):
             objective_function: AbstractObjectiveFunction,
             stepper: AbstractStepper = Euler(),
             observables: Dict[str, ObservableEntry] | None = None,
+            callback: List[Callable] | None = None,
             save_meta_data: bool = False,
             **kwargs # KWARGS ARE FOR BOTH THE STEPPER AND THE OBJECTIVE FUNCTION, TODO: ADD DOCUMENTATION ON THIS
         ):
@@ -133,7 +142,7 @@ class AbstractOptimizer(ABC):
             # saving one sample call per step
             new_parameters, _ = self.step(0, stepper, objective_function, **kwargs)
             self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out     
-            self._measure_and_store(n, observables, save_meta_data)
+            self._measure_and_store(n, observables, callback, save_meta_data)
             self.psi.parameters = new_parameters
 
             pbar.set_postfix(E=f"{self.o_loc}")
@@ -151,6 +160,7 @@ class AbstractOptimizer(ABC):
             objective_function: AbstractObjectiveFunction,
             stepper: AbstractStepper = Euler,
             observables: Dict[str, ObservableEntry] | None = None,
+            callback: List[Callable] | None = None,
             save_meta_data: bool = False,
             **kwargs
         ):
@@ -162,7 +172,7 @@ class AbstractOptimizer(ABC):
             self.sampler._samples, self.sampler._logPsi, self.sampler._weights = self._sampler_out
             dt = float(dt)
             self.meta_data['dt'] = dt 
-            self._measure_and_store(t, observables, save_meta_data)
+            self._measure_and_store(t, observables, callback, save_meta_data)
             self.psi.parameters = new_parameters
 
             if t + dt >= t_max:
@@ -181,7 +191,7 @@ class AbstractOptimizer(ABC):
         
         self.meta_data['dt'] = dt
         self.sampler.sample()
-        self._measure_and_store(t, observables, save_meta_data)
+        self._measure_and_store(t, observables, callback, save_meta_data)
 
         pbar.close()
         self.output_manager.print_timings()
@@ -213,12 +223,12 @@ class AbstractOptimizer(ABC):
         '''
         self.meta_data = {}
 
-    def _measure_and_store(self, t, observables, save_meta_data):
+    def _measure_and_store(self, t, observables, callback, save_meta_data):
         measures = {}
         energy = dict(
-            mean = jnp.real(self.o_loc.mean).item(),
-            variance = jnp.real(self.o_loc.var).item(),
-            MC_error = jnp.real(self.o_loc.error_of_mean).item()
+            mean = jnp.real(self.o_loc.mean).squeeze(),
+            variance = jnp.real(self.o_loc.var).squeeze(),
+            MC_error = jnp.real(self.o_loc.error_of_mean).squeeze()
         )
 
         if observables is not None:
@@ -228,9 +238,20 @@ class AbstractOptimizer(ABC):
         if save_meta_data:
             self.output_manager.write_metadata(t, **self.meta_data)
 
+        if callback is not None:
+            if callable(callback):
+                callback = (callback,)
+            elif not hasattr(callback, '__len__'):
+                raise ValueError(
+                    'Callback has to be a callable or a list of callables, '
+                    f'got {callback}.'
+                )
+            for cb in callback:
+                cb()
+
 class Evolution(AbstractOptimizer):
     def __init__(
-            self, sampler: AbstractSampler, psi: NQS, 
+            self, sampler: AbstractSampler, psi: NQS, resample_stepper: bool,
             imag_time: bool, make_real: bool, use_cross_valiadation: bool=False, 
             diagonalShift: float | Callable=1e-3, diagonalScale: float | Callable=0., 
             solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None
@@ -260,7 +281,9 @@ class Evolution(AbstractOptimizer):
         self._solver = solver
         self._get_lhs = self._get_lhs_dense if solver._needs_dense_matrix else self._get_lhs_lazy
        
-        super().__init__(sampler, psi, use_cross_valiadation, output_manager=output_manager)
+        super().__init__(
+            sampler, psi, resample_stepper, use_cross_valiadation, output_manager=output_manager
+        )
 
         self._solver_state = SolverState(
             covar_grad_o_loc=lambda: self._covar_grad_o_loc,
@@ -341,7 +364,7 @@ class Evolution(AbstractOptimizer):
         update = self._make_cmplx_fn(update) if self.psi.holomorphic else update
         Sv = self._S0(update) if callable(self._S0) else self._S0.dot(update)
 
-        return jnp.abs(1. + jnp.real(update.dot(Sv) - 2. * jnp.real(update.dot(self._F0))) / (self.o_loc.var + 1e-10))
+        return jnp.abs(1. + (jnp.real(update.dot(Sv)) - 2 * jnp.real(update.dot(self._F0))) / (self.o_loc.var + 1e-10))
     
     def _get_lhs_dense(self, grad_log_psi: SampledObs):
         '''
