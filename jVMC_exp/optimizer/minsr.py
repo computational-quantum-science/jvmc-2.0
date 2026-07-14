@@ -24,7 +24,11 @@ class MinSR(AbstractOptimizer):
         * ``diagonalSchift``: Regularization parameter :math:`\\lambda`, see below.
         * ``diagonalizeOnDevice``: Choose whether to diagonalize :math:`S` on GPU or CPU.
     """
-    def __init__(self, sampler: AbstractSampler, psi: NQS, pinv_tol=1e-14, diagonalShift=1e-3):
+    def __init__(
+            self, sampler: AbstractSampler, psi: NQS, 
+            pinv_tol=1e-14, diagonalShift=1e-3,
+            resample_stepper=True,
+        ):
         self.pinv_tol = pinv_tol
         self.diag_shift = diagonalShift
 
@@ -32,7 +36,7 @@ class MinSR(AbstractOptimizer):
         num_devices = MESH.shape["devices"]
         self._params_pad_size = int((num_devices - num_params % num_devices) % num_devices)
 
-        super().__init__(sampler, psi, use_cross_valiadation=False)
+        super().__init__(sampler, psi, resample_stepper, use_cross_valiadation=False)
 
     @property
     def diag_shift(self):

@@ -170,7 +170,10 @@ class AdaptiveHeun(AbstractStepper):
             jnp.array([0, 1])
         )
 
-    def step(self, t, f, y, normFunction=jnp.linalg.norm, **rhsArgs):
+    def step(
+        self, t, f, y,
+        *, normFunction=jnp.linalg.norm, **rhsArgs
+    ):
         """ This function performs an integration time step.
 
         For a first order ordinary differential equation (ODE) of the form
@@ -196,8 +199,9 @@ class AdaptiveHeun(AbstractStepper):
         """
         converged = False
 
-        while not converged:
-            k0 = f(y, t, **rhsArgs, intStep=0)
+        k0 = f(y, t, **rhsArgs, intStep=0) # TODO: this was inside the loop before
+        
+        while not converged:    
             dy0, _ = _get_rk_step(
                 self._butcher_tableau, 
                 t, f, y, self.dt, k0, **rhsArgs
@@ -241,11 +245,11 @@ class RK23(AbstractStepper):
 
     def step(self, t, f, y, normFunction=jnp.linalg.norm, **rhsArgs):
         converged = False
+        # k0 = self._k0 if self._k0 is not None else f(y, t, **rhsArgs, intStep=0) 
+        # TODO: at the moment this is needed to trigger intStep=0, but the above line saves a step
+        k0 = f(y, t, **rhsArgs, intStep=0)
 
         while not converged:
-            # k0 = self._k0 if self._k0 is not None else f(y, t, **rhsArgs, intStep=0) 
-            # TODO: at the moment this is needed to trigger intStep=0, but the above line saves a step
-            k0 = f(y, t, **rhsArgs, intStep=0)
             dy_high, K = _get_rk_step(
                 self._butcher_tableau,
                 t, f, y, self.dt, k0, **rhsArgs
@@ -291,11 +295,11 @@ class RK45(AbstractStepper):
 
     def step(self, t, f, y, normFunction=jnp.linalg.norm, **rhsArgs):
         converged = False
+        # k0 = self._k0 if self._k0 is not None else f(y, t, **rhsArgs, intStep=0) 
+        # TODO: at the moment this is needed to trigger intStep=0, but the above line saves a step
+        k0 = f(y, t, **rhsArgs, intStep=0)
 
         while not converged:
-            # k0 = self._k0 if self._k0 is not None else f(y, t, **rhsArgs, intStep=0) 
-            # TODO: at the moment this is needed to trigger intStep=0, but the above line saves a step
-            k0 = f(y, t, **rhsArgs, intStep=0)
             dy_high, K = _get_rk_step(
                 self._butcher_tableau,
                 t, f, y, self.dt, k0, **rhsArgs

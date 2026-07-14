@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, List, Callable
 
 from .base import Evolution
 from jVMC_exp.solver.pinv_snr import PinvSNR
@@ -11,10 +11,10 @@ class SR(Evolution):
     def __init__(
             self, sampler, psi, 
             use_cross_valiadation=False, diagonalShift=0.001, diagonalScale=0., solver=PinvSNR(),
-            output_manager: OutputManager | None = None
+            resample_stepper=True, output_manager: OutputManager | None = None
         ):
         super().__init__(
-            sampler, psi, True, True, 
+            sampler, psi, resample_stepper, True, True, 
             use_cross_valiadation, diagonalShift, diagonalScale, solver,
             output_manager=output_manager
         )
@@ -25,6 +25,7 @@ class SR(Evolution):
             objective_function: AbstractObjectiveFunction,
             stepper: AbstractStepper = Euler,
             observables: Dict[str, ObservableEntry] | None = None,
+            callback: List[Callable] | None = None,
             save_meta_data: bool = False,
             **kwargs
         ):

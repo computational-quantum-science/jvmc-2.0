@@ -85,7 +85,8 @@ class SampledObs():
             weights = jnp.ones(self._num_samples, dtype=observations.dtype) / self._num_samples
         elif weights.shape != (self._num_samples,):
             raise ValueError(f"Weights must have shape ({self._num_samples},), got {weights.shape}")
-        
+        weights /= jnp.sum(weights)
+
         remainder = self._num_samples % num_devices
         if remainder != 0:
             num_pad = num_devices - remainder

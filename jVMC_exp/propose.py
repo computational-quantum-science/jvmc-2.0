@@ -10,9 +10,9 @@ from jVMC_exp.sharding_config import DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDI
 from jVMC_exp import global_defs
 
 def shard_array_across_chains(arr, numChains, dtype):
-    arr_atleast_1d = jnp.atleast_1d(arr)
-    sharded_arr = jnp.stack([arr_atleast_1d] * numChains, axis=0, dtype=dtype)
-    return jax.device_put(sharded_arr.reshape((numChains,) + arr_atleast_1d.shape), DEVICE_SHARDING)
+    arr = jnp.atleast_1d(jnp.asarray(arr, dtype=dtype))
+    sharded_arr = jnp.broadcast_to(arr, (numChains,) + arr.shape)
+    return jax.device_put(sharded_arr, DEVICE_SHARDING)
 
 class AbstractProposer(ABC):
     def __init__(self, use_custom_thermalization=False):
