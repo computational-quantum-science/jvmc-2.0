@@ -1,22 +1,23 @@
+from abc import ABC, abstractmethod
+from functools import cached_property, partial
+from typing import Tuple
+
 import jax
 import jax.numpy as jnp
 import jax.random as random
 import numpy as np
-from functools import partial, cached_property
-from abc import ABC, abstractmethod
-from typing import Tuple
 
+from jVMC_exp import global_defs
+from jVMC_exp.operator.base import AbstractOperator
+from jVMC_exp.propose import AbstractProposeCont, AbstractProposer
+from jVMC_exp.sharding_config import (DEVICE_SHARDING, DEVICE_SPEC, MESH,
+                                      REPLICATED_SPEC, broadcast_split_key,
+                                      distribute)
+from jVMC_exp.stats import SampledObs
 from jVMC_exp.util.key_gen import format_key
 from jVMC_exp.util.util import has_callable_attr
 from jVMC_exp.vqs import NQS
-from jVMC_exp.sharding_config import (
-    MESH, DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING, 
-    distribute, broadcast_split_key
-)
-from jVMC_exp.propose import AbstractProposer, AbstractProposeCont
-from jVMC_exp.operator.base import AbstractOperator
-from jVMC_exp.stats import SampledObs
-from jVMC_exp import global_defs
+
 
 class AbstractSampler(ABC):
     def __init__(self, psi: NQS):
@@ -551,7 +552,7 @@ class MCSamplerCont(AbstractMCSampler):
     def _init_state(self):
         return self._init_state_general(self.updateProposer.geometry.uniform_populate, global_defs.DT_SAMPLES_CONT)
 
-class CutoffSampler(AbstractMCSampler):
+class CutoffSampler(AbstractSampler):
     """A cutoff-based MCMC sampler class.
 
     This class provides functionality to sample computational basis states from
@@ -596,22 +597,74 @@ class CutoffSampler(AbstractMCSampler):
             ``numSamples``) or to override its key.
     """
 
-    def __init__(self, net: NQS, updateProposer: AbstractProposer, eps,
+    def __init__(self, psi: NQS, updateProposer: AbstractProposer, eps,
                  key=None, numChains=32, numSamples=128,
                  thermalizationSweeps=10, sweepSteps=None, initState=None,
                  mu=2, logProbFactor=0.5, maxLogPsi=None, bootstrap_kwargs=None):
-        super().__init__(net, updateProposer=updateProposer, key=key,
-                         numChains=numChains, numSamples=numSamples,
-                         thermalizationSweeps=thermalizationSweeps,
-                         sweepSteps=sweepSteps, initState=initState,
-                         mu=mu, logProbFactor=logProbFactor)
-
+        if psi.is_generator:
+            raise RuntimeError(
+                "CutoffSampler does not support generator (autoregressive) nets; "
+                "use 'MCSampler' for those."
+            )
+        if not isinstance(updateProposer, AbstractProposer):
+            raise RuntimeError(
+                "'updateProposer' must be an instance of 'jVMC_exp.propose.AbstractProposer'."
+            )
         if updateProposer._use_custom_thermalization:
             raise RuntimeError(
                 "CutoffSampler does not support proposers with custom "
                 "thermalization (e.g. RWM, MALA)."
             )
 
+        super().__init__(psi)
+
+        self.initial_states = initState
+        if initState is not None:
+            self.initial_states = jnp.array(initState)
+            if self.initial_states.shape[1:] != self.sampleShape:
+                raise ValueError(f"The provided initState has the wrong sample shape. "
+                                 f"Got {self.initial_states.shape[1:]}, while sampleShape is {self.sampleShape}.")
+            elif numChains - self.initial_states.shape[0] < 0:
+                raise ValueError(f"The number of chains in initState ({self.initial_states.shape[0]}) "
+                                 f"is greater than the provided numChains ({numChains}).")
+
+        if mu < 0 or mu > 2:
+            raise ValueError("mu must be in the range [0, 2]")
+        self.mu = mu
+        self.logProbFactor = logProbFactor
+        self._updateProposer = updateProposer
+
+        self.key = key
+
+        if sweepSteps is None:
+            sweepSteps = self.sampleShape[-1]
+        self.sweepSteps = sweepSteps
+        self.thermalizationSweeps = thermalizationSweeps
+        self.numSamples = numSamples
+        self.numChains = numChains
+
+        # Log-probability of a single configuration, log q_0(s) = mu * Re log psi(s).
+        # Same convention as AbstractMCSampler, so that `mu` and `eval_real` are
+        # handled identically.
+        if has_callable_attr(self.psi.net, "eval_real"):
+            def log_prob_fun(p, s):
+                return (self.mu * self.psi.apply_fun(p, s, method=self.psi.net.eval_real)
+                        .astype(global_defs.DT_OUT_REAL))
+        else:
+            def log_prob_fun(p, s):
+                return (self.mu * jnp.real(self.psi.apply_fun(p, s))
+                        .astype(global_defs.DT_OUT_REAL))
+        self._log_prob_fun = log_prob_fun
+        self._log_prob_fun_jsh = jax.jit(
+            jax.shard_map(
+                jax.vmap(log_prob_fun, in_axes=(None, 0)),
+                mesh=MESH,
+                in_specs=(REPLICATED_SPEC, DEVICE_SPEC),
+                out_specs=DEVICE_SPEC
+            )
+        )
+
+        # Cutoff bookkeeping
         if not (0.0 <= float(eps) <= 1.0):
             raise ValueError("`eps` must be in the closed interval [0, 1].")
         self._eps = float(eps)
@@ -621,27 +674,50 @@ class CutoffSampler(AbstractMCSampler):
         self._maxLogPsi = jnp.asarray(maxLogPsi)
         self._cutoff = self._maxLogPsi + jnp.log(self._eps)
 
-    def _init_state(self):
-        initializer = lambda key, shape, dtype: jax.random.bernoulli(key, 0.5, shape).astype(dtype)
+    # ---- Properties with cache-invalidating setters ----
 
-        return self._init_state_general(initializer, DT_SAMPLES)
+    @property
+    def thermalizationSweeps(self):
+        return self._thermalizationSweeps
 
-    def _bootstrap_max_log_psi(self, bootstrap_kwargs):
-        """Run a small MCSampler to obtain an initial estimate of max log psi."""
-        defaults = dict(
-            key=random.PRNGKey(4321),
-            numChains=25,
-            sweepSteps=int(np.prod(self.sampleShape)),
-            numSamples=self.numSamples,
-            thermalizationSweeps=50,
-            mu=self.mu,
-            logProbFactor=self.logProbFactor,
-        )
-        defaults.update(bootstrap_kwargs)
-        bootstrap = MCSampler(self.net, updateProposer=self.updateProposer, **defaults)
-        _, coeffs, _ = bootstrap.sample()
+    @thermalizationSweeps.setter
+    def thermalizationSweeps(self, value):
+        self._thermalizationSweeps = value
+        self._get_samples_jsh = {}
 
-        return jnp.max(self.mu * jnp.real(coeffs))
+    @property
+    def sweepSteps(self):
+        return self._sweepSteps
+
+    @sweepSteps.setter
+    def sweepSteps(self, value):
+        self._sweepSteps = value
+        self._get_samples_jsh = {}
+
+    @property
+    def updateProposer(self):
+        return self._updateProposer
+
+    @property
+    def numChains(self):
+        return self._numChains
+
+    @numChains.setter
+    def numChains(self, value):
+        self._numChains = value
+        self._is_state_initialized = False
+        self._get_samples_jsh = {}
+
+    @property
+    def key(self):
+        return self._key
+
+    @key.setter
+    def key(self, value):
+        self._key = format_key(value)
+        self._is_state_initialized = False
+
+    # ---- Cutoff bookkeeping ----
 
     @property
     def eps(self):
@@ -671,14 +747,114 @@ class CutoffSampler(AbstractMCSampler):
         self._maxLogPsi = jnp.asarray(maxLogPsi)
         self.update_cutoff()
 
+    def _bootstrap_max_log_psi(self, bootstrap_kwargs):
+        """Run a small MCSampler to obtain an initial estimate of max log psi."""
+        defaults = dict(
+            key=random.PRNGKey(4321),
+            numChains=25,
+            sweepSteps=int(np.prod(self.sampleShape)),
+            numSamples=self.numSamples,
+            thermalizationSweeps=50,
+            mu=self.mu,
+            logProbFactor=self.logProbFactor,
+        )
+        defaults.update(bootstrap_kwargs)
+        bootstrap = MCSampler(self.psi, updateProposer=self.updateProposer, **defaults)
+        _, coeffs, _ = bootstrap.sample()
+
+        return jnp.max(self.mu * jnp.real(coeffs))
+
+    # ---- AbstractSampler interface ----
+
+    def __call__(
+        self,
+        observable: AbstractOperator,
+        num_samples: int | None = None,
+        resample: bool = False,
+        **obs_kwargs,
+    ) -> SampledObs:
+        """Evaluate an observable using Monte Carlo samples of the current variational state."""
+        needs_resample = (
+            self.samples is None
+            or (num_samples is not None and num_samples != self.numSamples)
+            or resample
+        )
+        if needs_resample:
+            self._samples, self._logPsi, self._weights = self.sample(num_samples)
+        raw_data = observable.get_O_loc(self.samples, self.psi, logPsiS=self.logPsi, **obs_kwargs)
+
+        return SampledObs(raw_data, self.weights)
+
+    def reset(self, key=None):
+        self.key = key
+
+    def sample(self, numSamples=None, parameters=None):
+        """Generate cutoff-MCMC samples and the cutoff-corrected weights."""
+        if numSamples is not None:
+            samples_tmp = self.numSamples
+            self.numSamples = numSamples
+        if parameters is not None:
+            parameters_tmp = self.psi.parameters
+            self.psi.parameters = parameters
+
+        configs, logPsi, p = self._get_samples_mcmc()
+
+        if numSamples is not None:
+            self.numSamples = samples_tmp
+        if parameters is not None:
+            self.psi.parameters = parameters_tmp
+
+        self._samples = configs
+        self._logPsi = logPsi
+        self._weights = p
+
+        return configs, logPsi, p
+
+    # ---- Internal MCMC machinery ----
+
+    def _distribute_sampling(self):
+        """Adjust chain and sample counts to match the device mesh (mirror of AbstractMCSampler)."""
+        self._numChains = distribute(self.numChains, 'chains')
+
+        self._samplePerChain = (self.numSamples + self.numChains - 1) // self.numChains
+        totalSamples = self._samplePerChain * self.numChains
+
+        if totalSamples > self.numSamples:
+            print(f"INFO: Total samples adjusted: {self.numSamples} -> {totalSamples}")
+        self.numSamples = totalSamples
+
+    def _init_state(self):
+        master_key = self.key[0] if self.key.ndim > 1 else self.key
+        all_keys = broadcast_split_key(master_key, self.numChains + 1)
+        keys = all_keys[:-1]
+        initStateKey = all_keys[-1]
+        self._key = jax.device_put(keys, DEVICE_SHARDING)
+
+        if self.initial_states is not None:
+            self.states = self.initial_states.astype(global_defs.DT_SAMPLES)
+            res = self.numChains - self.states.shape[0]
+            if res > 0:
+                pad = jax.random.bernoulli(
+                    initStateKey, 0.5, (res,) + self.sampleShape
+                ).astype(global_defs.DT_SAMPLES)
+                self.states = jnp.concat([self.states, pad])
+        else:
+            self.states = jax.random.bernoulli(
+                initStateKey, 0.5, (self.numChains,) + self.sampleShape
+            ).astype(global_defs.DT_SAMPLES)
+        self.states = jax.device_put(self.states, DEVICE_SHARDING)
+
+        self.updateProposer.init_arg(self.psi, self.numChains)
+        self._is_state_initialized = True
+
     def _get_samples_mcmc(self):
         self._distribute_sampling()
         if not self._is_state_initialized:
             self._init_state()
-        self.updateProposer.update_arg(self.net)
+        self.updateProposer.update_arg(self.psi)
 
-        self.logProb = self._log_prob_fun_jsh(self.states, self.mu, self.net.parameters)
-        self.logProb = jnp.where(self.logProb > self.cutoff, self.logProb, self.cutoff)
+        self.logProb = self._log_prob_fun_jsh(self.psi.sampler_parameters, self.states)
+        self.logProb = jnp.maximum(self.logProb, self.cutoff)
         self.numProposed = jax.device_put(
             jnp.zeros((self.numChains,), dtype=np.int64), DEVICE_SHARDING
         )
@@ -691,7 +867,7 @@ class CutoffSampler(AbstractMCSampler):
         if numSamplesStr not in self._get_samples_jsh:
             get_samples = partial(
                 self._get_samples,
-                sweepFunction=partial(self._sweep, net=self.sampler_net),
+                sweepFunction=self._sweep,
                 updateProposer=self.updateProposer,
                 numSamples=self._samplePerChain,
                 thermSweeps=self.thermalizationSweeps,
@@ -712,21 +888,27 @@ class CutoffSampler(AbstractMCSampler):
 
         (self.states, self.logProb, self._key, self.numProposed, self.numAccepted), configs, \
             self.updateProposer._arg = self._get_samples_jsh[numSamplesStr](
-                self.net.parameters, self.states, self.logProb, self.key,
+                self.psi.sampler_parameters, self.states, self.logProb, self.key,
                 self.numProposed, self.numAccepted, self.updateProposer._arg, self.cutoff
             )
 
-        coeffs = self.net(configs)
-        p = jnp.exp((1.0 / self.logProbFactor - self.mu) * jnp.real(coeffs))
+        coeffs = self.psi(configs)
+        logPMu = self.mu * jnp.real(coeffs)
 
-        pMu = jnp.exp(self.mu * jnp.real(coeffs))
-        weightsArr = jnp.where(pMu > jnp.exp(self.cutoff), pMu, jnp.exp(self.cutoff))
-        ratio = pMu / weightsArr
-        self.renorm = self.numSamples / jnp.sum(ratio)
+        # Importance ratio p_target(s) / q(s), evaluated in log space to avoid
+        # overflow: ratio = |psi|^mu / max{|psi|^mu, exp(cutoff)} = exp(min(0, logPMu - cutoff)).
+        logRatio = jnp.minimum(logPMu - self.cutoff, 0.0)
+        # Target distribution is |psi|^(1/logProbFactor), the sampled one carries |psi|^mu.
+        logWeights = (1.0 / self.logProbFactor - self.mu) * jnp.real(coeffs) + logRatio
+        weights = jnp.exp(logWeights - jnp.max(logWeights))
+        weights = weights / jnp.sum(weights)
 
-        self.update_maxLogPsi(jnp.max(self.mu * jnp.real(coeffs)))
+        self.ratio = jnp.exp(logRatio)
+        self.renorm = self.numSamples / jnp.sum(self.ratio)
 
-        return configs, coeffs, (p / jnp.sum(p)) * self.renorm * ratio
+        self.update_maxLogPsi(jnp.max(logPMu))
+
+        return configs, coeffs, weights
 
     def _get_samples(self, params, states, logProb, key, numProposed, numAccepted,
                      updateProposerArg, cutoff,
@@ -754,13 +936,14 @@ class CutoffSampler(AbstractMCSampler):
                 updateProposerArg)
 
     def _sweep(self, states, logProb, key, numProposed, numAccepted, cutoff, params,
-               numSteps, updateProposer, updateProposerArg, net=None):
+               numSteps, updateProposer, updateProposerArg):
         def perform_mc_update_single_chain(state, logProb, key_single, ProposerArg):
             proposerKey, newKey = random.split(key_single)
             newState, log_prob_correction = updateProposer(proposerKey, state, ProposerArg)
 
-            newLogProb = self.mu * net(params, newState)
-            newLogProb = jnp.where(newLogProb > cutoff, newLogProb, cutoff)
+            # Clip the log-probability from below at the cutoff: the chain samples
+            # from q(s) ~ max{|psi(s)|^mu, exp(cutoff)}.
+            newLogProb = jnp.maximum(self._log_prob_fun(params, newState), cutoff)
             P = jnp.exp(newLogProb - logProb + log_prob_correction)
 
             acceptKey, newKey = random.split(newKey)
@@ -787,6 +970,18 @@ class CutoffSampler(AbstractMCSampler):
             None, length=numSteps
         )
         return states, logProb, key, numProposed, numAccepted
+
+    def acceptance_ratio(self):
+        """Get acceptance ratio.
+
+        Returns:
+            Acceptance ratio observed in the last call to ``sample()``.
+        """
+        numProp = jnp.sum(self.numProposed)
+        if numProp > 0:
+            return jnp.sum(self.numAccepted) / numProp
+
+        return jnp.array([0.])
 
 class ExactSampler(AbstractSampler):
     """
