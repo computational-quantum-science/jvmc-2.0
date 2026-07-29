@@ -113,7 +113,17 @@ class SampledObs():
     @property
     def weights(self):
         return self._weights
-    
+
+    @property
+    def effective_num_samples(self):
+        """Kish effective sample size :math:`1/\\sum_n w_n^2`.
+
+        Equals the number of samples for uniform weights and is the quantity
+        that replaces it in Monte-Carlo error estimates when the samples carry
+        importance weights (e.g. from ``CutoffSampler`` or ``mu != 2``).
+        """
+        return 1.0 / jnp.sum(self.weights ** 2)
+
     @property
     def mean(self):
         return _get_mean(self.observations, self.weights)

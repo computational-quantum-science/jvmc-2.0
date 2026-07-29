@@ -13,8 +13,14 @@ def _eigh_numpy(S):
 def smooth_cutoff_fn(x, c, exp=6):
     return 1 / (1 + (c / x)**exp)
 
-@jax.jit(static_argnums=(2,))
+@jax.jit
 def get_snr(VtF, rho_var, num_samples):
+    """Signal-to-noise ratio of the force in the eigenbasis of S.
+
+    ``num_samples`` must be the *effective* number of samples, i.e.
+    :math:`1/\\sum_n w_n^2`. It equals the plain sample count for uniformly
+    weighted samples, but not when the samples carry importance weights.
+    """
     return jnp.sqrt(jnp.abs(num_samples * (jnp.conj(VtF) * VtF) / (rho_var + 1e-14))).ravel()
     
 class PinvSNR(AbstractSolver):
@@ -87,7 +93,11 @@ class PinvSNR(AbstractSolver):
             solver_state.rhs_trans_fn, 
             jnp.transpose(jnp.conj(self.last_eigenvectors))
         )
-        snr = get_snr(self._VtF, rho.var.ravel(), rho._num_samples)
+        # The effective sample size, not the raw one: with importance weights
+        # (CutoffSampler, mu != 2) the MC error of the force is
+        # sqrt(var * sum_n w_n^2), so feeding the raw count overestimates the SNR
+        # by sqrt(N / N_eff) and the SNR filter stops regularizing.
+        snr = get_snr(self._VtF, rho.var.ravel(), rho.effective_num_samples)
 
         # Discard eigenvalues below numerical precision
         invEv = jnp.where(jnp.abs(self.last_eigenvalues / self.last_eigenvalues[-1]) > 1e-14, 1. / self.last_eigenvalues, 0.)
