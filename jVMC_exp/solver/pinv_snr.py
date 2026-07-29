@@ -11,7 +11,19 @@ def _eigh_numpy(S):
     return jnp.array(e), jnp.array(V)
 
 def smooth_cutoff_fn(x, c, exp=6):
-    return 1 / (1 + (c / x)**exp)
+    """Smooth step ``1/(1 + (c/x)^exp)``, evaluated without 0/0.
+
+    ``x = 0`` occurs for numerically unresolved modes (a rank-deficient sample
+    covariance gives eigenvalues and SNRs that underflow to exactly zero). For
+    ``c > 0`` the limit is 0, i.e. the mode is discarded, as before. For
+    ``c = 0`` the filter is disabled and the limit is 1 -- the naive expression
+    returns NaN there, which propagates into the update and makes the adaptive
+    steppers spin forever.
+    """
+    safe_x = jnp.where(x > 0, x, 1.0)
+    value = 1 / (1 + (c / safe_x)**exp)
+
+    return jnp.where(x > 0, value, jnp.where(jnp.asarray(c) > 0, 0.0, 1.0))
 
 @jax.jit
 def get_snr(VtF, rho_var, num_samples):
