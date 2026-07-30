@@ -1,9 +1,12 @@
 from __future__ import annotations
-import jax
-import jax.numpy as jnp
+
 from functools import partial
 
+import jax
+import jax.numpy as jnp
+
 from jVMC_exp.sharding_config import DEVICE_SHARDING, MESH
+
 
 @jax.jit
 def _get_mean(data, weights):
