@@ -1,9 +1,11 @@
-import jax.numpy as jnp
 import warnings
-import numpy as np
-import jax
 
-from jVMC_exp.solver.base import SolverState, AbstractSolver
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from jVMC_exp.solver.base import AbstractSolver, SolverState
+
 
 def _eigh_numpy(S):
     e, V = np.linalg.eigh(np.array(S))
@@ -11,19 +13,7 @@ def _eigh_numpy(S):
     return jnp.array(e), jnp.array(V)
 
 def smooth_cutoff_fn(x, c, exp=6):
-    """Smooth step ``1/(1 + (c/x)^exp)``, evaluated without 0/0.
-
-    ``x = 0`` occurs for numerically unresolved modes (a rank-deficient sample
-    covariance gives eigenvalues and SNRs that underflow to exactly zero). For
-    ``c > 0`` the limit is 0, i.e. the mode is discarded, as before. For
-    ``c = 0`` the filter is disabled and the limit is 1 -- the naive expression
-    returns NaN there, which propagates into the update and makes the adaptive
-    steppers spin forever.
-    """
-    safe_x = jnp.where(x > 0, x, 1.0)
-    value = 1 / (1 + (c / safe_x)**exp)
-
-    return jnp.where(x > 0, value, jnp.where(jnp.asarray(c) > 0, 0.0, 1.0))
+    return 1 / (1 + (c / x)**exp)
 
 @jax.jit
 def get_snr(VtF, rho_var, num_samples):
@@ -53,7 +43,7 @@ class PinvSNR(AbstractSolver):
 
     Parameters
     ----------
-    snr_tol : float, default=2
+    snr_tol : float, default=0
         Minimum signal-to-noise ratio of an eigenmode before it contributes
         significantly to the update.
 
@@ -112,6 +102,11 @@ class PinvSNR(AbstractSolver):
         snr = get_snr(self._VtF, rho.var.ravel(), rho.effective_num_samples)
 
         # Discard eigenvalues below numerical precision
+        if jnp.abs(self.last_eigenvalues[-1])<1e-14:
+            raise RuntimeError(
+                f"Largest eigenvalue of the QGT is {self.last_eigenvalues[-1]}. "
+                "QGT is most likely hightly ill-conditioned/zero "
+            )
         invEv = jnp.where(jnp.abs(self.last_eigenvalues / self.last_eigenvalues[-1]) > 1e-14, 1. / self.last_eigenvalues, 0.)
         
         residual = 1.0
