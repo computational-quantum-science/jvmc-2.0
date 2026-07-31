@@ -15,14 +15,8 @@ def _eigh_numpy(S):
 def smooth_cutoff_fn(x, c, exp=6):
     return 1 / (1 + (c / x)**exp)
 
-@jax.jit
+@jax.jit(static_argnums=(2,))
 def get_snr(VtF, rho_var, num_samples):
-    """Signal-to-noise ratio of the force in the eigenbasis of S.
-
-    ``num_samples`` must be the *effective* number of samples, i.e.
-    :math:`1/\\sum_n w_n^2`. It equals the plain sample count for uniformly
-    weighted samples, but not when the samples carry importance weights.
-    """
     return jnp.sqrt(jnp.abs(num_samples * (jnp.conj(VtF) * VtF) / (rho_var + 1e-14))).ravel()
     
 class PinvSNR(AbstractSolver):
@@ -43,7 +37,7 @@ class PinvSNR(AbstractSolver):
 
     Parameters
     ----------
-    snr_tol : float, default=0
+    snr_tol : float, default=2
         Minimum signal-to-noise ratio of an eigenmode before it contributes
         significantly to the update.
 

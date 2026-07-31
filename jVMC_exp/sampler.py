@@ -7,16 +7,23 @@ import jax.numpy as jnp
 import jax.random as random
 import numpy as np
 
-from jVMC_exp import global_defs
+from jVMC_exp.util.key_gen import format_key
+from jVMC_exp.util.util import has_callable_attr
+from jVMC_exp.vqs import NQS
+from jVMC_exp.sharding_config import (
+    MESH, DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING, 
+    distribute, broadcast_split_key
+)
+from jVMC_exp.propose import AbstractProposer, AbstractProposeCont
+
 from jVMC_exp.operator.base import AbstractOperator
 from jVMC_exp.propose import AbstractProposeCont, AbstractProposer
 from jVMC_exp.sharding_config import (DEVICE_SHARDING, DEVICE_SPEC, MESH,
                                       REPLICATED_SPEC, broadcast_split_key,
                                       distribute)
 from jVMC_exp.stats import SampledObs
-from jVMC_exp.util.key_gen import format_key
-from jVMC_exp.util.util import has_callable_attr
-from jVMC_exp.vqs import NQS
+
+from jVMC_exp import global_defs
 
 
 class AbstractSampler(ABC):
