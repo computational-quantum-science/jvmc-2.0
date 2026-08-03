@@ -122,7 +122,7 @@ class Operator(AbstractOperator):
         basis : array_like
             Ordered computational basis with shape
 
-                (dimension, *sample_shape).
+                (num_states, *sample_shape).
 
             The basis must be closed under every nonzero action of the
             operator. Zero-weight padded connections returned by the
@@ -142,77 +142,47 @@ class Operator(AbstractOperator):
         """
         if zero_tolerance < 0:
             raise ValueError(
-                "zero_tolerance must be nonnegative."
+                "zero_tolerance must be nonnegative. "
+                f"Got {zero_tolerance}."
             )
 
         basis_array = jnp.asarray(basis)
-
         if basis_array.ndim < 2:
             raise ValueError(
-                "basis must have shape "
-                "(dimension, *sample_shape)."
+                "basis must have shape (num_states, *sample_shape). "
+                f"Got {basis_array.shape}."
             )
 
         dim = basis_array.shape[0]
-
         if dim == 0:
             raise ValueError(
-                "Cannot construct a matrix from an empty basis."
+                "Cannot construct a matrix from an empty basis. "
+                f"Got {basis_array.shape}."
             )
 
-        # SciPy and the Python lookup dictionary operate on CPU arrays.
-        basis_host = jax.device_get(
-            basis_array
-        )
-
-        flat_basis = basis_host.reshape(
-            dim,
-            -1,
-        )
-
+        # SciPy and the Python lookup dictionary operate on CPU arrays
+        flat_basis = jax.device_get(basis_array).reshape(dim, -1)
         basis_index = {
             tuple(configuration.tolist()): index
-            for index, configuration
-            in enumerate(flat_basis)
+            for index, configuration in enumerate(flat_basis)
         }
-
         if len(basis_index) != dim:
             raise ValueError(
-                "The supplied basis contains duplicate "
-                "configurations."
+                "The supplied basis contains duplicate configurations."
             )
 
         n_devices = jax.device_count()
-
-        batch_size = (
-            (dim + n_devices - 1) // n_devices
-        ) * n_devices
-
         s_primes, mat_els = self.get_conn_elements(
             basis_array,
-            batch_size,
+            ((dim + n_devices - 1) // n_devices) * n_devices,
             **op_kwargs,
         )
-
-        s_primes_host = jax.device_get(
-            s_primes
-        )
-
-        mat_els_host = jax.device_get(
-            mat_els
-        )
-
-        flat_s_primes = s_primes_host.reshape(
-            -1,
-            flat_basis.shape[1],
-        )
-
+        s_primes_host = jax.device_get(s_primes)
+        mat_els_host = jax.device_get(mat_els)
+        flat_s_primes = s_primes_host.reshape(-1, flat_basis.shape[1])
         flat_mat_els = mat_els_host.reshape(-1)
 
-        if (
-            flat_s_primes.shape[0]
-            != flat_mat_els.shape[0]
-        ):
+        if flat_s_primes.shape[0] != flat_mat_els.shape[0]:
             raise RuntimeError(
                 "Incompatible get_conn_elements output shapes: "
                 f"s_primes={s_primes_host.shape}, "
@@ -229,44 +199,29 @@ class Operator(AbstractOperator):
         n_conn = flat_mat_els.size // dim
 
         all_cols = jax.device_get(
-            jnp.repeat(
-                jnp.arange(dim),
-                n_conn,
-            )
+            jnp.repeat(jnp.arange(dim), n_conn,)
         )
 
         rows = []
         cols = []
         data = []
-
         missing_connections = []
-
         for connected_configuration, matrix_element, col in zip(
             flat_s_primes,
             flat_mat_els,
             all_cols,
         ):
-            if (
-                abs(matrix_element)
-                <= zero_tolerance
-            ):
+            if abs(matrix_element) <= zero_tolerance:
                 continue
 
-            configuration_key = tuple(
-                connected_configuration.tolist()
-            )
-
-            row = basis_index.get(
-                configuration_key
-            )
+            configuration_key = tuple(connected_configuration.tolist())
+            row = basis_index.get(configuration_key)
 
             if row is None:
                 missing_connections.append(
                     (
                         int(col),
-                        tuple(
-                            flat_basis[col].tolist()
-                        ),
+                        tuple(flat_basis[col].tolist()),
                         configuration_key,
                         matrix_element,
                     )
@@ -285,16 +240,10 @@ class Operator(AbstractOperator):
 
         matrix = coo_matrix(
             (
-                jax.device_get(
-                    jnp.asarray(data)
-                ),
+                jax.device_get(jnp.asarray(data)),
                 (
-                    jax.device_get(
-                        jnp.asarray(rows)
-                    ),
-                    jax.device_get(
-                        jnp.asarray(cols)
-                    ),
+                    jax.device_get(jnp.asarray(rows)),
+                    jax.device_get(jnp.asarray(cols))
                 ),
             ),
             shape=(dim, dim),

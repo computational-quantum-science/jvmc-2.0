@@ -329,21 +329,13 @@ class NQS:
         """
         basis = jnp.asarray(basis)
 
-        if (
-            basis.ndim < 2
-            or tuple(basis.shape[1:])
-            != tuple(self.sampleShape)
-        ):
+        if basis.ndim < 2 or tuple(basis.shape[1:]) != tuple(self.sampleShape):
             raise ValueError(
-                f"Expected basis shape "
-                f"(dimension, {self.sampleShape}), "
-                f"got {basis.shape}."
+                f"Expected basis shape (dimension, {self.sampleShape}), got {basis.shape}."
             )
 
         if basis.shape[0] == 0:
-            raise ValueError(
-                "The basis is empty."
-            )
+            raise ValueError("The basis is empty.")
 
         values = self(basis).reshape(-1)
 
@@ -355,23 +347,15 @@ class NQS:
 
         if log:
             if normalize:
-                values -= jnp.max(
-                    jnp.real(values)
-                )
-
+                values -= jnp.max(jnp.real(values))
             statevector = jnp.exp(values)
         else:
             statevector = values
 
         if normalize:
-            norm = jnp.linalg.norm(
-                statevector
-            )
+            norm = jnp.linalg.norm(statevector)
 
-            if (
-                not bool(jnp.isfinite(norm))
-                or bool(norm == 0)
-            ):
+            if not bool(jnp.isfinite(norm)) or bool(norm == 0):
                 raise ValueError(
                     f"Cannot normalize statevector "
                     f"with norm {norm}."
