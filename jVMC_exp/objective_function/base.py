@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from chex import dataclass
+import jax
 
-from jVMC_exp.stats import SampledObs
+from jVMC_exp.stats import SampledObs, LazySampledObs
 from jVMC_exp.operator.base import AbstractOperator
 from jVMC_exp.sampler import AbstractSampler
 from jVMC_exp.sharding_config import sharded
@@ -10,22 +11,11 @@ from jVMC_exp.util.grads import pick_gradient
 @dataclass
 class ObjectiveFunctionOutput():
     o_loc: SampledObs | None = None
-    grad: SampledObs | None = None
-    grad_log_psi: SampledObs | None = None
-
-    def get_subset(self, start=None, end=None, step=None):
-        return ObjectiveFunctionOutput(
-            o_loc=self.o_loc.get_subset(start=start, end=end, step=step) if self.o_loc is not None else None,
-            grad=self.grad.get_subset(start=start, end=end, step=step) if self.grad is not None else None,
-            grad_log_psi=self.grad_log_psi.get_subset(start=start, end=end, step=step ) if self.grad_log_psi is not None else None
-        )
-    
-    def transform(self, element_wise_fn=lambda x: x, linear_map=None):
-        return ObjectiveFunctionOutput(
-            o_loc=self.o_loc.transform(element_wise_fn, linear_map) if self.o_loc is not None else None,
-            grad=self.grad.transform(element_wise_fn, linear_map) if self.grad is not None else None,
-            grad_log_psi=self.grad_log_psi.transform(element_wise_fn, linear_map) if self.grad_log_psi is not None else None
-        )
+    grad_log_psi: SampledObs | LazySampledObs | None = None
+    grad: jax.Array | None = None
+    grad_var_re: jax.Array | None = None
+    grad_var_im: jax.Array | None = None
+    grad_cov_re_im: jax.Array | None = None
 
 class AbstractObjectiveFunction(ABC):
     @abstractmethod
@@ -33,12 +23,14 @@ class AbstractObjectiveFunction(ABC):
         pass
 
     @abstractmethod
-    def value_and_grad(self, sampler: AbstractSampler, **kwargs) -> ObjectiveFunctionOutput:
+    def value_and_grad(self, sampler: AbstractSampler, compute_grad: bool, **kwargs) -> ObjectiveFunctionOutput:
         pass
 
 class Observable(AbstractObjectiveFunction):
-    def __init__(self, operator: AbstractOperator):
+    def __init__(self, operator: AbstractOperator, batched_jacobian: bool = False):
         self._operator = operator
+        self._batched_jacobian = batched_jacobian
+        # TODO: might add a batch size here so that one can have different batch sizes
 
     @property
     def operator(self):
@@ -47,17 +39,28 @@ class Observable(AbstractObjectiveFunction):
     def __call__(self, sampler: AbstractSampler, **op_kwargs):
         return sampler(self.operator, **op_kwargs)
     
-    def value_and_grad(self, sampler: AbstractSampler, **op_kwargs):
+    def value_and_grad(self, sampler: AbstractSampler, compute_grad: bool = True, **op_kwargs):
         o_loc = self(sampler, **op_kwargs)
-        grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
-        grad_obs = grad_log_psi.get_covar_obs(o_loc)
+        if self._batched_jacobian:
+            grad_log_psi = LazySampledObs(sampler.psi.lazy_gradients(sampler.samples), sampler.weights)
+        else:
+            grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
 
-        return ObjectiveFunctionOutput(o_loc=o_loc, grad=grad_obs, grad_log_psi=grad_log_psi)
+        if compute_grad:
+            grad, grad_var_re, grad_var_im, grad_cov_re_im = grad_log_psi.get_covar_and_covar_var(o_loc)
+            return ObjectiveFunctionOutput(
+                o_loc=o_loc, grad=grad,
+                grad_var_re=grad_var_re, grad_var_im=grad_var_im, grad_cov_re_im=grad_cov_re_im,
+                grad_log_psi=grad_log_psi
+            )
+
+        return ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=grad_log_psi)
 
 class Estimator(AbstractObjectiveFunction):
-    def __init__(self, estimator_fn: callable):
+    def __init__(self, estimator_fn: callable, batched_jacobian: bool = False):
         self._estimator_fn = estimator_fn
         self._is_grad_init = False
+        self._batched_jacobian = batched_jacobian
         
     @property
     def estimator_fn(self):
@@ -68,22 +71,39 @@ class Estimator(AbstractObjectiveFunction):
 
         return SampledObs(observations, sampler.weights)
     
-    def value_and_grad(self, sampler: AbstractSampler):
+    def value_and_grad(self, sampler: AbstractSampler, **kwargs):
         if not self._is_grad_init:
             _, _, self._grad_fn, _ = pick_gradient(self.estimator_fn, sampler.psi.parameters, sampler.samples[0])
             self._is_grad_init = True
 
         value = self(sampler)
-        grad = SampledObs(self._get_estimator_grad(
-            sampler.samples, 
-            parameters=sampler.psi.parameters, 
-            batch_size=sampler.psi.batchSize
-        ), sampler.weights)
+        if self._batched_jacobian:
+            grad_obs = LazySampledObs(
+                self._lazy_grad_fn_sh(
+                    sampler.samples, 
+                    parameters=sampler.psi.parameters, 
+                    batch_size=sampler.psi.batchSize
+                ), 
+                sampler.weights
+            )
+        else:
+            grad_obs = SampledObs(
+                self._grad_fn_sh(
+                    sampler.samples, 
+                    parameters=sampler.psi.parameters, 
+                    batch_size=sampler.psi.batchSize
+                ), 
+                sampler.weights
+            )
 
-        return ObjectiveFunctionOutput(o_loc=value, grad=grad)
+        return ObjectiveFunctionOutput(o_loc=value, grad=grad_obs.mean)
 
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
-    def _get_estimator_grad(self, samples, *, parameters, batch_size):
+    def _grad_fn_sh(self, samples, *, parameters, batch_size):
+        return self._grad_fn(self.estimator_fn, parameters, samples)
+    
+    @sharded(automatic_sharding=True, yield_iter=True) # TODO: Set flag to False once jax problem is solved
+    def _lazy_grad_fn_sh(self, samples, *, parameters, batch_size):
         return self._grad_fn(self.estimator_fn, parameters, samples)
     
 class ParametricObservable(AbstractObjectiveFunction):
@@ -91,19 +111,26 @@ class ParametricObservable(AbstractObjectiveFunction):
     Objective function for an observable O(θ, s) that depends explicitly on
     both the network parameters θ and the configuration s.
     """
-    def __init__(self, operator: AbstractOperator, estimator_fn: callable):
-        self._observable = Observable(operator)
-        self._estimator = Estimator(estimator_fn)
+    def __init__(
+            self, 
+            operator: AbstractOperator, 
+            estimator_fn: callable, 
+            batched_jacobian: bool = False
+        ):
+        self._observable = Observable(operator, batched_jacobian)
+        self._estimator = Estimator(estimator_fn, batched_jacobian)
 
     def __call__(self, sampler: AbstractSampler, **op_kwargs):
         return self._observable(sampler, **op_kwargs)
 
-    def value_and_grad(self, sampler: AbstractSampler, **op_kwargs):
-        o_loc = self(sampler, **op_kwargs)
-        grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
+    def value_and_grad(self, sampler: AbstractSampler, compute_grad: bool = True, **op_kwargs):
+        obs_out = self._observable.value_and_grad(sampler, compute_grad, **op_kwargs)
+        o_loc = obs_out.o_loc
+        grad_log_psi = obs_out.grad_log_psi
 
-        term1 = grad_log_psi.get_covar(o_loc).ravel()
-        estimator_out = self._estimator.value_and_grad(sampler)
-        grad = SampledObs(term1 + estimator_out.grad.observations, sampler.weights)
+        if compute_grad:
+            grad = obs_out.grad + self._estimator.value_and_grad(sampler, compute_grad=compute_grad).grad
 
-        return ObjectiveFunctionOutput(o_loc=o_loc, grad=grad, grad_log_psi=grad_log_psi)
+            return ObjectiveFunctionOutput(o_loc=o_loc, grad=grad, grad_log_psi=grad_log_psi)
+        
+        return ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=grad_log_psi)

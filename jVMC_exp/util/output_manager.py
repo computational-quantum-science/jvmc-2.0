@@ -9,6 +9,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+def _is_main_process() -> bool:
+    return jax.process_index() == 0
+
 def _as_h5_array(value: Any):
     try:
         arr = jax.device_get(jnp.asarray(value))
@@ -106,6 +109,7 @@ class OutputManager:
         self.timings = self._timings
         self._parameter_attrs: dict[str, dict[str, Any]] = {}
         self._parameter_latest: str | None = None
+        self.is_main_process = _is_main_process()
         if path is not None:
             self._set_path(path, append=append)
 
@@ -118,11 +122,13 @@ class OutputManager:
 
     def _set_path(self, path: str | Path, append: bool = True) -> None:
         self.path = Path(path).expanduser()
+        self.mode = "a"
+        if not self.is_main_process:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
         with h5py.File(self.path, mode) as handle:
             handle.require_group(self.group)
-        self.mode = "a"
         
     def _root(self, handle):
         return handle[self.group]
@@ -185,7 +191,7 @@ class OutputManager:
 
     def write_observables(self, step: int | float, **observables) -> None:
         self._add("observables", step, **observables)
-        if self.path is not None:
+        if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 group = self._root(handle).require_group("observables")
                 self._append_h5(group, "times", step)
@@ -197,7 +203,7 @@ class OutputManager:
         else:
             self.data.setdefault("metadata", {}).update(metadata)
 
-        if self.path is not None:
+        if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 group = self._root(handle).require_group("metadata")
                 if step is not None:
@@ -215,7 +221,7 @@ class OutputManager:
             self._add("network_checkpoints", time, checkpoints=weights)
         else:
             raise ValueError("Network weights must be serialized for checkpointing.")
-        if self.path is not None:
+        if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 group = self._root(handle).require_group("network_checkpoints")
                 self._append_h5(group, "times", time)
@@ -225,7 +231,7 @@ class OutputManager:
         if path is not None:
             raise ValueError("write_dataset() does not bind paths. Use save_to_h5(path=...) to choose an output file.")
         self._store_dataset(name, data, group=group)
-        if self.path is not None:
+        if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 self._write_dataset_to_h5(handle, name, data, group=group)
 
@@ -278,7 +284,7 @@ class OutputManager:
         checkpoint_attrs.update(attrs or {})
         self._parameter_attrs[group_name] = checkpoint_attrs
         self._parameter_latest = group_name
-        if self.path is not None:
+        if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 self._write_parameters_to_h5(handle, group_name, state, checkpoint_attrs)
         return group_name
@@ -288,7 +294,9 @@ class OutputManager:
             self._set_path(path, append=append)
         if self.path is None:
             raise ValueError("A path is required for this operation. Pass a path to save_to_h5().")
-    
+        if not self.is_main_process:
+            return
+
         mode = "a" if append else "w"
         with h5py.File(self.path, mode) as handle:
             handle.require_group(self.group)
@@ -342,6 +350,8 @@ class OutputManager:
         entry["count"] = int(entry["count"]) + 1
 
     def print_timings(self, indent: str = "") -> None:
+        if not self.is_main_process:
+            return
         print(f"{indent}Recorded timings:", flush=True)
         for key, item in self._timings.items():
             delta = item["total"] - item["last_total"]
@@ -357,7 +367,7 @@ class OutputManager:
                 "total": value["total"],
                 "count": value["count"],
             }
-        if self.path is not None:
+        if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 self._write_dict_to_h5(self._root(handle).require_group("timings"), timings)
 

@@ -88,7 +88,7 @@ class NQS:
             is limited by memory access overheads, too large values can lead \
             to "out of memory" issues.
         * ``seed``: Seed for the PRNG to initialize the network parameters.
-        * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``symmetry_projector.SymmetryProjector``). \
+        * ``orbit``: Symmetry projector defining the symmetry operations (instance of ``jVMC_exp.symmetry.SymmetryProjector``). \
             If this argument is given, the wave function is symmetrized to be invariant under symmetry operations.
         * ``symmetry_average``: Built-in symmetry average name or callable passed to ``ProjectedOrbitNet``.
         * ``mixed_precision``: If ``True``, low-precision parameter storage is allowed while public \
@@ -147,7 +147,7 @@ class NQS:
         if orbit is not None:
             if not isinstance(orbit, SymmetryProjector):
                 raise TypeError(
-                    f"Orbit has to be an instance of jVMC_exp.symmetry_projector.SymmetryProjector, "
+                    f"Orbit has to be an instance of jVMC_exp.symmetry.SymmetryProjector, "
                     f"got {orbit}"
                 )
             net = ProjectedOrbitNet(base_net=net, symmetry=orbit, symmetry_average=symmetry_average)
@@ -254,11 +254,12 @@ class NQS:
             Array holding current values of all variational parameters.
         """
         if not self.realParams:
-            return jnp.concatenate([
+            flat = jnp.concatenate([
                 jnp.concatenate([p.ravel().real,p.ravel().imag,]) for p in tree_flatten(self.params)[0]
             ])
+            return flat.astype(global_defs.DT_OUT_REAL)
         
-        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]])
+        return jnp.concatenate([p.ravel() for p in tree_flatten(self.params)[0]]).astype(global_defs.DT_OUT_REAL)
     
     @property
     def frozen_parameters(self):
@@ -438,6 +439,13 @@ class NQS:
     def _gradients_sh(self, s, *, parameters, batch_size):
         return self.flat_gradient_function(self.apply_fun, parameters, s)
     
+    def lazy_gradients(self, s):
+        return self._lazy_gradients_sh(s, parameters=self.grad_parameters, batch_size=self.batchSize)
+    
+    @sharded(automatic_sharding=True, yield_iter=True)
+    def _lazy_gradients_sh(self, s, *, parameters, batch_size):
+        return self.flat_gradient_function(self.apply_fun, parameters, s)
+    
     def gradients_dict(self, s):
         result = self._gradients_dict_sh(s, parameters=self.grad_parameters, batch_size=self.batchSize)
         if self.holomorphic:
@@ -448,21 +456,6 @@ class NQS:
     @sharded(automatic_sharding=True) # TODO: Set flag to False once jax problem is solved
     def _gradients_dict_sh(self, s, *, parameters, batch_size):
         return self.dict_gradient_function(self.apply_fun, parameters, s)
-
-    def grad_dict_to_vec_map(self):
-        PTreeShape = []
-        start = 0
-        P = jnp.arange(2 * self.numParameters)
-        for s in self.paramShapes:
-            # TODO: Here we need to add the treatment for the complex non-holomorphic case
-            if self.holomorphic:
-                PTreeShape.append((P[start:start + 2 * s[0]]))
-                start += 2 * s[0]
-            else:
-                PTreeShape.append(P[start:start + s[0]])
-                start += s[0]
-        
-        return tree_unflatten(self._netTreeDef, PTreeShape)
     
     def sample(self, numSamples, key=None):
         if self.is_generator:

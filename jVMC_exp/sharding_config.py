@@ -1,9 +1,13 @@
 import jax
 import jax.numpy as jnp
+import inspect
 from jax.sharding import Mesh, NamedSharding
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import PartitionSpec as P
-from functools import partial, wraps
+from functools import wraps
+from dataclasses import dataclass
+from typing import Iterator, ParamSpec, TypeVar, Callable
+import math
 
 from jVMC_exp import global_defs
 
@@ -12,11 +16,14 @@ if global_defs.USE_DISTRIBUTED:
         jax.distributed.initialize()
         num_processes = jax.process_count()
         num_devices = jax.device_count()
-        print(f"JAX distributed initialized: {num_processes} processes and {num_devices} devices.")
+        if jax.process_index() == 0:
+            print(f"JAX distributed initialized: {num_processes} processes and {num_devices} devices.")
     except Exception as e:
-        print(f"Failed to initialize JAX distributed: {e}")
+        if jax.process_index() == 0:
+            print(f"Failed to initialize JAX distributed: {e}")
 else:
-    print("Running in single-node mode (JVMC_USE_DISTRIBUTED not set)")
+    if jax.process_index() == 0:
+        print("Running in single-node mode (JVMC_USE_DISTRIBUTED not set)")
 
 global_devices = mesh_utils.create_device_mesh((jax.device_count(),))
 MESH = Mesh(global_devices, axis_names=("devices",))
@@ -24,6 +31,21 @@ DEVICE_SHARDING = NamedSharding(MESH, P("devices"))
 REPLICATED_SHARDING = NamedSharding(MESH, P())
 DEVICE_SPEC = P("devices")
 REPLICATED_SPEC = P()
+
+@dataclass
+class SizedIterable:
+    reusable_iterable: Callable
+    n_iterations: int
+    batch_size: int
+
+    def __len__(self):
+        return self.n_iterations
+
+    def __iter__(self) -> Iterator:
+        return self.reusable_iterable()
+
+P = ParamSpec('P')
+R = TypeVar('R')
 
 def is_on_device(args, target_sharding=DEVICE_SHARDING):
     return any(jax.tree_util.tree_map(lambda x: x.sharding == target_sharding, args))
@@ -119,11 +141,6 @@ def create_batches(configs, b):
 
     return jnp.pad(configs, pads).reshape((-1, b) + configs.shape[1:])
     
-from typing import ParamSpec, TypeVar, Callable
-
-P = ParamSpec('P')
-R = TypeVar('R')
-
 class sharded:
     """Decorator to automatically create sharded versions of methods."""
     def __init__(
@@ -133,7 +150,9 @@ class sharded:
             use_vmap=True, vmap_in_axes=None, # If None, default to (0,) * num_args
             in_specs=None,                    # If None, default to (DEVICE_SPEC,) * num_args
             out_specs=DEVICE_SPEC,
-            automatic_sharding=False
+            automatic_sharding=False,
+            donate_argnums=None,
+            yield_iter=False,
     ):
         self.static_argnums = static_argnums
         self.static_kwarg_names = set(static_kwarg_names + ('batch_size',))
@@ -143,99 +162,139 @@ class sharded:
         self.in_sharding = None
         self.out_specs = out_specs
         self.automatic_sharding = automatic_sharding
-        
+        self.donate_argnums = donate_argnums
+        self.yield_iter = yield_iter
+
     def __call__(self, method: Callable[P, R]) -> Callable[P, R]:
         @wraps(method)
         def wrapper(instance, *args, **kwargs):
-            if not hasattr(instance, '_sharded_cache'):
-                instance._sharded_cache = {}
+            jsh_fn = self._get_jsh(instance, method, args, kwargs)
+            batch_size, kwargs = self._split_batch_size(kwargs)
 
-            method_name = method.__name__
+            num_samples = args[0].shape[0]
+            n_batches = 1 if batch_size is None else math.ceil(num_samples / batch_size)
 
-            if method_name not in instance._sharded_cache:
-                if self.in_specs is None:
-                    self.in_specs = (DEVICE_SPEC,) * len(args)
-                else:
-                    if len(self.in_specs) != len(args):
-                        raise ValueError(f"in_specs length ({len(self.in_specs)}) must match "
-                                         f"number of args ({len(args)})")
-                self.in_sharding = tuple(REPLICATED_SHARDING if REPLICATED_SPEC == s else DEVICE_SHARDING for s in self.in_specs)
-                
-                if self.vmap_in_axes is None:
-                    self.vmap_in_axes = (0,) * len(args)
-                else:
-                    if len(self.vmap_in_axes) != len(args):
-                        raise ValueError(f"vmap_in_axes length ({len(self.vmap_in_axes)}) must match "
-                                         f"number of args ({len(args)})")
-                
-                if kwargs['batch_size'] is not None and kwargs['batch_size'] % MESH.size != 0:
-                    raise ValueError(f"The batch size ({kwargs['batch_size']}) "
-                                     f"has to be divisible by the number of devices ({MESH.size})")
-                
-                static_kwargs = {k: v for k, v in kwargs.items() if k in self.static_kwarg_names}
-                base_fn = lambda kw, *a: method(instance, *a, **kw, **static_kwargs)
-                instance._sharded_cache[method_name] = self._create_sharded_versions(base_fn)
+            reusable_iterable = lambda: self._iter_batches(batch_size, kwargs, *args, jsh_fn=jsh_fn)
+            if self.yield_iter:
+                resolved_batch_size = num_samples if batch_size is None else batch_size
+                return SizedIterable(
+                    reusable_iterable=reusable_iterable, n_iterations=n_batches, batch_size=resolved_batch_size
+                )
 
-            batch_size = kwargs['batch_size']
-            kwargs = {k: v for k, v in kwargs.items() if k not in self.static_kwarg_names}
+            def concat(*xs):
+                if len(xs) == 1:
+                    return xs[0]
+                # NOTE: jnp.concatenate along an already-partitioned axis propagates the
+                # existing per-device sharding for free (no gather/replicate). Using
+                # jnp.array/jnp.stack on a list of sharded arrays instead loses this and
+                # silently replicates everything onto a single device layout.
+                return jnp.concatenate(xs, axis=0)
 
-            return instance._sharded_cache[method_name]['batched'](batch_size, kwargs, *args)
+            return jax.tree_util.tree_map(concat, *list(reusable_iterable()))
+        
         return wrapper
-    
+
+    def _split_batch_size(self, kwargs):
+        batch_size = kwargs['batch_size']
+        kwargs = {k: v for k, v in kwargs.items() if k not in self.static_kwarg_names}
+        
+        return batch_size, kwargs
+
+    def _get_jsh(self, instance, method, args, kwargs):
+        if not hasattr(instance, '_sharded_cache'):
+            instance._sharded_cache = {}
+
+        method_name = method.__name__
+
+        if method_name not in instance._sharded_cache:
+            if self.in_specs is None:
+                self.in_specs = (DEVICE_SPEC,) * len(args)
+            elif len(self.in_specs) != len(args):
+                raise ValueError(f"in_specs length ({len(self.in_specs)}) must match "
+                                 f"number of args ({len(args)})")
+            self.in_sharding = tuple(
+                REPLICATED_SHARDING if REPLICATED_SPEC == s else DEVICE_SHARDING for s in self.in_specs
+            )
+
+            if self.vmap_in_axes is None:
+                self.vmap_in_axes = (0,) * len(args)
+            elif len(self.vmap_in_axes) != len(args):
+                raise ValueError(f"vmap_in_axes length ({len(self.vmap_in_axes)}) must match "
+                                 f"number of args ({len(args)})")
+
+            if kwargs['batch_size'] is not None and kwargs['batch_size'] % MESH.size != 0:
+                raise ValueError(f"The batch size ({kwargs['batch_size']}) "
+                                 f"has to be divisible by the number of devices ({MESH.size})")
+
+            static_kwargs = {k: v for k, v in kwargs.items() if k in self.static_kwarg_names}
+            base_fn = lambda kw, *a: method(instance, *a, **kw, **static_kwargs)
+            instance._sharded_cache[method_name] = self._create_sharded_versions(base_fn)
+
+        return instance._sharded_cache[method_name]['jsh']
+
     def _create_sharded_versions(self, base_fn):
-        """
-        Create all versions of the method.
-        """
-        vmapd_fn = jax.vmap(base_fn, in_axes=(None,) + self.vmap_in_axes) if self.use_vmap else base_fn
+        vmapd_fn = jax.vmap(
+            base_fn, in_axes=(None,) + self.vmap_in_axes
+        ) if self.use_vmap else base_fn
 
         if self.automatic_sharding:
-            jsh_fn = jax.jit(vmapd_fn, static_argnums=self.static_argnums)
+            jsh_fn = jax.jit(
+                vmapd_fn, 
+                static_argnums=self.static_argnums, 
+                donate_argnums=self.donate_argnums
+            )
         else:
             jsh_fn = jax.jit(
                 jax.shard_map(
-                    vmapd_fn, 
-                    mesh=MESH, 
-                    in_specs=(REPLICATED_SPEC,) + self.in_specs, 
+                    vmapd_fn,
+                    mesh=MESH,
+                    in_specs=(REPLICATED_SPEC,) + self.in_specs,
                     out_specs=self.out_specs
                 ),
-                static_argnums=self.static_argnums
+                static_argnums=self.static_argnums,
+                donate_argnums=self.donate_argnums
             )
 
-        batched_fn = partial(self._batched_wrapper, jsh_fn=jsh_fn)
-        
-        return {'single': base_fn, "vmapd": vmapd_fn, 'batched': batched_fn}
+        return {'single': base_fn, 'vmapd': vmapd_fn, 'jsh': jsh_fn}
 
-    def _batched_wrapper(self, batch_size, kwargs, *args, jsh_fn):
-        """Wrapper for batched computation - assumes batch_size is divisible by number of devices."""
+    def _iter_batches(self, batch_size, kwargs, *args, jsh_fn):
+        """
+        Generator yielding one (trimmed) chunk result at a time.
+        Assumes batch_size is divisible by number of devices.
+        """
         num_samples = args[0].shape[0]
-        trim = True
         if batch_size is None:
             batch_size = num_samples
-            trim = False
-        append = (-num_samples) % batch_size
-        total_sumples = num_samples + append
+            args = tuple(jax.device_put(a, self.in_sharding[i]) for i, a in enumerate(args))
 
-        if (total_sumples > batch_size) and is_on_device(args):
+            yield jsh_fn(kwargs, *args)
+            return
+
+        append = (-num_samples) % batch_size
+        total_samples = num_samples + append
+
+        if (total_samples > batch_size) and is_on_device(args):
             args = tuple(jax.device_put(a, REPLICATED_SHARDING) for a in args)
-       
+
         batched_args = tuple(
-            jnp.pad(a, [(0, append),] + [(0, 0)] * (len(a.shape) - 1)).reshape((-1, batch_size) + a.shape[1:]) 
-            for a in args
+            jnp.pad(
+                a, [(0, append),] + [(0, 0)] * (len(a.shape) - 1)
+            ).reshape((-1, batch_size) + a.shape[1:]) for a in args
         )
 
-        results = []
         num_batches = batched_args[0].shape[0]
-        for batch_idx in range(num_batches):
-            batch_args = tuple(
-                jax.device_put(ba[batch_idx], self.in_sharding[arg_idx]) for arg_idx, ba in enumerate(batched_args)
+        for batch_idx in range(num_batches): 
+            result = jsh_fn(
+                kwargs, 
+                *tuple(
+                    jax.device_put(
+                        ba[batch_idx], self.in_sharding[arg_idx]
+                    ) for arg_idx, ba in enumerate(batched_args)
+                )
             )
-            results.append(jsh_fn(kwargs, *batch_args))
 
-        def stack_reshape_trim(*xs):
-            x = jnp.stack(xs)
-            if trim:
-                x = x.reshape((-1,) + x.shape[2:])
-                return x[:num_samples]
-            return x
+            if batch_idx == num_batches - 1 and append:
+                trim = batch_size - append
+                result = jax.tree_util.tree_map(lambda x: x[:trim], result)
 
-        return jax.tree_util.tree_map(stack_reshape_trim, *results)
+            yield result

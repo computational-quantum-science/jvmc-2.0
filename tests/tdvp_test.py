@@ -127,5 +127,40 @@ class TestTimeEvolutionMCSampler(unittest.TestCase):
         )
         self.assertTrue(np.max(np.abs(netZZ - refZZ[:len(netZZ)])) < 2e-2)
 
+class TestTimeEvolutionBatchedJacobian(unittest.TestCase):
+    def test_batched_jacobian_matches_dense(self):
+        L = 4
+        J = -1.0
+        hx = -0.3
+
+        weights = jnp.array(
+            [0.23898957, 0.12614753, 0.19479055, 0.17325271, 0.14619853, 0.21392751,
+             0.19648707, 0.17103704, -0.15457255, 0.10954413, 0.13228065, -0.14935214,
+             -0.09963073, 0.17610707, 0.13386381, -0.14836467]
+        )
+
+        def run(batch_size, batched_jacobian):
+            rbm = nets.CpxRBM(numHidden=2, bias=False)
+            psi = NQS(rbm, L, batch_size, seed=123)
+            psi.parameters = weights
+            exactSampler = sampler.ExactSampler(psi)
+
+            hamiltonian = 0
+            for l in range(L):
+                hamiltonian += J * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) + hx * op.SigmaX(l)
+
+            loss_function = jVMC_exp.objective_function.Observable(hamiltonian, batched_jacobian=batched_jacobian)
+            solver = jVMC_exp.solver.PinvSNR(snr_tol=1, pinv_tol=0.0, pinv_cutoff=1e-8)
+            stepper = jVMC_exp.stepper.Euler(timeStep=1e-3)
+            opt = jVMC_exp.optimizer.TDVP(exactSampler, psi, make_real=False, diagonalShift=0, solver=solver)
+
+            out = opt.time_evolution(5e-3, loss_function, stepper)
+            return np.array(out['energy']['mean'])
+
+        energy_dense = run(batch_size=2 ** L, batched_jacobian=False)
+        energy_lazy = run(batch_size=6, batched_jacobian=True)
+
+        self.assertTrue(np.allclose(energy_dense, energy_lazy, atol=1e-6))
+
 if __name__ == "__main__":
     unittest.main()

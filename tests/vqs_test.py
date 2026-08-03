@@ -152,6 +152,28 @@ class TestGradients(unittest.TestCase):
         ref = jnp.array([-1.1+0.j, -1.1+0.j, -1.1+0.j, -1.1+0.j, -0.-1.j, -0.-1.j, -0.-1.j, -0.-1.j])
         self.assertTrue(jnp.allclose(G.T.ravel(), ref))
 
+    def test_lazy_gradients_matches_gradients(self):
+        """
+        lazy_gradients (batched_jacobian's backend) must reproduce the
+        dense gradients(), batch by batch. batch_size=4 over 10 samples is
+        deliberately uneven ([4, 4, 2]) to hit the padding/trimming logic.
+        """
+        L = 3
+        num_samples = 10
+        batch_size = 4
+
+        rbm = nets.CpxRBM(numHidden=3, bias=True)
+        psi = NQS(rbm, L, batch_size, seed=42)
+
+        key = jax.random.PRNGKey(0)
+        s = jax.random.randint(key, (num_samples, L), 0, 2).astype(global_defs.DT_SAMPLES)
+
+        dense = psi.gradients(s)
+        lazy = jnp.concatenate(list(psi.lazy_gradients(s)), axis=0)
+
+        self.assertEqual(lazy.shape, dense.shape)
+        self.assertTrue(jnp.allclose(lazy, dense))
+
     def test_gradient_dict(self):
         L = 3
         num_samples = 4

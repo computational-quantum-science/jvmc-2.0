@@ -7,14 +7,14 @@ import warnings
 from typing import Callable
 from functools import partial
 
-from jVMC_exp.stats import SampledObs
+from jVMC_exp.stats import LazySampledObs, SampledObs
 from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler import AbstractSampler, ExactSampler
 from jVMC_exp.util import make_cmplx_array, make_real_array, remove_double
 from jVMC_exp.util.output_manager import OutputManager
 from jVMC_exp.stepper import AbstractStepper, Euler
 from jVMC_exp.util import ObservableEntry, measure
-from jVMC_exp.solver.base import AbstractSolver, SolverState
+from jVMC_exp.solver.base import AbstractSolver
 from jVMC_exp.solver.pinv_snr import PinvSNR
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
 
@@ -45,9 +45,14 @@ class AbstractOptimizer(ABC):
     def psi(self):
         return self._psi
     
+    @property
+    @abstractmethod
+    def _needs_grad(self) -> bool:
+        pass
+
     def __call__(
             self, parameters, t, *,
-            numSamples=None, intStep=None, resample=True,
+            numSamples=None, intStep=None,
             objective_function: AbstractObjectiveFunction, **objective_function_kwargs
     ):
         """ 
@@ -66,8 +71,9 @@ class AbstractOptimizer(ABC):
         """
         tmp_parameters = self.psi.parameters
         self.psi.parameters = parameters
-        self._elapsed = 0
-        
+        if intStep is None or intStep == 0:
+            self._elapsed = 0
+
         def stop_timing(name, wait_for=None):
             if wait_for is not None:
                 jax.block_until_ready(wait_for)
@@ -86,8 +92,16 @@ class AbstractOptimizer(ABC):
 
         # Evaluate local observables and their gradient
         self.output_manager.start_timing("compute objective function and gradient")
-        objective_fn_out = objective_function.value_and_grad(self.sampler, t=t, **objective_function_kwargs)
-        self._elapsed += stop_timing("compute objective function and gradient", wait_for=objective_fn_out.grad_log_psi.observations)
+        objective_fn_out = objective_function.value_and_grad(
+            self.sampler,
+            compute_grad=self._needs_grad, 
+            t=t,
+            **objective_function_kwargs
+        )
+        self._elapsed += stop_timing(
+            "compute objective function and gradient", 
+            wait_for=(objective_fn_out.o_loc, objective_fn_out.grad)
+        )
 
         # Obtain the update from the gradients
         self.output_manager.start_timing("solve")
@@ -104,7 +118,7 @@ class AbstractOptimizer(ABC):
 
                 if self.use_cross_valiadation:
                     self.output_manager.start_timing("cross_validation")
-                    self.cross_validation(objective_fn_out)
+                    self.cross_validation(objective_function, t=t, **objective_function_kwargs)
                     self._elapsed += stop_timing("cross_validation")
 
         return update
@@ -129,11 +143,13 @@ class AbstractOptimizer(ABC):
             **kwargs # KWARGS ARE FOR BOTH THE STEPPER AND THE OBJECTIVE FUNCTION, TODO: ADD DOCUMENTATION ON THIS
         ):
         if not hasattr(stepper, "update_dt"):
-            raise ValueError("For ground state search the stepper must " \
-                            f"implement a mehod called 'update_dt'")
+            raise ValueError(
+                "For ground state search the stepper must "
+                "implement a method called 'update_dt'"
+            )
 
-        pbar = tqdm.tqdm(range(steps))
-        for n in pbar: 
+        pbar = tqdm.tqdm(range(steps), disable=jax.process_index() != 0)
+        for n in pbar:
             stepper.update_dt(n)
             self.update_hyperparams(n)
 
@@ -165,7 +181,7 @@ class AbstractOptimizer(ABC):
             **kwargs
         ):
 
-        pbar = tqdm.tqdm(total=t_max)
+        pbar = tqdm.tqdm(total=t_max, disable=jax.process_index() != 0)
         t = 0
         while t < t_max:
             new_parameters, dt = self.step(t, stepper, objective_function, **kwargs) 
@@ -213,7 +229,7 @@ class AbstractOptimizer(ABC):
         self._additional_info = None
 
     @abstractmethod
-    def cross_validation(self, objective_function_output: ObjectiveFunctionOutput):
+    def cross_validation(self, objective_function: AbstractObjectiveFunction, **objective_function_kwargs):
         pass
 
     @abstractmethod
@@ -257,26 +273,40 @@ class Evolution(AbstractOptimizer):
             solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None
         ):
         self.rhsPrefactor = 1 if imag_time else 1j
+        c = - self.rhsPrefactor
+        c_r, c_i = jnp.real(c), jnp.imag(c)
         if psi.holomorphic:
             self._lhs_trans_fn = lambda x: x
+            self._rhs_var_trans_fn = lambda var_re, var_im, cov_re_im: var_re + var_im
+        elif make_real:
+            self._lhs_trans_fn = lambda x: jnp.real(x)
+            self._rhs_var_trans_fn = lambda var_re, var_im, cov_re_im: (
+                c_r ** 2 * var_re + c_i ** 2 * var_im - 2 * c_r * c_i * cov_re_im
+            )
         else:
-            self._lhs_trans_fn = (lambda x: jnp.real(x)) if make_real else (lambda x: 1j * jnp.imag(x))
-        self._rhs_trans_fn = lambda x: self._lhs_trans_fn((- self.rhsPrefactor) * x)
+            self._lhs_trans_fn = lambda x: 1j * jnp.imag(x)
+            self._rhs_var_trans_fn = lambda var_re, var_im, cov_re_im: (
+                c_r ** 2 * var_im + c_i ** 2 * var_re + 2 * c_r * c_i * cov_re_im
+            )
+        self._rhs_trans_fn = lambda x: self._lhs_trans_fn(c * x)
 
         self.diag_scale = diagonalScale
         self.diag_shift = diagonalShift
 
         self._make_cmplx_fn = jax.jit(partial(make_cmplx_array, params_shape=psi.paramShapes))
         self._make_real_fn = jax.jit(partial(make_real_array, params_shape=psi.paramShapes))
-        self._remove_double_trans = jax.vmap(partial(remove_double, params_shape=psi.paramShapes))
+        remove_double_fn = partial(remove_double, params_shape=psi.paramShapes)
+        self._remove_double_trans = jax.vmap(remove_double_fn)
+        self._remove_double_fn = jax.jit(remove_double_fn)
         
-        warnings.warn(
-            "Naming convention changed: "
-            "'diag_shift' now adds a constant term to the diagonal, "
-            "while 'diag_scale' multiplies the diagonal entries. "
-            "This is the opposite of the previous convention.",
-            UserWarning,
-        )
+        if jax.process_index() == 0:
+            warnings.warn(
+                "Naming convention changed: "
+                "'diag_shift' now adds a constant term to the diagonal, "
+                "while 'diag_scale' multiplies the diagonal entries. "
+                "This is the opposite of the previous convention.",
+                UserWarning,
+            )
 
         self._solver = solver
         self._get_lhs = self._get_lhs_dense if solver._needs_dense_matrix else self._get_lhs_lazy
@@ -285,11 +315,10 @@ class Evolution(AbstractOptimizer):
             sampler, psi, resample_stepper, use_cross_valiadation, output_manager=output_manager
         )
 
-        self._solver_state = SolverState(
-            covar_grad_o_loc=lambda: self._covar_grad_o_loc,
-            rhs_trans_fn=self._rhs_trans_fn,
+        self._solver_state = dict(
             exact_sampler=isinstance(self.sampler, ExactSampler),
-            holomorphic=self.psi.holomorphic
+            holomorphic=self.psi.holomorphic,
+            n_samples=sampler.numSamples
         )
 
         self._F0 = None
@@ -320,6 +349,10 @@ class Evolution(AbstractOptimizer):
     def diag_shift(self, value):
         self._diag_shift_fn = value if isinstance(value, Callable) else lambda step: value
         self._diag_shift = self._diag_shift_fn(0)
+    
+    @property
+    def _needs_grad(self):
+        return True
 
     def update_hyperparams(self, step):
         self._diag_shift = self._diag_shift_fn(step)
@@ -327,30 +360,72 @@ class Evolution(AbstractOptimizer):
     
     def get_update(self, objective_function_output: ObjectiveFunctionOutput):
         if self.psi.holomorphic:
-            objective_function_output = objective_function_output.transform(self._remove_double_trans)
-        grad = objective_function_output.grad
-        grad_log_psi = objective_function_output.grad_log_psi
-        self._covar_grad_o_loc = grad
+            objective_function_output.grad_log_psi.transform(self._remove_double_trans)
+            objective_function_output.grad = self._remove_double_fn(
+                objective_function_output.grad
+            )
+            objective_function_output.grad_var_re = self._remove_double_fn(
+                objective_function_output.grad_var_re
+            )
+            objective_function_output.grad_var_im = self._remove_double_fn(
+                objective_function_output.grad_var_im
+            )
+            objective_function_output.grad_cov_re_im = self._remove_double_fn(
+                objective_function_output.grad_cov_re_im
+            )
 
-        S = self._get_lhs(grad_log_psi)
-        F = self._get_rhs(grad)   
-        update, self._additional_info = self.solver(S, F, self.solver_state)
+        A = self._get_lhs(objective_function_output.grad_log_psi)
+        b, b_var = self._get_rhs(
+            objective_function_output.grad,
+            objective_function_output.grad_var_re,
+            objective_function_output.grad_var_im,
+            objective_function_output.grad_cov_re_im,
+        )
+        update, self._additional_info = self.solver(A, b, b_var=b_var, **self.solver_state)
         self.update = self._make_real_fn(update) if self.psi.holomorphic else update
 
         return self.update
     
-    def cross_validation(self, objective_function_output: ObjectiveFunctionOutput):
+    def cross_validation(self, objective_function: AbstractObjectiveFunction, **objective_function_kwargs):
         residual = self.meta_data["residual"]
         tvp_error = self.meta_data["tdvp_error"]
-        objective_fn_out_1 = objective_function_output.get_subset(start=0, step=2)
-        objective_fn_out_2 = objective_function_output.get_subset(start=1, step=2)
+
+        full_samples, full_logPsi, full_weights = (
+            self.sampler.samples, 
+            self.sampler.logPsi, 
+            self.sampler.weights
+        )
+
+        def _value_and_grad_on_subset(start):
+            self.sampler._samples = full_samples[start::2]
+            self.sampler._logPsi = full_logPsi[start::2]
+            w = full_weights[start::2]
+            self.sampler._weights = w / jnp.sum(w)
+
+            return objective_function.value_and_grad(
+                self.sampler, compute_grad=True, **objective_function_kwargs
+            )
+
+        try:
+            objective_fn_out_1 = _value_and_grad_on_subset(0)
+            objective_fn_out_2 = _value_and_grad_on_subset(1)
+        finally:
+            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = (
+                full_samples, 
+                full_logPsi, 
+                full_weights
+            )
 
         update_1 = self.get_update(objective_fn_out_1)
         validation_tdvp_err = self._get_tdvp_error(update_1)
         if self.psi.holomorphic:
             update_1 = self._make_cmplx_fn(update_1)
-            objective_fn_out_2 = objective_fn_out_2.transform(self._remove_double_trans)
-        F2 = self._get_rhs(objective_fn_out_2.grad)
+            objective_fn_out_2.grad_log_psi.transform(self._remove_double_trans)
+            objective_fn_out_2.grad = self._remove_double_fn(objective_fn_out_2.grad)
+        F2, _ = self._get_rhs(
+            objective_fn_out_2.grad, objective_fn_out_2.grad_var_re,
+            objective_fn_out_2.grad_var_im, objective_fn_out_2.grad_cov_re_im,
+        )
         S2 = self._get_lhs(objective_fn_out_2.grad_log_psi)
         Sv = S2(update_1) if callable(S2) else S2.dot(update_1)
         validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / residual
@@ -364,9 +439,11 @@ class Evolution(AbstractOptimizer):
         update = self._make_cmplx_fn(update) if self.psi.holomorphic else update
         Sv = self._S0(update) if callable(self._S0) else self._S0.dot(update)
 
-        return jnp.abs(1. + (jnp.real(update.dot(Sv)) - 2 * jnp.real(update.dot(self._F0))) / (self.o_loc.var + 1e-10))
+        return jnp.abs(
+            1. + (jnp.real(jnp.vdot(update, Sv)) - 2 * jnp.real(jnp.vdot(update, - self.rhsPrefactor  * self._F0))) / (self.o_loc.var + 1e-14)
+        )
     
-    def _get_lhs_dense(self, grad_log_psi: SampledObs):
+    def _get_lhs_dense(self, grad_log_psi: SampledObs | LazySampledObs):
         '''
         Returns left hand side of the TDVP equation
         '''
@@ -380,20 +457,28 @@ class Evolution(AbstractOptimizer):
 
         return S
     
-    def _get_lhs_lazy(self, grad_log_psi: SampledObs):
+    def _get_lhs_lazy(self, grad_log_psi: SampledObs | LazySampledObs):
         '''
         Returns a function that computes the matrix vector product with the left hand side of the TDVP equation
         '''
-        O = grad_log_psi._normalized_obs
-
+        if isinstance(grad_log_psi, LazySampledObs):
+            raise ValueError(
+                f"Solver '{type(self.solver).__name__}' is matrix-free (_needs_dense_matrix=False) "
+                "and builds its matvec directly from the fully materialized Jacobian, but the "
+                "Jacobian was computed in batches (LazySampledObs), which has no such materialized "
+                "array. Either use a solver with _needs_dense_matrix=True (e.g. PinvSNR), or "
+                "compute the Jacobian without batching."
+            )
+        
         def raw_matvec(v):
-            return (O.conj().T @ (O @ v))
+            return (grad_log_psi._normalized_obs.conj().T @ (grad_log_psi._normalized_obs @ v))
+
         self._S0 = raw_matvec
 
         def matvec(v):
             Sv = self._lhs_trans_fn(raw_matvec(v))
             if self.diag_scale > 1e-15:
-                diag = jnp.sum(jnp.abs(O) ** 2, axis=0)
+                diag = jnp.sum(jnp.abs(grad_log_psi._normalized_obs) ** 2, axis=0)
                 Sv = Sv + self.diag_scale * diag * v
             if self.diag_shift > 1e-15:
                 Sv = Sv + self.diag_shift * v
@@ -402,12 +487,15 @@ class Evolution(AbstractOptimizer):
 
         return matvec 
     
-    def _get_rhs(self, grad: SampledObs):
-        self._F0 = - self.rhsPrefactor * grad.mean.ravel()
-        F = self._lhs_trans_fn(self._F0)
-        F.block_until_ready()
+    def _get_rhs(self, grad, grad_var_re, grad_var_im, grad_cov_re_im):
+        self._F0 = grad
+        b = self._rhs_trans_fn(grad)
+        b_var = None
+        if grad_var_re is not None:
+            b_var = self._rhs_var_trans_fn(grad_var_re, grad_var_im, grad_cov_re_im)
+        b.block_until_ready()
 
-        return F
+        return b, b_var
 
     def _update_meta_data(self):
         self.meta_data = dict(

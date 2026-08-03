@@ -7,9 +7,7 @@ import numpy as np
 from jVMC_exp.util.input_manager import InputManager
 from jVMC_exp.util.output_manager import OutputManager
 
-
 class TestOutputManager(unittest.TestCase):
-
     def setUp(self):
         self.h5 = "test_output.h5"
         self.outp = OutputManager()
