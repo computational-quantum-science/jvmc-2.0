@@ -1,4 +1,4 @@
-from .base import AbstractSolver, SolverState
+from .base import AbstractSolver
 from jax.scipy.sparse.linalg import cg
 
 class CG(AbstractSolver):
@@ -14,7 +14,7 @@ class CG(AbstractSolver):
     def maxiter(self):
         return self._maxiter
 
-    def __call__(self, A, b, solver_state: SolverState):
+    def __call__(self, A, b, **kwargs):
         # The current jax implementaiton of cg does not return any info
         x, info = cg(A, b, tol=self.tol, maxiter=self.maxiter) 
 

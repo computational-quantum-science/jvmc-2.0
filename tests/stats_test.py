@@ -2,7 +2,8 @@ import unittest
 import jax
 import jax.numpy as jnp
 
-from jVMC_exp.stats import SampledObs
+from jVMC_exp.stats import SampledObs, LazySampledObs, _reshape_in_batches
+from jVMC_exp.sharding_config import SizedIterable
 
 
 class TestStats(unittest.TestCase):
@@ -130,6 +131,136 @@ class TestStats(unittest.TestCase):
         tau_hi = float(jnp.mean(obs_hi.get_autocorrelation_time(n_chains=4).mean))
 
         self.assertGreater(tau_hi, tau_lo)
+
+def _make_lazy(observations, weights, batch_size):
+    """
+    Build a `LazySampledObs` the same way `sharded(..., yield_iter=True)`
+    would: batches of `batch_size` (last one padded/trimmed), re-iterable
+    from scratch on every pass.
+    """
+    batches = _reshape_in_batches(observations, batch_size)
+    iterable = SizedIterable(
+        reusable_iterable=lambda: iter(batches),
+        n_iterations=len(batches),
+        batch_size=batch_size,
+    )
+    return LazySampledObs(iterable, weights)
+
+class TestLazySampledObs(unittest.TestCase):
+    """
+    `LazySampledObs` is the batched_jacobian backend for SampledObs: it must
+    reproduce SampledObs's numbers exactly, just computed batch-by-batch
+    instead of on one materialized array. batch_size=6 over 20 samples is
+    chosen deliberately so batches are uneven ([6, 6, 6, 2]), which is the
+    case that would break a naive equal-split implementation.
+    """
+    def _make_data(self, seed=0, n=20, n_obs=3):
+        key = jax.random.PRNGKey(seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        obs = jax.random.normal(k1, (n, n_obs)) + 1j * jax.random.normal(k2, (n, n_obs))
+        weights = jax.random.uniform(k3, (n,))
+        weights = weights / jnp.sum(weights)
+        return obs, weights
+
+    def test_mean_matches_sampled_obs(self):
+        obs, weights = self._make_data()
+        dense = SampledObs(obs, weights)
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        self.assertTrue(jnp.allclose(lazy.mean, dense.mean))
+
+    def test_var_matches_sampled_obs(self):
+        obs, weights = self._make_data()
+        dense = SampledObs(obs, weights)
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        self.assertTrue(jnp.allclose(lazy.var, dense.var))
+
+    def test_error_of_mean_matches_sampled_obs(self):
+        obs, weights = self._make_data()
+        dense = SampledObs(obs, weights)
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        self.assertTrue(jnp.allclose(lazy.error_of_mean, dense.error_of_mean))
+
+    def test_get_covar_no_other_matches_sampled_obs(self):
+        obs, weights = self._make_data()
+        dense = SampledObs(obs, weights)
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        self.assertTrue(jnp.allclose(lazy.get_covar(), dense.get_covar(), atol=1e-10))
+
+    def test_get_covar_against_sampled_obs_other(self):
+        obs1, weights = self._make_data(seed=0)
+        obs2, _ = self._make_data(seed=1)
+        dense1 = SampledObs(obs1, weights)
+        dense2 = SampledObs(obs2, weights)
+        lazy1 = _make_lazy(obs1, weights, batch_size=6)
+
+        self.assertTrue(jnp.allclose(lazy1.get_covar(dense2), dense1.get_covar(dense2), atol=1e-10))
+
+    def test_get_covar_against_lazy_sampled_obs_other(self):
+        obs1, weights = self._make_data(seed=0)
+        obs2, _ = self._make_data(seed=1)
+        dense1 = SampledObs(obs1, weights)
+        dense2 = SampledObs(obs2, weights)
+        lazy1 = _make_lazy(obs1, weights, batch_size=6)
+        lazy2 = _make_lazy(obs2, weights, batch_size=6)
+
+        self.assertTrue(jnp.allclose(lazy1.get_covar(lazy2), dense1.get_covar(dense2), atol=1e-10))
+
+    def test_get_covar_and_covar_var_matches_sampled_obs(self):
+        obs, weights = self._make_data()
+        dense = SampledObs(obs, weights)
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        covar_d, var_re_d, var_im_d, cov_re_im_d = dense.get_covar_and_covar_var()
+        covar_l, var_re_l, var_im_l, cov_re_im_l = lazy.get_covar_and_covar_var()
+
+        self.assertTrue(jnp.allclose(covar_l, covar_d, atol=1e-10))
+        self.assertTrue(jnp.allclose(var_re_l, var_re_d, atol=1e-10))
+        self.assertTrue(jnp.allclose(var_im_l, var_im_d, atol=1e-10))
+        self.assertTrue(jnp.allclose(cov_re_im_l, cov_re_im_d, atol=1e-10))
+
+    def test_repeated_iteration_gives_consistent_results(self):
+        """
+        `.mean` and `.get_covar()` each do a full pass over `observations`;
+        since the iterable recomputes from scratch every time it's iterated
+        (that's the whole point of "lazy"), a second pass must reproduce
+        identical numbers instead of silently drifting or erroring out.
+        """
+        obs, weights = self._make_data()
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        mean_first = lazy.mean
+        covar_first = lazy.get_covar()
+        covar_second = lazy.get_covar()
+
+        self.assertTrue(jnp.allclose(mean_first, lazy.mean))
+        self.assertTrue(jnp.allclose(covar_first, covar_second))
+
+    def test_transform_invalidates_cache(self):
+        obs, weights = self._make_data(n_obs=1)
+        lazy = _make_lazy(obs, weights, batch_size=6)
+
+        _ = lazy.mean  # populate the cached_property before transforming
+
+        lazy.transform(lambda x: 2 * x)
+
+        self.assertTrue(jnp.allclose(lazy.mean, 2 * SampledObs(obs, weights).mean))
+
+    def test_batch_weight_mismatch_raises(self):
+        obs, weights = self._make_data(n=20)
+        # `observations` batched with batch_size=6 -> 4 batches ([6,6,6,2]),
+        # but told it has batch_size=4 -> weights would split into 5 batches.
+        batches = _reshape_in_batches(obs, 6)
+        iterable = SizedIterable(
+            reusable_iterable=lambda: iter(batches),
+            n_iterations=len(batches),
+            batch_size=4,
+        )
+        with self.assertRaises(ValueError):
+            LazySampledObs(iterable, weights)
 
 if __name__ == "__main__":
     unittest.main()

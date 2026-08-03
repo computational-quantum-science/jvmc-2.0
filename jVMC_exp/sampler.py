@@ -32,6 +32,7 @@ class AbstractSampler(ABC):
         self._samples = None
         self._logPsi = None
         self._weights = None
+        self.numSamples = None
 
     @property
     def psi(self):
@@ -474,8 +475,7 @@ class AbstractMCSampler(AbstractSampler):
 
         meta, configs = jax.lax.scan(scan_fun, (states, logProb, key, numProposed, numAccepted), None, length=numSamples)
 
-        # Reshape in from (numChains, numSamplesPerChain, sampleShape) to (numChains * numSamplesPerChain, sampleShape)
-        return meta, configs.reshape((configs.shape[0] * configs.shape[1],) + sampleShape), updateProposerArg
+        return meta, jnp.swapaxes(configs, 0, 1).reshape((-1,) + sampleShape), updateProposerArg
 
     def _sweep(
             self, states, logProb, key, numProposed, numAccepted, params, 
@@ -1011,6 +1011,7 @@ class ExactSampler(AbstractSampler):
         self._lDim = lDim
         self._logProbFactor = logProbFactor
         self._lastNorm = 0.
+        self.numSamples = self.num_states
 
         self.get_probabilities = jax.jit(
             jax.shard_map(

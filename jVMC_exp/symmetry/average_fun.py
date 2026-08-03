@@ -4,9 +4,17 @@ from typing import Literal, Callable
 def avg_coefficients_exp(log_amplitudes, weights):
     log_amplitudes = jnp.asarray(log_amplitudes, dtype=jnp.complex128)
     weights = jnp.asarray(weights, dtype=jnp.complex128)
-    shift = jnp.max(jnp.real(log_amplitudes))
+    finite = jnp.isfinite(jnp.real(log_amplitudes))
+    shift = jnp.max(jnp.where(finite, jnp.real(log_amplitudes), -jnp.inf))
+    shift = jnp.where(jnp.any(finite), shift, 0.0)
+    safe_log_amplitudes = jnp.where(finite, log_amplitudes, -jnp.inf + 0.0j)
+    average = jnp.mean(weights * jnp.exp(safe_log_amplitudes - shift))
 
-    return shift + jnp.log(jnp.mean(weights * jnp.exp(log_amplitudes - shift)))
+    return jnp.where(
+        jnp.any(finite),
+        shift + jnp.log(average),
+        jnp.asarray(-jnp.inf + 0.0j, dtype=jnp.complex128),
+    )
 
 def avg_coefficients_log(log_amplitudes, weights):
     del weights
