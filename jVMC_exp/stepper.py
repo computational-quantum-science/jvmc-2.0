@@ -1,6 +1,6 @@
-import jax.numpy as jnp
 from abc import ABC, abstractmethod
 from typing import Callable
+import jax.numpy as jnp
 
 def _get_rk_step(butcher_tableau, t, f, y0, dt, k0=None, start_step=0, **rhs_kwargs):
     '''
@@ -45,6 +45,11 @@ def _get_rk_step(butcher_tableau, t, f, y0, dt, k0=None, start_step=0, **rhs_kwa
 
 def _adaptive_step_control(dy_low, dy_high, tolerance, max_step, norm_function, dt, order):
     update_diff = norm_function(dy_low - dy_high)
+    if not jnp.isfinite(update_diff):
+        raise RuntimeError(
+            f"Adaptive step control got a non-finite error estimate ({update_diff}). "
+            "The right-hand side of the ODE is NaN or inf -- check the solver "
+        )
     fe = tolerance / update_diff
 
     if 0.2 > 0.9 * fe**(1 / (order + 1)):

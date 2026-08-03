@@ -257,5 +257,227 @@ class TestExactSampler(unittest.TestCase):
         s, psi_s, _ = exact_sampler.sample()
         self.assertTrue(jnp.max(jnp.abs((psi(s) - psi_s) / psi_s)) < 1e-14)
 
+
+_CUTOFF_WEIGHTS = jnp.array(
+    [0.23898957, 0.12614753, 0.19479055, 0.17325271, 0.14619853, 0.21392751,
+     0.19648707, 0.17103704, -0.15457255, 0.10954413, 0.13228065, -0.14935214,
+     -0.09963073, 0.17610707, 0.13386381, -0.14836467]
+)
+
+
+def _setup_cutoff_psi(L=4, num_samples=2 ** 16):
+    rbm = nets.CpxRBM(numHidden=2, bias=False)
+    net = _translation_projector(L) * rbm
+    psi = NQS(net, L, num_samples, seed=1234)
+    exact_psi = NQS(net, L, 2 ** L, seed=1234)
+    psi.parameters = _CUTOFF_WEIGHTS
+    exact_psi.parameters = _CUTOFF_WEIGHTS
+
+    return psi, exact_psi
+
+
+def _histogram_from_samples(samples, L, weights=None):
+    """Empirical distribution over the 2**L basis states, optionally reweighted."""
+    counts, _ = np.histogram(
+        np.asarray(state_to_int(samples)), bins=np.arange(0, 2 ** L + 1),
+        weights=None if weights is None else np.asarray(weights)
+    )
+
+    return counts / np.sum(counts)
+
+
+def _normalized(log_p):
+    p = np.exp(log_p - np.max(log_p))
+
+    return p / np.sum(p)
+
+
+def _cutoff_reference(exact_psi, eps, mu, log_prob_factor):
+    """Exact reference distributions for a given cutoff setting.
+
+    Returns the target ``p ~ |psi|^(1/logProbFactor)`` that the reweighted
+    samples must reproduce, the law ``q ~ max(|psi|^mu, eps * max|psi|^mu)``
+    that the Markov chain is supposed to sample, the uncut law
+    ``p_mu ~ |psi|^mu``, and ``mu * max_s Re log psi``.
+    """
+    _, log_psi, p_target = sampler.ExactSampler(exact_psi, logProbFactor=log_prob_factor).sample()
+    log_p_mu = mu * np.real(np.asarray(log_psi))
+    max_log_p_mu = float(np.max(log_p_mu))
+    cutoff = max_log_p_mu + np.log(eps) if eps > 0 else -np.inf
+
+    return np.asarray(p_target), _normalized(np.maximum(log_p_mu, cutoff)), \
+        _normalized(log_p_mu), max_log_p_mu
+
+
+class TestCutoffSampler(unittest.TestCase):
+    """Statistical correctness of the cutoff-based sampler.
+
+    The sampler has two halves that have to be tested separately: the Markov
+    chain must sample the *flattened* law ``q ~ max(|psi|^mu, e^cutoff)``, and
+    the importance ratio returned alongside the samples must turn that back
+    into the target ``|psi|^(1/logProbFactor)``. Checking only the second half
+    is not enough -- an implementation that ignores ``eps`` altogether would
+    pass it.
+    """
+
+    L = 4
+    NUM_SAMPLES = 2 ** 18
+    NUM_CHAINS = 2 ** 16
+
+    def _run_sampling_test(self, eps, tol, mu=2, log_prob_factor=0.5, cutoff_active=True):
+        psi, exact_psi = _setup_cutoff_psi(self.L, self.NUM_SAMPLES)
+        p_target, q_ref, p_mu, max_log_p_mu = _cutoff_reference(
+            exact_psi, eps, mu, log_prob_factor
+        )
+
+        # Guard against a vacuous test. |psi|^2 of this state spans only a factor
+        # of ~5, so e.g. eps=0.1 puts the cutoff *below* the smallest amplitude:
+        # nothing is clipped, q == p_mu, and the test would pass even if the
+        # cutoff and the reweighting were both removed.
+        deformation = np.max(np.abs(q_ref - p_mu))
+        if cutoff_active:
+            self.assertGreater(deformation, 5 * tol)
+        else:
+            self.assertLess(deformation, 1e-12)
+
+        cutoff_sampler = sampler.CutoffSampler(
+            psi, updateProposer=jVMC_exp.propose.SpinFlip(), eps=eps,
+            key=random.PRNGKey(0),
+            numChains=self.NUM_CHAINS, numSamples=self.NUM_SAMPLES,
+            mu=mu, logProbFactor=log_prob_factor,
+            maxLogPsi=max_log_p_mu,  # exact, so the test does not depend on the bootstrap
+        )
+        samples, _, weights = cutoff_sampler.sample()
+
+        self.assertGreaterEqual(samples.shape[0], self.NUM_SAMPLES)
+        self.assertEqual(weights.shape, (samples.shape[0],))
+        self.assertTrue(jnp.all(jnp.isfinite(weights)))
+
+        # 1. the chain samples the flattened law ...
+        self.assertLess(np.max(np.abs(_histogram_from_samples(samples, self.L) - q_ref)), tol)
+        # 2. ... and the importance ratio restores the target
+        self.assertLess(
+            np.max(np.abs(_histogram_from_samples(samples, self.L, weights) - p_target)), tol
+        )
+
+        # The weights must be non-trivial exactly when the cutoff bites.
+        weight_spread = float(jnp.min(weights) / jnp.max(weights))
+        if cutoff_active:
+            self.assertLess(weight_spread, 0.9)
+        elif abs(mu - 1 / log_prob_factor) < 1e-12:
+            # Nothing clipped and the sampled law is already the target.
+            self.assertAlmostEqual(weight_spread, 1.0, places=10)
+
+    def test_cutoff_inactive_for_tiny_eps(self):
+        """eps far below the smallest |psi|^2: must reduce to plain Born sampling."""
+        self._run_sampling_test(eps=1e-12, tol=2e-3, cutoff_active=False)
+
+    def test_cutoff_inactive_for_zero_eps(self):
+        """eps=0 means log(eps) = -inf; the cutoff must switch off without NaNs."""
+        self._run_sampling_test(eps=0.0, tol=2e-3, cutoff_active=False)
+
+    def test_cutoff_active(self):
+        """eps=0.9 clips 14 of the 16 basis states; reweighting must undo it."""
+        self._run_sampling_test(eps=0.9, tol=3e-3, cutoff_active=True)
+
+    def test_cutoff_active_with_mu(self):
+        """Importance sampling (mu < 2) combined with an active cutoff."""
+        self._run_sampling_test(eps=0.9, tol=3e-3, mu=1, cutoff_active=True)
+
+    def test_cutoff_active_with_log_prob_factor(self):
+        """logProbFactor=1 (POVM convention) combined with an active cutoff."""
+        self._run_sampling_test(eps=0.9, tol=3e-3, mu=1, log_prob_factor=1.0, cutoff_active=True)
+
+    def test_eps_one_samples_uniformly(self):
+        """eps=1 puts the cutoff at the maximum: the chain must sample uniformly."""
+        _, exact_psi = _setup_cutoff_psi(self.L, self.NUM_SAMPLES)
+        _, q_ref, _, _ = _cutoff_reference(exact_psi, 1.0, 2, 0.5)
+        self.assertTrue(np.allclose(q_ref, 1 / 2 ** self.L))
+
+        self._run_sampling_test(eps=1.0, tol=3e-3, cutoff_active=True)
+
+class _CustomThermalizationProposer(jVMC_exp.propose.SpinFlip):
+    def __init__(self):
+        super().__init__()
+        self._use_custom_thermalization = True
+
+class TestCutoffSamplerGuards(unittest.TestCase):
+    """The constructor rejects configurations the sampler cannot handle."""
+
+    def _psi(self):
+        return _setup_cutoff_psi(L=4, num_samples=2 ** 6)[0]
+
+    def test_rejects_non_proposer(self):
+        with self.assertRaises(RuntimeError):
+            sampler.CutoffSampler(self._psi(), updateProposer=None, eps=0.1,
+                                  key=random.PRNGKey(0), maxLogPsi=0.0)
+
+    def test_rejects_custom_thermalization_proposer(self):
+        with self.assertRaises(RuntimeError):
+            sampler.CutoffSampler(self._psi(), updateProposer=_CustomThermalizationProposer(),
+                                  eps=0.1, key=random.PRNGKey(0), maxLogPsi=0.0)
+
+    def test_rejects_generator_net(self):
+        psi = NQS(_PeakedGeneratorNet((1, 0, 0, 0)), 4, 2 ** 6, seed=1234)
+        with self.assertRaises(RuntimeError):
+            sampler.CutoffSampler(psi, updateProposer=jVMC_exp.propose.SpinFlip(), eps=0.1,
+                                  key=random.PRNGKey(0), maxLogPsi=0.0)
+
+
+class TestCutoffSamplerProperties(unittest.TestCase):
+    """Light-weight tests of the cutoff bookkeeping that skip the bootstrap."""
+
+    def _make_sampler(self, eps=0.1, maxLogPsi=-2.0):
+        psi, _ = _setup_cutoff_psi(L=4, num_samples=2 ** 8)
+        proposer = jVMC_exp.propose.SpinFlip()
+
+        return sampler.CutoffSampler(
+            psi, updateProposer=proposer, eps=eps,
+            key=random.PRNGKey(0),
+            numChains=2 ** 4, numSamples=2 ** 8,
+            maxLogPsi=maxLogPsi,
+        )
+
+    def test_init_sets_cutoff(self):
+        s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
+        self.assertAlmostEqual(float(s.eps), 0.1)
+        self.assertTrue(jnp.allclose(s.maxLogPsi, jnp.asarray(-2.0)))
+        self.assertTrue(jnp.allclose(s.cutoff, jnp.asarray(-2.0) + jnp.log(0.1)))
+
+    def test_update_eps(self):
+        s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
+        s.eps = 0.5
+        self.assertAlmostEqual(float(s.eps), 0.5)
+        self.assertTrue(jnp.allclose(s.cutoff, jnp.asarray(-2.0) + jnp.log(0.5)))
+
+    def test_update_eps_rejects_out_of_range(self):
+        s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
+        with self.assertRaises(ValueError):
+            s.eps = 2.0
+        with self.assertRaises(ValueError):
+            s.eps = -0.1
+
+    def test_update_maxLogPsi(self):
+        s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
+        s.maxLogPsi = -1.5
+        self.assertTrue(jnp.allclose(s.maxLogPsi, jnp.asarray(-1.5)))
+        self.assertTrue(jnp.allclose(s.cutoff, jnp.asarray(-1.5) + jnp.log(0.1)))
+
+    def test_init_rejects_eps_out_of_range(self):
+        psi, _ = _setup_cutoff_psi(L=4, num_samples=2 ** 8)
+        proposer = jVMC_exp.propose.SpinFlip()
+        for bad_eps in (2.0, -0.1):
+            with self.assertRaises(ValueError):
+                sampler.CutoffSampler(psi, updateProposer=proposer, eps=bad_eps,
+                                      key=random.PRNGKey(0), maxLogPsi=-2.0)
+
+    def test_sampling_updates_max_log_psi(self):
+        """The cutoff tracks mu * max Re log psi of the last batch of samples."""
+        s = self._make_sampler(eps=0.5, maxLogPsi=-2.0)
+        _, coeffs, _ = s.sample()
+        expected = jnp.max(s.mu * jnp.real(coeffs))
+        self.assertTrue(jnp.allclose(s.maxLogPsi, expected))
+        self.assertTrue(jnp.allclose(s.cutoff, expected + jnp.log(0.5)))
+
 if __name__ == "__main__":
     unittest.main()

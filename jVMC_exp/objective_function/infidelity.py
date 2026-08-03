@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import warnings
 
-from jVMC_exp.sampler import AbstractSampler
+from jVMC_exp.sampler.base import AbstractSampler
 from jVMC_exp.operator.discrete.base import AbstractOperator
 from jVMC_exp.operator.discrete.branch_free import IdentityOperator
 from jVMC_exp.stats import SampledObs, LazySampledObs

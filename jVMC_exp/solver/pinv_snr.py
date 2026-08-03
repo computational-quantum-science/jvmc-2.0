@@ -13,7 +13,7 @@ def _eigh_numpy(S):
 def smooth_cutoff_fn(x, c, exp=6):
     return 1 / (1 + (c / x)**exp)
 
-@jax.jit(static_argnums=(2,))
+@jax.jit
 def get_snr(Vtb, Vtb_var, num_samples):
     return jnp.sqrt(jnp.abs(num_samples * (jnp.conj(Vtb) * Vtb) / (Vtb_var + 1e-14))).ravel()
     
@@ -82,11 +82,17 @@ class PinvSNR(AbstractSolver):
 
     def __call__(
             self, A, b, b_var=None, *, 
-            n_samples, exact_sampler, holomorphic, **kwargs
+            effective_num_samples, exact_sampler, holomorphic, **kwargs
         ):
         # Transform equation to eigenbasis and compute Signal to Noise Ratio
         self._transform_to_eigenbasis(A, b)
         b_norm = jnp.linalg.norm(b)
+
+        if jnp.abs(self.last_eigenvalues[-1]) < 1e-14:
+                    raise RuntimeError(
+                        f"Largest eigenvalue of the QGT is {self.last_eigenvalues[-1]}. "
+                        "QGT is most likely highly ill-conditioned/zero "
+                    )
 
         snr = None
         if not exact_sampler:
@@ -94,9 +100,9 @@ class PinvSNR(AbstractSolver):
                 snr = get_snr(
                     self._Vtb, 
                     jnp.dot(jnp.abs(jnp.transpose(jnp.conj(self._V)))**2, b_var),
-                    n_samples
+                    effective_num_samples
                 )
-            elif self.snr_tol != 0:
+            elif self.snr_tol != 0 and jax.process_index() == 0:
                 warnings.warn(
                     f"PinvSNR has snr_tol={self.snr_tol}, but was called with b_var=None, "
                     "so no SNR-based regularization can be applied. "

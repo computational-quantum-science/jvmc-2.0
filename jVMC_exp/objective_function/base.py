@@ -4,7 +4,7 @@ import jax
 
 from jVMC_exp.stats import SampledObs, LazySampledObs
 from jVMC_exp.operator.base import AbstractOperator
-from jVMC_exp.sampler import AbstractSampler
+from jVMC_exp.sampler.base import AbstractSampler
 from jVMC_exp.sharding_config import sharded
 from jVMC_exp.util.grads import pick_gradient
 

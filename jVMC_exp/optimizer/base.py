@@ -9,7 +9,8 @@ from functools import partial
 
 from jVMC_exp.stats import LazySampledObs, SampledObs
 from jVMC_exp.vqs import NQS
-from jVMC_exp.sampler import AbstractSampler, ExactSampler
+from jVMC_exp.sampler.base import AbstractSampler
+from jVMC_exp.sampler import ExactSampler
 from jVMC_exp.util import make_cmplx_array, make_real_array, remove_double
 from jVMC_exp.util.output_manager import OutputManager
 from jVMC_exp.stepper import AbstractStepper, Euler
@@ -317,8 +318,7 @@ class Evolution(AbstractOptimizer):
 
         self._solver_state = dict(
             exact_sampler=isinstance(self.sampler, ExactSampler),
-            holomorphic=self.psi.holomorphic,
-            n_samples=sampler.numSamples
+            holomorphic=self.psi.holomorphic
         )
 
         self._F0 = None
@@ -381,7 +381,11 @@ class Evolution(AbstractOptimizer):
             objective_function_output.grad_var_im,
             objective_function_output.grad_cov_re_im,
         )
-        update, self._additional_info = self.solver(A, b, b_var=b_var, **self.solver_state)
+        update, self._additional_info = self.solver(
+            A, b, b_var=b_var, 
+            effective_num_samples=objective_function_output.o_loc.effective_num_samples,
+            **self.solver_state
+        )
         self.update = self._make_real_fn(update) if self.psi.holomorphic else update
 
         return self.update

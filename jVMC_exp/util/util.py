@@ -11,7 +11,7 @@ from jVMC_exp import global_defs
 import jVMC_exp.nets.activation_functions as act_funs
 
 if TYPE_CHECKING:
-    from jVMC_exp.sampler import AbstractMCSampler
+    from jVMC_exp.sampler.base import AbstractMCSampler
     from jVMC_exp.optimizer import TDVP
 
 OperatorWithKwargs = tuple[Any, dict[str, Any]]
