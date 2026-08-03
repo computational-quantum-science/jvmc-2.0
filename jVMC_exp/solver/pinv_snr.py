@@ -13,7 +13,7 @@ def _eigh_numpy(S):
 def smooth_cutoff_fn(x, c, exp=6):
     return 1 / (1 + (c / x)**exp)
 
-@jax.jit(static_argnums=(2,))
+@jax.jit
 def get_snr(Vtb, Vtb_var, num_samples):
     return jnp.sqrt(jnp.abs(num_samples * (jnp.conj(Vtb) * Vtb) / (Vtb_var + 1e-14))).ravel()
     

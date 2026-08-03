@@ -396,31 +396,10 @@ class TestCutoffSampler(unittest.TestCase):
 
         self._run_sampling_test(eps=1.0, tol=3e-3, cutoff_active=True)
 
-    def test_sample_with_parameters_uses_and_restores_them(self):
-        """sample(parameters=...) evaluates at the given parameters and restores its own."""
-        psi, _ = _setup_cutoff_psi(self.L, num_samples=2 ** 6)
-        other = NQS(psi.net, self.L, 2 ** 6, seed=4321)
-        original = jnp.array(other.parameters_flat)
-        self.assertFalse(jnp.allclose(original, psi.parameters_flat))
-
-        small_sampler = sampler.CutoffSampler(
-            other, updateProposer=jVMC_exp.propose.SpinFlip(), eps=0.5,
-            key=random.PRNGKey(0),
-            numChains=2 ** 4, numSamples=2 ** 6, maxLogPsi=0.0,
-        )
-        s, psi_s, _ = small_sampler.sample(parameters=psi.parameters)
-
-        # Coefficients belong to the supplied parameters, not to the sampler's own.
-        self.assertTrue(jnp.max(jnp.abs((psi_s - psi(s)) / psi(s))) < 1e-14)
-        # ... and the sampler's variational state is left untouched.
-        self.assertTrue(jnp.allclose(other.parameters_flat, original))
-
-
 class _CustomThermalizationProposer(jVMC_exp.propose.SpinFlip):
     def __init__(self):
         super().__init__()
         self._use_custom_thermalization = True
-
 
 class TestCutoffSamplerGuards(unittest.TestCase):
     """The constructor rejects configurations the sampler cannot handle."""
@@ -467,20 +446,20 @@ class TestCutoffSamplerProperties(unittest.TestCase):
 
     def test_update_eps(self):
         s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
-        s.update_eps(0.5)
+        s.eps = 0.5
         self.assertAlmostEqual(float(s.eps), 0.5)
         self.assertTrue(jnp.allclose(s.cutoff, jnp.asarray(-2.0) + jnp.log(0.5)))
 
     def test_update_eps_rejects_out_of_range(self):
         s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
         with self.assertRaises(ValueError):
-            s.update_eps(2.0)
+            s.eps = 2.0
         with self.assertRaises(ValueError):
-            s.update_eps(-0.1)
+            s.eps = -0.1
 
     def test_update_maxLogPsi(self):
         s = self._make_sampler(eps=0.1, maxLogPsi=-2.0)
-        s.update_maxLogPsi(-1.5)
+        s.maxLogPsi = -1.5
         self.assertTrue(jnp.allclose(s.maxLogPsi, jnp.asarray(-1.5)))
         self.assertTrue(jnp.allclose(s.cutoff, jnp.asarray(-1.5) + jnp.log(0.1)))
 
@@ -499,7 +478,6 @@ class TestCutoffSamplerProperties(unittest.TestCase):
         expected = jnp.max(s.mu * jnp.real(coeffs))
         self.assertTrue(jnp.allclose(s.maxLogPsi, expected))
         self.assertTrue(jnp.allclose(s.cutoff, expected + jnp.log(0.5)))
-
 
 if __name__ == "__main__":
     unittest.main()

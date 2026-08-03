@@ -7,7 +7,7 @@ from . import vqs
 from . import sampler
 from . import stats
 from . import geometry
-from . import propose
+from .sampler import propose
 from . import optimizer
 from . import solver
 from . import objective_function

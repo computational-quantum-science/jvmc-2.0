@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from typing import Callable
 
-from jVMC_exp.sampler import AbstractSampler
+from jVMC_exp.sampler.base import AbstractSampler
 from jVMC_exp.stats import SampledObs, LazySampledObs, _normalize, _reshape_in_batches
 from jVMC_exp.vqs import NQS
 from jVMC_exp.optimizer.base import AbstractOptimizer

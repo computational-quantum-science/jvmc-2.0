@@ -9,7 +9,8 @@ from functools import partial
 
 from jVMC_exp.stats import LazySampledObs, SampledObs
 from jVMC_exp.vqs import NQS
-from jVMC_exp.sampler import AbstractSampler, ExactSampler
+from jVMC_exp.sampler.base import AbstractSampler
+from jVMC_exp.sampler import ExactSampler
 from jVMC_exp.util import make_cmplx_array, make_real_array, remove_double
 from jVMC_exp.util.output_manager import OutputManager
 from jVMC_exp.stepper import AbstractStepper, Euler

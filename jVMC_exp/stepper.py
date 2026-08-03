@@ -1,8 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Callable
-
 import jax.numpy as jnp
-
 
 def _get_rk_step(butcher_tableau, t, f, y0, dt, k0=None, start_step=0, **rhs_kwargs):
     '''
