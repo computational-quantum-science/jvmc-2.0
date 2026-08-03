@@ -306,6 +306,66 @@ class NQS:
     def sampleShape(self):
         return self._sampleShape
 
+    def to_array(
+        self,
+        basis,
+        *,
+        normalize=True,
+        log=True,
+    ):
+        """
+        Evaluate the variational state on an ordered computational basis.
+
+        Parameters
+        ----------
+        basis : array_like
+            Ordered basis with shape `(dimension, *sampleShape)`.
+
+        normalize : bool, optional
+            Normalize the returned vector. Default is True.
+
+        log : bool, optional
+            If True, interpret the NQS output as logarithmic
+            amplitudes and exponentiate it. Default is True.
+        """
+        basis = jnp.asarray(basis)
+
+        if basis.ndim < 2 or tuple(basis.shape[1:]) != tuple(self.sampleShape):
+            raise ValueError(
+                f"Expected basis shape (dimension, {self.sampleShape}), got {basis.shape}."
+            )
+
+        if basis.shape[0] == 0:
+            raise ValueError("The basis is empty.")
+
+        values = self(basis).reshape(-1)
+
+        if values.shape[0] != basis.shape[0]:
+            raise RuntimeError(
+                "The number of amplitudes does not match "
+                "the basis dimension."
+            )
+
+        if log:
+            if normalize:
+                values -= jnp.max(jnp.real(values))
+            statevector = jnp.exp(values)
+        else:
+            statevector = values
+
+        if normalize:
+            norm = jnp.linalg.norm(statevector)
+
+            if not bool(jnp.isfinite(norm)) or bool(norm == 0):
+                raise ValueError(
+                    f"Cannot normalize statevector "
+                    f"with norm {norm}."
+                )
+
+            statevector /= norm
+
+        return statevector
+
     @property
     def is_generator(self):
         return self._is_generator
