@@ -61,16 +61,48 @@ def _get_covar_per_sample(centered_data_1, centered_data_2):
     return jnp.outer(jnp.conj(centered_data_1), centered_data_2)
 
 @jax.jit
-@jax.vmap
-def _outer_per_sample(data_1, data_2):
-    return jnp.outer(data_1, data_2)
+def _covar_partial(centered_data_1, centered_data_2, weights):
+    centered_data_1 = centered_data_1.reshape(centered_data_1.shape[0], -1)
+    centered_data_2 = centered_data_2.reshape(centered_data_2.shape[0], -1)
+    w_c1 = _normalize_no_center(centered_data_1, weights)
+    w_c2 = _normalize_no_center(centered_data_2, weights)
+
+    return jnp.tensordot(jnp.conj(w_c1), w_c2, axes=(0, 0))
 
 @jax.jit
-def _get_covar_var_re_im(centered_data_1, centered_data_2, weights):
+def _second_moment_partial(centered_data_1, centered_data_2, weights):
+    centered_data_1 = centered_data_1.reshape(centered_data_1.shape[0], -1)
+    centered_data_2 = centered_data_2.reshape(centered_data_2.shape[0], -1)
+    w_sq1 = _normalize_no_center(jnp.abs(centered_data_1) ** 2, weights)
+    w_sq2 = _normalize_no_center(jnp.abs(centered_data_2) ** 2, weights)
+
+    return jnp.tensordot(w_sq1, w_sq2, axes=(0, 0))
+
+@jax.jit
+def _relation_partial(centered_data_1, centered_data_2, weights):
+    centered_data_1 = centered_data_1.reshape(centered_data_1.shape[0], -1)
+    centered_data_2 = centered_data_2.reshape(centered_data_2.shape[0], -1)
+    w_conj_c1_sq = _normalize_no_center(jnp.conj(centered_data_1) ** 2, weights)
+    w_c2_sq = _normalize_no_center(centered_data_2 ** 2, weights)
+
+    return jnp.tensordot(w_conj_c1_sq, w_c2_sq, axes=(0, 0))
+
+@jax.jit
+def _covar_var_re_im_partial_self(centered_data, weights):
+    centered_data = centered_data.reshape(centered_data.shape[0], -1)
+    w_c = _normalize_no_center(centered_data, weights)
+    w_sq = _normalize_no_center(jnp.abs(centered_data) ** 2, weights)
+    w_conj_sq = _normalize_no_center(jnp.conj(centered_data) ** 2, weights)
+
+    covar = jnp.tensordot(jnp.conj(w_c), w_c, axes=(0, 0))
+    second_moment = jnp.tensordot(w_sq, w_sq, axes=(0, 0))
+    relation = jnp.tensordot(w_conj_sq, w_conj_sq, axes=(0, 0))
+    return covar, second_moment, relation
+
+def _get_covar_var_re_im_partial(centered_data_1, centered_data_2, weights):
     """
-    Variance of the real and imaginary parts of the covariance
-    estimator (plus their cross-covariance), without assuming circular
-    symmetry of the underlying complex noise.
+    Per-batch partial sums for the variance of the real and imaginary
+    parts of the covariance estimator (plus their cross-covariance).
 
     Obtained from the total variance E[|y-Ey|^2] together with
     the pseudo-variance ("relation") E[(y-Ey)^2], where
@@ -79,82 +111,18 @@ def _get_covar_var_re_im(centered_data_1, centered_data_2, weights):
     Re(y)^2-Im(y)^2 + 2i Re(y)Im(y) = y^2, the two moments above are enough
     to solve exactly for Var(Re y), Var(Im y) and Cov(Re y, Im y).
     """
-    covar_per_sample = _get_covar_per_sample(centered_data_1, centered_data_2)
-    covar = jnp.tensordot(weights, covar_per_sample, axes=(0, 0))
-    var_total = jnp.tensordot(weights, jnp.abs(covar_per_sample) ** 2, axes=(0, 0)) - jnp.abs(covar) ** 2
+    if centered_data_1 is centered_data_2:
+        return _covar_var_re_im_partial_self(centered_data_1, weights)
 
-    relation_per_sample = _outer_per_sample(jnp.conj(centered_data_1) ** 2, centered_data_2 ** 2)
-    relation = jnp.tensordot(weights, relation_per_sample, axes=(0, 0)) - covar ** 2
-
-    var_re = (var_total + jnp.real(relation)) / 2
-    var_im = (var_total - jnp.real(relation)) / 2
-    cov_re_im = jnp.imag(relation) / 2
-
-    return var_re.squeeze(), var_im.squeeze(), cov_re_im.squeeze()
+    covar = _covar_partial(centered_data_1, centered_data_2, weights)
+    second_moment = _second_moment_partial(centered_data_1, centered_data_2, weights)
+    relation = _relation_partial(centered_data_1, centered_data_2, weights)
+    return covar, second_moment, relation
 
 @jax.jit
-def _get_covar_var_re_im_moments(data_1, data_2, weights):
-    """
-    Raw (uncentered) moments needed to accumulate, across batches, both the
-    total variance of the covariance estimator and its pseudo-variance, 
-    from which the exact (no isotropy assumption) variance.
-    """
-    data_1 = data_1.reshape(data_1.shape[0], -1)
-    data_2 = data_2.reshape(data_2.shape[0], -1)
-    sq_1 = jnp.abs(data_1) ** 2
-    sq_2 = jnp.abs(data_2) ** 2
-    conj_1_sq = jnp.conj(data_1) ** 2
-    data_2_sq = data_2 ** 2
-
-    mean_1 = jnp.tensordot(weights, data_1, axes=(0, 0))
-    mean_2 = jnp.tensordot(weights, data_2, axes=(0, 0))
-    var_1 = jnp.tensordot(weights, sq_1, axes=(0, 0))
-    var_2 = jnp.tensordot(weights, sq_2, axes=(0, 0))
-
-    m_11 = jnp.tensordot(weights, _get_covar_per_sample(data_1, data_2), axes=(0, 0))
-    m_20 = jnp.tensordot(weights, _outer_per_sample(data_1, data_2), axes=(0, 0))
-    m_sq1 = jnp.tensordot(weights, _outer_per_sample(sq_1, data_2), axes=(0, 0))
-    m_sq2 = jnp.tensordot(weights, _outer_per_sample(data_1, sq_2), axes=(0, 0))
-    m_sqsq = jnp.tensordot(weights, _outer_per_sample(sq_1, sq_2), axes=(0, 0))
-
-    q_1 = jnp.tensordot(weights, conj_1_sq, axes=(0, 0))
-    q_2 = jnp.tensordot(weights, data_2_sq, axes=(0, 0))
-    m_21 = jnp.tensordot(weights, _outer_per_sample(conj_1_sq, data_2), axes=(0, 0))
-    m_12 = jnp.tensordot(weights, _outer_per_sample(jnp.conj(data_1), data_2_sq), axes=(0, 0))
-    m_22 = jnp.tensordot(weights, _outer_per_sample(conj_1_sq, data_2_sq), axes=(0, 0))
-
-    return mean_1, mean_2, var_1, var_2, m_11, m_20, m_sq1, m_sq2, m_sqsq, q_1, q_2, m_21, m_12, m_22
-
-@jax.jit
-def _finalize_covar_var_re_im(
-    mean_1, mean_2, var_1, var_2, m_11, m_20, m_sq1, m_sq2, m_sqsq, q_1, q_2, m_21, m_12, m_22
-):
-    covar = m_11 - jnp.outer(jnp.conj(mean_1), mean_2)
-
-    second_moment = (
-        m_sqsq
-        - 2 * jnp.real(jnp.conj(mean_2)[None, :] * m_sq1)
-        - 2 * jnp.real(jnp.conj(mean_1)[:, None] * m_sq2)
-        + 2 * jnp.real(jnp.outer(jnp.conj(mean_1), jnp.conj(mean_2)) * m_20)
-        + 2 * jnp.real(jnp.outer(mean_1, jnp.conj(mean_2)) * m_11)
-        + jnp.outer(var_1, jnp.abs(mean_2) ** 2)
-        + jnp.outer(jnp.abs(mean_1) ** 2, var_2)
-        - 3 * jnp.outer(jnp.abs(mean_1) ** 2, jnp.abs(mean_2) ** 2)
-    )
+def _finalize_covar_var_re_im(covar, second_moment, relation):
     var_total = second_moment - jnp.abs(covar) ** 2
-
-    A = jnp.conj(mean_1)
-    B = mean_2
-    relation = (
-        m_22
-        - 2 * B[None, :] * m_21
-        - 2 * A[:, None] * m_12
-        + 4 * jnp.outer(A, B) * m_11
-        + jnp.outer(q_1, B ** 2)
-        + jnp.outer(A ** 2, q_2)
-        - 3 * jnp.outer(A ** 2, B ** 2)
-        - covar ** 2
-    )
+    relation = relation - covar ** 2
 
     var_re = (var_total + jnp.real(relation)) / 2
     var_im = (var_total - jnp.real(relation)) / 2
@@ -162,13 +130,14 @@ def _finalize_covar_var_re_im(
 
     return covar.squeeze(), var_re.squeeze(), var_im.squeeze(), cov_re_im.squeeze()
 
+def _get_covar_var_re_im(centered_data_1, centered_data_2, weights):
+    covar, second_moment, relation = _get_covar_var_re_im_partial(centered_data_1, centered_data_2, weights)
+    _, var_re, var_im, cov_re_im = _finalize_covar_var_re_im(covar, second_moment, relation)
+    return var_re, var_im, cov_re_im
+
 @jax.jit(static_argnums=(1,))
 def _apply_and_project(data, apply_fn, projection):
     return jnp.matmul(projection, apply_fn(data)) 
-
-@jax.jit
-def _get_tangent_kernel(norm_data):
-    return jnp.matmul(norm_data, jnp.conj(jnp.transpose(norm_data)))
 
 @jax.jit(static_argnums=(1, 2))
 @partial(jax.vmap, in_axes=(0, None, None))
@@ -271,10 +240,6 @@ class SampledObs():
     @property
     def error_of_mean(self):
         return _get_error_of_mean(self.var, self.weights)
-    
-    @property
-    def tangent_kernel(self):
-        return _get_tangent_kernel(self._normalized_obs)
 
     def get_covar(self, other: SampledObs | None = None):
         """
@@ -284,8 +249,9 @@ class SampledObs():
             * ``other`` [optional]: Another instance of `SampledObs`.
         """
         if other is None:
-            other = self
-        
+            normalized = self._normalized_obs
+            return _get_covar(normalized, normalized)
+
         return _get_covar(self._normalized_obs, other._normalized_obs)
     
     def get_covar_var(self, other: SampledObs | None = None):
@@ -300,7 +266,8 @@ class SampledObs():
             Tuple ``(var_re, var_im, cov_re_im)``.
         """
         if other is None:
-            other = self
+            centered = self._centered_obs
+            return _get_covar_var_re_im(centered, centered, self.weights)
 
         return _get_covar_var_re_im(self._centered_obs, other._centered_obs, self.weights)
 
@@ -311,10 +278,13 @@ class SampledObs():
         Args:
             * ``other`` [optional]: Another instance of `SampledObs`.
         """
+        other_num_obs = self._num_obs if other is None else other._num_obs
         if other is None:
-            other = self
-        covar_per_sample = _get_covar_per_sample(self._centered_obs, other._centered_obs)
-        if other._num_obs == 1:
+            centered = self._centered_obs
+            covar_per_sample = _get_covar_per_sample(centered, centered)
+        else:
+            covar_per_sample = _get_covar_per_sample(self._centered_obs, other._centered_obs)
+        if other_num_obs == 1:
             covar_per_sample = covar_per_sample[..., 0]
 
         return SampledObs(covar_per_sample, self.weights)
@@ -323,14 +293,14 @@ class SampledObs():
         """
         Returns the covariance and the variance of its real and
         imaginary parts (and their cross-covariance).
-
-        Returns:
-            Tuple ``(covar, var_re, var_im, cov_re_im)``.
         """
-        covar = self.get_covar(other)
-        var_re, var_im, cov_re_im = self.get_covar_var(other)
+        if other is None:
+            centered = self._centered_obs
+            partial = _get_covar_var_re_im_partial(centered, centered, self.weights)
+        else:
+            partial = _get_covar_var_re_im_partial(self._centered_obs, other._centered_obs, self.weights)
 
-        return covar, var_re, var_im, cov_re_im
+        return _finalize_covar_var_re_im(*partial)
     
     def get_R_hat(self, n_chains):
         """
@@ -536,50 +506,54 @@ class LazySampledObs():
         Returns the covariance and the variance of its real and
         imaginary parts (and their cross-covariance).
 
-        Both quantities are accumulated together over a single pass through
-        the underlying iterable(s), so this should be preferred over calling
-        `get_covar` and `get_covar_var` separately.
-
         Args:
             * ``other`` [optional]: Another instance of `SampledObs` or `LazySampledObs`.
 
         Returns:
             Tuple ``(covar, var_re, var_im, cov_re_im)``.
         """
-        def _accumulate(moments, batch_1, batch_2, weights):
-            batch_moments = _get_covar_var_re_im_moments(batch_1, batch_2, weights)
-            if moments is None:
-                return batch_moments
-            return tuple(m + b for m, b in zip(moments, batch_moments))
-
-        moments = None
+        mean = self.mean
 
         if other is None:
-            for batch, weights in zip(self._observations, self._weights):
-                moments = _accumulate(moments, batch, batch, weights)
-
-        elif isinstance(other, SampledObs):
-            other_batches = _reshape_in_batches(other.observations, self._batch_size)
-
-            for batch, weights, batch_other in zip(self._observations, self._weights, other_batches):
-                moments = _accumulate(moments, batch, batch_other, weights)
-
-        elif isinstance(other, LazySampledObs):
-            for batch_1, weights_1, batch_2 in zip(self._observations, self._weights, other._observations):
-                moments = _accumulate(moments, batch_1, batch_2, weights_1)
-
+            other_mean = mean
+        elif isinstance(other, (SampledObs, LazySampledObs)):
+            other_mean = other.mean
         else:
             raise NotImplementedError(
                 "Can only compute the variance with a SampledObs or a LazySampledObs, "
                 f"got {other}"
             )
 
-        return _finalize_covar_var_re_im(*moments)
+        def _accumulate(partial, batch_1, batch_2, weights, self_covar):
+            centered_1 = _center(batch_1, mean)
+            centered_2 = centered_1 if self_covar else _center(batch_2, other_mean)
+            batch_partial = _get_covar_var_re_im_partial(centered_1, centered_2, weights)
+            if partial is None:
+                return batch_partial
+            return tuple(p + b for p, b in zip(partial, batch_partial))
+
+        partial = None
+
+        if other is None:
+            for batch, weights in zip(self._observations, self._weights):
+                partial = _accumulate(partial, batch, batch, weights, self_covar=True)
+
+        elif isinstance(other, SampledObs):
+            other_batches = _reshape_in_batches(other.observations, self._batch_size)
+
+            for batch, weights, batch_other in zip(self._observations, self._weights, other_batches):
+                partial = _accumulate(partial, batch, batch_other, weights, self_covar=False)
+
+        else:
+            for batch_1, weights_1, batch_2 in zip(self._observations, self._weights, other._observations):
+                partial = _accumulate(partial, batch_1, batch_2, weights_1, self_covar=False)
+
+        return _finalize_covar_var_re_im(*partial)
 
     def transform(self, element_wise_fn=lambda x: x, linear_map=None) -> LazySampledObs:
         if linear_map is not None:
             raise NotImplementedError(
-                "A linear map can't be applied withoud materializing all the observables"
+                "A linear map can't be applied without materializing all the observables"
             )
         
         jitted_fn = jax.jit(element_wise_fn)
