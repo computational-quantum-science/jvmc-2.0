@@ -319,30 +319,35 @@ class AbstractMCSampler(AbstractSampler):
     
     def _distribute_sampling(self):
         """
-        Distribute MCMC sampling tasks across sharded devices.
-
-        This method ensures that the number of chains and samples per chain are 
-        compatible with the device mesh used for JAX sharding. It adjusts chain 
-        and sample counts as needed to maintain uniform distribution across devices.
+        Adjust sample (and, for MCMC sampling, chain) counts to be compatible
+        with the device mesh used for JAX sharding.
 
         Device constraints:
-            - The number of chains must be >= total_devices
-            - The number of chains must be divisible by total_devices
-            - Each chain generates the same number of samples
+            - For direct/generator sampling: numSamples must be divisible by total_devices
+            - For MCMC sampling:
+                - The number of chains must be >= total_devices
+                - The number of chains must be divisible by total_devices
+                - Each chain generates the same number of samples
 
         The method performs the following adjustments:
-            1. If numChains < total_devices: increases numChains to total_devices
-            2. If numChains is not divisible by total_devices: rounds up to the 
-               next multiple of total_devices
-            3. Rounds up samples per chain using ceiling division to ensure 
-               at least numSamples total samples are generated
+            1. Generator sampling: rounds numSamples up to the next multiple of
+               total_devices (numChains is unused in this case).
+            2. MCMC sampling:
+                a. If numChains < total_devices: increases numChains to total_devices
+                b. If numChains is not divisible by total_devices: rounds up to the
+                   next multiple of total_devices
+                c. Rounds up samples per chain using ceiling division to ensure
+                   at least numSamples total samples are generated
         """
-        self._numChains = distribute(self.numChains, 'chains')
-        
-        # Use ceiling division to ensure at least numSamples total samples
-        self._samplePerChain = (self.numSamples + self.numChains - 1) // self.numChains
-        totalSamples = self._samplePerChain * self.numChains
-        
+        if self.psi.is_generator:
+            totalSamples = distribute(self.numSamples, 'samples')
+        else:
+            self._numChains = distribute(self.numChains, 'chains')
+
+            # Use ceiling division to ensure at least numSamples total samples
+            self._samplePerChain = (self.numSamples + self.numChains - 1) // self.numChains
+            totalSamples = self._samplePerChain * self.numChains
+
         if totalSamples > self.numSamples:
             print(f"INFO: Total samples adjusted: {self.numSamples} -> {totalSamples}")
         self.numSamples = totalSamples
@@ -374,8 +379,10 @@ class AbstractMCSampler(AbstractSampler):
         """
 
         if numSamples is not None:
-            samples_tmp = self.numSamples 
+            samples_tmp = self.numSamples
             self.numSamples = numSamples
+
+        self._distribute_sampling()
 
         if self.psi.is_generator:
             configs, logPsi, p = self._get_samples_gen()
@@ -398,7 +405,6 @@ class AbstractMCSampler(AbstractSampler):
         return samples, self.psi(samples), jnp.ones(self.numSamples) / self.numSamples
 
     def _get_samples_mcmc(self):
-        self._distribute_sampling()
         if not self._is_state_initialized:
             self._init_state()
         self.updateProposer.update_arg(self.psi)

@@ -195,7 +195,6 @@ class CutoffSampler(MCSampler):
         return jnp.max(self.mu * jnp.real(coeffs))
 
     def _get_samples_mcmc(self):
-        self._distribute_sampling()
         if not self._is_state_initialized:
             self._init_state()
         self.updateProposer.update_arg(self.psi)

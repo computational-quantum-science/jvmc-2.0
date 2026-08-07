@@ -5,7 +5,6 @@ import jax.numpy as jnp
 from jVMC_exp.stats import SampledObs, LazySampledObs, _reshape_in_batches
 from jVMC_exp.sharding_config import SizedIterable
 
-
 class TestStats(unittest.TestCase):
         
     def test_subset_function(self):
@@ -30,6 +29,76 @@ class TestStats(unittest.TestCase):
         obs3 = SampledObs(Obs1[0:N//2, :], p[0:N//2] / jnp.sum(p[0:N//2]))
 
         self.assertTrue(jnp.allclose(obs3.get_covar(), obs2.get_covar()))
+
+    def test_transform_updates_mean(self):
+        N = 20
+        key = jax.random.PRNGKey(0)
+        data = jax.random.normal(key, shape=(N, 1))
+        obs = SampledObs(data)
+
+        obs.transform(lambda x: 2 * x)
+
+        expected = SampledObs(2 * data)
+        self.assertTrue(jnp.allclose(obs.mean, expected.mean))
+        self.assertTrue(jnp.allclose(obs.var, expected.var))
+
+    def test_state_roundtrip_recovers_observations(self):
+        """
+        `SampledObs` keeps a single buffer internally and destructively
+        converts it between "observations" (o), "centered" (c) and
+        "normalized" (n) representations on access. Cycling through every
+        transition (o->c, c->n, n->o, o->n, n->c, c->o) must reproduce the
+        exact formula at each step and lose no information: the buffer
+        must be back to the original input once the cycle returns to "o".
+        """
+        N = 12
+        k1, k2, k3 = jax.random.split(jax.random.PRNGKey(7), 3)
+        data = jax.random.normal(k1, (N, 3)) + 1j * jax.random.normal(k2, (N, 3))
+        weights = jax.random.uniform(k3, (N,))
+        weights = weights / jnp.sum(weights)
+
+        obs = SampledObs(data, weights)
+
+        mean_ref = jnp.tensordot(weights, data, axes=(0, 0))
+        centered_ref = data - mean_ref
+        normalized_ref = jnp.einsum("i,i...->i...", jnp.sqrt(weights), centered_ref)
+
+        self.assertTrue(jnp.allclose(obs._centered_obs, centered_ref))      # o -> c
+        self.assertTrue(jnp.allclose(obs._normalized_obs, normalized_ref))  # c -> n
+        self.assertTrue(jnp.allclose(obs.observations, data))               # n -> o
+        self.assertTrue(jnp.allclose(obs._normalized_obs, normalized_ref))  # o -> n
+        self.assertTrue(jnp.allclose(obs._centered_obs, centered_ref))      # n -> c
+        self.assertTrue(jnp.allclose(obs.observations, data))               # c -> o
+
+    def test_state_roundtrip_zero_weight_rows(self):
+        """
+        A row with weight exactly 0 (e.g. a padded row, or a genuinely
+        zero-weighted sample from a CutoffSampler) is destroyed the moment
+        it passes through the normalized state (multiplied by sqrt(0));
+        by convention it is then reconstructed as exactly 0 in every
+        representation, rather than leaking a stale placeholder like
+        `mean`. Rows with non-zero weight must still round-trip exactly.
+        """
+        N = 8
+        key = jax.random.PRNGKey(3)
+        data = jax.random.normal(key, (N, 2))
+        weights = jnp.ones(N).at[2].set(0.0).at[5].set(0.0)
+        weights = weights / jnp.sum(weights)
+        zero_rows = jnp.array([2, 5])
+        nonzero_rows = jnp.array([i for i in range(N) if i not in (2, 5)])
+
+        obs = SampledObs(data, weights)
+        mean_ref = jnp.tensordot(weights, data, axes=(0, 0))
+
+        _ = obs._normalized_obs      # o -> n: zero-weight rows collapse to 0 here
+        raw = obs.observations       # n -> o
+        centered = obs._centered_obs  # o -> c
+
+        self.assertTrue(jnp.allclose(raw[nonzero_rows], data[nonzero_rows]))
+        self.assertTrue(jnp.allclose(raw[zero_rows], 0.0))
+
+        self.assertTrue(jnp.allclose(centered[nonzero_rows], data[nonzero_rows] - mean_ref))
+        self.assertTrue(jnp.allclose(centered[zero_rows], 0.0))
 
     def _make_converged_obs(self, n_chains, chain_length, seed=0):
         """Independent draws from the same Gaussian — should give R-hat ≈ 1."""

@@ -1,13 +1,14 @@
 import jax
 import jax.numpy as jnp
-from typing import Callable
+from typing import Callable, Literal
 
 from jVMC_exp.sampler.base import AbstractSampler
-from jVMC_exp.stats import SampledObs, LazySampledObs, _normalize, _reshape_in_batches
+from jVMC_exp.stats import SampledObs, _reshape_in_batches
 from jVMC_exp.vqs import NQS
 from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput, AbstractObjectiveFunction
-from jVMC_exp.sharding_config import DEVICE_SPEC, REPLICATED_SPEC, MESH, sharded
+from jVMC_exp.solver.util import pinvert
+from jVMC_exp.sharding_config import sharded, MESH
 
 @jax.jit
 def _concat_nonholo(arr):
@@ -15,6 +16,14 @@ def _concat_nonholo(arr):
     Returns a real array correctly sharded on the first dimension
     """
     return jnp.concatenate([jnp.real(arr), jnp.imag(arr)], axis=0)
+
+@jax.jit(static_argnums=(3,))
+def _normalize_batch(batch, weights, mean, concat):
+    batch = jnp.einsum("i, i... -> i...", jnp.sqrt(weights), batch - mean)
+    if concat:
+        batch = jnp.concatenate([jnp.real(batch), jnp.imag(batch)], axis=0)
+
+    return batch
 
 class MinSR(AbstractOptimizer):
     """
@@ -24,22 +33,33 @@ class MinSR(AbstractOptimizer):
 
     Initializer arguments:
         * ``sampler``: A sampler object.
-        * ``pinv_tol``: Regularization parameter :math:`\\epsilon_{SVD}`, see above.
-        * ``diagonalSchift``: Regularization parameter :math:`\\lambda`, see below.
-        * ``diagonalizeOnDevice``: Choose whether to diagonalize :math:`S` on GPU or CPU.
+        * ``psi``: The variational wave function (``NQS`` instance) being optimized.
+        * ``pinv_tol``: Regularization parameter :math:`\\epsilon_{SVD}`, the relative cutoff used \
+        when pseudo-inverting the tangent kernel, see above.
+        * ``diagonalShift``: Regularization parameter :math:`\\lambda`, the diagonal shift added \
+        to the tangent kernel before inversion, see above. May be a constant or a callable \
+        ``step -> value``, updated at each step via ``update_hyperparams``.
+        * ``pinv_mode``: Backend used to pseudo-invert the tangent kernel, forwarded to \
+        :func:`jVMC_exp.solver.util.pinvert`. ``"device"`` runs ``jax.numpy.linalg.pinv`` \
+        locally; ``"distributed"`` uses a distributed eigendecomposition via ``jaxmg``. \
+        * ``T_A``: Tile size forwarded to :func:`jVMC_exp.solver.util.pinvert` when \
+        ``pinv_mode="distributed"``. If ``None``, a default is derived automatically.
+        * ``resample_stepper``: Whether the sampler resamples at every stepper substep.
     """
     def __init__(
             self, sampler: AbstractSampler, psi: NQS,
-            pinv_tol=1e-14, diagonalShift=1e-3,
+            pinv_tol=1e-14, diagonalShift=1e-3, *,
+            pinv_mode: Literal["device", "distributed"] = "device", T_A: int | None = None,
             resample_stepper=True,
         ):
         self.pinv_tol = pinv_tol
         self.diag_shift = diagonalShift
+        self._pinv_mode = pinv_mode
+        self._T_A = T_A
 
-        num_params = psi.numParameters * (2 if not psi.realParams else 1)
-        num_devices = MESH.shape["devices"]
-        self._params_pad_size = int((num_devices - num_params % num_devices) % num_devices)
         self._concat = (not psi.holomorphic) and (not psi.realParams)
+        num_params = psi.numParameters * (2 if not psi.realParams else 1)
+        self._params_pad_size = (- num_params) % MESH.shape["devices"]
 
         super().__init__(sampler, psi, resample_stepper, use_cross_valiadation=False)
 
@@ -61,92 +81,122 @@ class MinSR(AbstractOptimizer):
 
     def get_update(self, objective_function_output: ObjectiveFunctionOutput):
         """
-        Uses the technique proposed in arXiv:2302.01941 to compute the updates.
-        Efficient only if number of samples :math:`\\ll` number of parameters.
+        Dispatches on the type of ``objective_function_output.grad_log_psi``: a dense
+        ``SampledObs`` is turned into a single tangent kernel via ``_get_tangent_kernel``, while a
+        ``LazySampledObs`` (``batched_jacobian=True``) is processed batch pair by batch pair so
+        that the full Jacobian is never materialized densely.
         """
-        grad_log_psi = objective_function_output.grad_log_psi
-        o_loc = objective_function_output.o_loc._normalized_obs.reshape(-1)
+        o_loc = objective_function_output.o_loc._normalized_obs.flatten()
+        if self._params_pad_size != 0:
+            objective_function_output.grad_log_psi.transform(
+                lambda x: jnp.pad(x, ((0, 0), (0, self._params_pad_size)), mode="constant")
+            )
 
-        if isinstance(grad_log_psi, LazySampledObs):
-            return self._solve_lazy(grad_log_psi, o_loc)
-        
-        gradients = grad_log_psi._get_normalized_obs_and_consume()
-        if self._concat:
-            gradients = _concat_nonholo(gradients)
-            o_loc = _concat_nonholo(o_loc)
-        update = self._solve(
-            gradients, o_loc,
-            diag_shift=self.diag_shift, pinv_tol=self.pinv_tol, batch_size=None
-        ).flatten()
+        if isinstance(objective_function_output.grad_log_psi, SampledObs):
+            grad = objective_function_output.grad_log_psi._normalized_obs 
+            if self._concat:
+                grad = _concat_nonholo(grad)
+                o_loc = _concat_nonholo(o_loc)
 
-        update = update[:-self._params_pad_size] if self._params_pad_size > 0 else update
+            T = self._get_tangent_kernel(grad)
 
-        return jnp.array(jax.experimental.multihost_utils.process_allgather(update, tiled=True))
+        else:
+            grad = objective_function_output.grad_log_psi
+            T = []
+            o_loc_batch = []
+            start = 0
+            for batch_l, weights_l in zip(grad.observations, grad._weights):
+                batch_l = _normalize_batch(batch_l, weights_l, grad.mean, self._concat)
+    
+                if self._concat:
+                    size = weights_l.shape[0]
+                    o_loc_batch.append(_concat_nonholo(o_loc[start:start + size]))
+                    start += size
+    
+                T_batch = []
+                for batch_r, weights_r in zip(grad.observations, grad._weights):
+                    batch_r = _normalize_batch(batch_r, weights_r, grad.mean, self._concat)
+                    T_batch.append(self._get_tangent_kernel(batch_l, batch_r))
+
+                T.append(jnp.concatenate(T_batch, axis=1))
+    
+            T = jnp.concatenate(T)
+            o_loc = jnp.concatenate(o_loc_batch) if self._concat else o_loc
+
+        if self.diag_shift > 1e-15:
+            idx = jnp.arange(T.shape[0])
+            T = T.at[idx, idx].add(self.diag_shift)
+
+        T = pinvert(T, self.pinv_tol, mode=self._pinv_mode, T_A=self._T_A)
+        T = T @ o_loc
+
+        if isinstance(objective_function_output.grad_log_psi, SampledObs):
+            update = - jnp.conj(jnp.transpose(grad)) @ T
+        else:
+            T = _reshape_in_batches(
+                T,
+                grad._batch_size if self.psi.holomorphic else 2 * grad._batch_size
+            )
+    
+            update = 0
+            for grad_batch, weights, T_batch in zip(grad.observations, grad._weights, T):
+                grad_batch = _normalize_batch(grad_batch, weights, grad.mean, self._concat)
+                update -= jnp.conj(jnp.transpose(grad_batch)) @ T_batch
+
+        if self._params_pad_size != 0:
+            objective_function_output.grad_log_psi.transform(
+                lambda x: x[:, :-self._params_pad_size]
+            )
+            update = update[:-self._params_pad_size]
+    
+        return update
 
     def cross_validation(self, objective_function: AbstractObjectiveFunction, **objective_function_kwargs):
         raise NotImplementedError
-
+    
     def _update_meta_data(self):
         pass
 
-    @sharded(use_vmap=False, in_specs=(DEVICE_SPEC, REPLICATED_SPEC))
-    def _solve(self, gradients, o_loc, *, diag_shift, pinv_tol, batch_size):
-        gradients = jnp.concatenate([
-            gradients,
-            jnp.zeros((gradients.shape[0], self._params_pad_size), dtype=gradients.dtype)], axis=1
-        )
-        gradients = jax.lax.all_to_all(gradients, 'devices', split_axis=1, concat_axis=0, tiled=True)
-        y = gradients @ jnp.conj(jnp.transpose(gradients))          # (Ns, Ns)
-        y = jax.lax.psum(y, 'devices')
-        y = y + diag_shift * jnp.eye(y.shape[-1], dtype=y.dtype)
+    def _get_tangent_kernel(self, grad_l, grad_r=None):
+        """
+        Dispatches to the single- or two-operand tangent kernel depending on whether a second
+        (distinct) gradient block is given, avoiding a redundant ``all_to_all`` of the same data
+        when computing a self-kernel (``grad_r is None`` or, for the batched path, the diagonal
+        ``l == r`` blocks).
+        """
+        if grad_r is None:
+            return self._get_single_tangent_kernel(grad_l, batch_size=None)
+        return self._get_double_tangent_kernel(grad_l, grad_r, batch_size=None)
 
-        y = jnp.linalg.pinv(y, rtol=pinv_tol, hermitian=True)
-        y = y @ o_loc                                               # (Ns,)
+    @sharded(use_vmap=False)
+    def _get_single_tangent_kernel(self, grad, *, batch_size):
+        """
+        Computes ``grad @ conj(grad).T``, sharded across devices along the sample axis, without
+        ever materializing the full (samples x parameters) ``grad`` on any single device.
 
-        return -1 * jnp.conj(jnp.transpose(gradients)) @ y          # (Np,)
+        ``grad`` arrives sharded along the sample axis with the (padded) parameter axis local to
+        each device. Computing the kernel directly in that layout would need cross-device pairs
+        of samples, forcing an implicit all-gather of the whole matrix under automatic sharding.
+        Instead, ``all_to_all`` trades which axis is sharded (each device ends up with all
+        samples but only its own shard of parameters), so the local matmul is a valid partial
+        sum over that parameter shard; ``psum_scatter`` then reduces and re-shards these partial
+        sums into the exact, correctly-sharded kernel.
+        """
+        grad = jax.lax.all_to_all(grad, 'devices', split_axis=1, concat_axis=0, tiled=True)
+        local = grad @ jnp.conj(jnp.transpose(grad))
 
-    def _solve_lazy(self, grad: LazySampledObs, o_loc):
-        def normalize_batch(batch, weights):
-                batch = _normalize(batch, weights, grad.mean)
-                if self._concat:
-                    batch = _concat_nonholo(batch)
-        
-                return batch
-        
-        y = []
-        for batch_l, weights_l in zip(grad.observations, grad._weights):
-            batch_l = normalize_batch(batch_l, weights_l)
+        return jax.lax.psum_scatter(local, 'devices', tiled=True)
 
-            y_batch = []
-            for batch_r, weights_r in zip(grad.observations, grad._weights):
-                batch_r = normalize_batch(batch_r, weights_r)
-                y_batch.append(batch_l @ jnp.conj(jnp.transpose(batch_r)))
+    @sharded(use_vmap=False)
+    def _get_double_tangent_kernel(self, grad_l, grad_r, *, batch_size):
+        """
+        Same as ``_get_single_tangent_kernel``, but for the cross term ``grad_l @ conj(grad_r).T``
+        between two distinct gradient blocks (used for off-diagonal batches in the
+        ``LazySampledObs`` path). Both operands must be redistributed the same way so that
+        matching parameter shards land on the same device for both.
+        """
+        grad_l = jax.lax.all_to_all(grad_l, 'devices', split_axis=1, concat_axis=0, tiled=True)
+        grad_r = jax.lax.all_to_all(grad_r, 'devices', split_axis=1, concat_axis=0, tiled=True)
+        local = grad_l @ jnp.conj(jnp.transpose(grad_r))
 
-            y.append(jnp.concatenate(y_batch, axis=1))
-        y = jnp.concatenate(y)
-
-        if self._concat:
-            pieces = []
-            start = 0
-            for weights in grad._weights:
-                size = weights.shape[0]
-                pieces.append(_concat_nonholo(o_loc[start:start + size]))
-                start += size
-
-            o_loc = jnp.concatenate(pieces)
-
-        y = y + self.diag_shift * jnp.eye(y.shape[-1], dtype=y.dtype)
-        y = jnp.linalg.pinv(y, rtol=self.pinv_tol, hermitian=True)
-        y = y @ o_loc
-
-        y = _reshape_in_batches(
-            y, 
-            grad._batch_size if self.psi.holomorphic else 2 * grad._batch_size
-        )
-
-        update = 0
-        for grad_batch, weights, y_batch in zip(grad.observations, grad._weights, y):
-            grad_batch = normalize_batch(grad_batch, weights)
-            update += jnp.conj(jnp.transpose(grad_batch)) @ y_batch
-
-        return -update
+        return jax.lax.psum_scatter(local, 'devices', tiled=True)

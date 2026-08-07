@@ -43,6 +43,11 @@ def _normalize(data, weights, mean):
     return jnp.einsum("i, i... -> i...", jnp.sqrt(weights), data - mean)
 
 @jax.jit
+def _inv_normalize(data, inv_weights, mean, mask):
+    raw = jnp.einsum("i, i... -> i...", jnp.sqrt(inv_weights), data) + mean
+    return jnp.einsum("i, i... -> i...", mask, raw)
+
+@jax.jit
 def _normalize_no_center(data, weights):
     return jnp.einsum("i, i... -> i...", jnp.sqrt(weights), data)
 
@@ -182,11 +187,16 @@ class SampledObs():
             pad = ((0, num_pad),) + ((0, 0),) * (observations.ndim - 1)
             observations = jnp.pad(observations, pad, mode='constant')
             weights = jnp.pad(weights, (0, num_pad), constant_values=0)
-        
-        self._weights = jax.device_put(weights, DEVICE_SHARDING)
-        self._observations = jax.device_put(observations, DEVICE_SHARDING, donate=True)
+        inv_weights = jnp.where(weights != 0, 1 / weights, weights)
+        zero_mask = jnp.where(weights != 0, 1, 0)
 
-        self._consumed = False
+        self._weights = jax.device_put(weights, DEVICE_SHARDING)
+        self._inv_weights = jax.device_put(inv_weights, DEVICE_SHARDING)
+        self._zero_mask = jax.device_put(zero_mask, DEVICE_SHARDING)
+        self._observations = jax.device_put(observations, DEVICE_SHARDING)
+
+        self._state = "o"
+        self._mean = _get_mean(self._observations, self.weights)
 
     def __repr__(self):
         return self.__str__()
@@ -199,11 +209,34 @@ class SampledObs():
 
     @property
     def observations(self):
-        if self._consumed:
-            raise RuntimeError(
-                "This SampledObs was consumed by _get_normalized_obs_and_consume() "
-                "(its buffer was donated) and can no longer be used."
+        if self._state == "c":
+            self._observations = _normalize(self._observations, self._zero_mask, -self.mean)
+        elif self._state == "n":
+            self._observations = _inv_normalize(
+                self._observations, self._inv_weights, self.mean, self._zero_mask
             )
+        self._state = "o"
+
+        return self._observations
+
+    @property
+    def _centered_obs(self):
+        if self._state == "o":
+            self._observations = _normalize(self._observations, self._zero_mask, self.mean)
+        elif self._state == "n":
+            self._observations = _normalize(self._observations, self._inv_weights, 0)
+        self._state = "c"
+
+        return self._observations
+    
+    @property
+    def _normalized_obs(self):
+        if self._state == "o":
+            self._observations = _normalize(self._observations, self.weights, self.mean)
+        elif self._state == "c":
+            self._observations = _normalize(self._observations, self.weights, 0)
+        self._state = "n"
+
         return self._observations
     
     @property
@@ -223,15 +256,7 @@ class SampledObs():
 
     @property
     def mean(self):
-        return _get_mean(self.observations, self.weights)
-
-    @property
-    def _centered_obs(self):
-        return _center(self.observations, self.mean)
-
-    @property
-    def _normalized_obs(self):
-        return _normalize(self.observations, self.weights, self.mean)
+        return self._mean
     
     @property
     def var(self):
@@ -354,6 +379,7 @@ class SampledObs():
             self._observations = _apply_and_project(self.observations, element_wise_fn, linear_map)
         else:
             self._observations = jax.jit(element_wise_fn)(self.observations)
+        self._mean = _get_mean(self._observations, self.weights)
 
     def select(self, idx):
         """
@@ -377,12 +403,6 @@ class SampledObs():
         new_weights = self.weights[sl]
 
         return SampledObs(self.observations[sl], new_weights / jnp.sum(new_weights))
-    
-    def _get_normalized_obs_and_consume(self):
-        norm_obs = _normalize_no_copy(self.observations, self.weights)
-        self._consumed = True
-
-        return norm_obs
 
 class LazySampledObs():
     def __init__(self, observations: SizedIterable, weights):

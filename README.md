@@ -25,9 +25,11 @@ Documentation is available [here](https://jvmc.readthedocs.io/en/latest/ "Docume
 
 To install jVMC with GPU support, use
 
-        pip install jVMC[gpu]
+        pip install jVMC[cuda12]
 
-This is assuming, that `jax[cuda12]` will work for you (see the [JAX documentation](https://docs.jax.dev/en/latest/installation.html#pip-installation-nvidia-gpu-cuda-installed-via-pip-easier)).
+or ``pip install jVMC[cuda13]`` depending on your CUDA version. This is assuming, that `jax[cuda12]`/`jax[cuda13]` will work for you (see the [JAX documentation](https://docs.jax.dev/en/latest/installation.html#pip-installation-nvidia-gpu-cuda-installed-via-pip-easier)), and additionally installs `jaxmg` for distributed linear algebra across multiple GPUs.
+
+On a cluster where CUDA is already provided (e.g. via an environment module) rather than pip-installed, use the ``-local`` variant instead, e.g. ``pip install jVMC[cuda12-local]`` or ``pip install jVMC[cuda13-local]``.
 
 ### Option 2: Clone and ``pip``-install for development
 

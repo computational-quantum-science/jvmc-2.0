@@ -18,6 +18,7 @@ from jVMC_exp.util import ObservableEntry, measure
 from jVMC_exp.solver.base import AbstractSolver
 from jVMC_exp.solver.pinv_snr import PinvSNR
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
+from jVMC_exp.sharding_config import sharded, MESH
 
 class AbstractOptimizer(ABC):
     def __init__(
@@ -316,9 +317,14 @@ class Evolution(AbstractOptimizer):
             sampler, psi, resample_stepper, use_cross_valiadation, output_manager=output_manager
         )
 
+        double_params = (not psi.realParams) and (not psi.holomorphic)
+        num_params = psi.numParameters * (2 if double_params  else 1)
+        self._params_pad_size = (- num_params) % MESH.shape["devices"]
+
         self._solver_state = dict(
             exact_sampler=isinstance(self.sampler, ExactSampler),
-            holomorphic=self.psi.holomorphic
+            holomorphic=self.psi.holomorphic,
+            pad_size=self._params_pad_size
         )
 
         self._F0 = None
@@ -374,13 +380,14 @@ class Evolution(AbstractOptimizer):
                 objective_function_output.grad_cov_re_im
             )
 
-        A = self._get_lhs(objective_function_output.grad_log_psi)
         b, b_var = self._get_rhs(
             objective_function_output.grad,
             objective_function_output.grad_var_re,
             objective_function_output.grad_var_im,
             objective_function_output.grad_cov_re_im,
         )
+        A = self._get_lhs(objective_function_output.grad_log_psi)
+        
         update, self._additional_info = self.solver(
             A, b, b_var=b_var, 
             effective_num_samples=objective_function_output.o_loc.effective_num_samples,
@@ -441,25 +448,77 @@ class Evolution(AbstractOptimizer):
 
     def _get_tdvp_error(self, update):
         update = self._make_cmplx_fn(update) if self.psi.holomorphic else update
-        Sv = self._S0(update) if callable(self._S0) else self._S0.dot(update)
+
+        if callable(self._S0):
+            Sv = self._S0(update)
+        else:
+            Sv = self._S0.dot(jnp.pad(update, (0, self._params_pad_size)))
+            Sv = Sv[:-self._params_pad_size] if self._params_pad_size else Sv
 
         return jnp.abs(
-            1. + (jnp.real(jnp.vdot(update, Sv)) - 2 * jnp.real(jnp.vdot(update, - self.rhsPrefactor  * self._F0))) / (self.o_loc.var + 1e-14)
+            1. 
+            + (jnp.real(jnp.vdot(update, Sv))
+            - 2 * jnp.real(jnp.vdot(update, - self.rhsPrefactor  * self._F0)))
+            / (self.o_loc.var + 1e-14)
         )
     
     def _get_lhs_dense(self, grad_log_psi: SampledObs | LazySampledObs):
         '''
-        Returns left hand side of the TDVP equation
+        Returns left hand side of the TDVP equation with shape (n_parameters, n_parameters)
+        and sharded across devices on the first dimension.
+        If n_parameters is not divisible by the number of devices, the output is padded.
         '''
-        self._S0 = grad_log_psi.get_covar()
-        S = self._lhs_trans_fn(self._S0)
+        if self._params_pad_size != 0:
+            grad_log_psi.transform(
+                lambda x: jnp.pad(x, ((0, 0), (0, self._params_pad_size)), mode="constant")
+            )
+        
+        if isinstance(grad_log_psi, SampledObs):
+            S = self._get_qgt(grad_log_psi._normalized_obs, batch_size=None)
+        else:
+            mean = 0
+            S = 0
+            for batch, weights in zip(grad_log_psi._observations, grad_log_psi._weights):
+                batch, batch_mean = self._weight_and_mean(batch, weights, batch_size=None)
+                mean += batch_mean
+                S += self._get_qgt(batch, batch_size=None)
+            del batch
+    
+            S = S - jnp.tensordot(jnp.conj(mean), mean, axes=0)
+
+        if self._params_pad_size != 0:
+            grad_log_psi.transform(lambda x: x[:,:-self._params_pad_size])
+
+        self._S0 = S
+        S = self._lhs_trans_fn(S)
 
         if self.diag_scale > 1e-15:
             S = S + jnp.diag(self.diag_scale * jnp.diag(S))
         if self.diag_shift > 1e-15:
-            S = S + self.diag_shift * jnp.eye(S.shape[0])
+            idx = jnp.arange(S.shape[0] - self._params_pad_size)
+            S = S.at[idx, idx].add(self.diag_shift)
 
         return S
+
+    @sharded(use_vmap=False)
+    def _get_qgt(self, grad_log_psi, *, batch_size):
+        """
+        Return the quantum geometric tensor, sharded accross devices on the first axis.
+        """
+        local = jnp.tensordot(jnp.conj(grad_log_psi), grad_log_psi, axes=(0, 0))
+    
+        return jax.lax.psum_scatter(local, "devices", scatter_dimension=0, tiled=True)
+
+    @sharded(use_vmap=False)
+    def _weight_and_mean(self, batch, weights, *, batch_size):
+        weighted_batch = jnp.einsum("i, i... -> i...", jnp.sqrt(weights), batch)
+        mean = jax.lax.psum_scatter(
+            jnp.tensordot(weights, batch, axes=(0, 0)), 
+            "devices",
+            tiled=True
+        )
+
+        return weighted_batch, mean
     
     def _get_lhs_lazy(self, grad_log_psi: SampledObs | LazySampledObs):
         '''
@@ -473,23 +532,25 @@ class Evolution(AbstractOptimizer):
                 "array. Either use a solver with _needs_dense_matrix=True (e.g. PinvSNR), or "
                 "compute the Jacobian without batching."
             )
+
+        grad = grad_log_psi._normalized_obs
         
         def raw_matvec(v):
-            return (grad_log_psi._normalized_obs.conj().T @ (grad_log_psi._normalized_obs @ v))
+            return (grad.conj().T @ (grad @ v))
 
         self._S0 = raw_matvec
 
         def matvec(v):
             Sv = self._lhs_trans_fn(raw_matvec(v))
             if self.diag_scale > 1e-15:
-                diag = jnp.sum(jnp.abs(grad_log_psi._normalized_obs) ** 2, axis=0)
+                diag = jnp.sum(jnp.abs(grad) ** 2, axis=0)
                 Sv = Sv + self.diag_scale * diag * v
             if self.diag_shift > 1e-15:
                 Sv = Sv + self.diag_shift * v
 
             return Sv
 
-        return matvec 
+        return matvec
     
     def _get_rhs(self, grad, grad_var_re, grad_var_im, grad_cov_re_im):
         self._F0 = grad

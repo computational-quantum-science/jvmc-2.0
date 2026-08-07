@@ -306,13 +306,7 @@ class NQS:
     def sampleShape(self):
         return self._sampleShape
 
-    def to_array(
-        self,
-        basis,
-        *,
-        normalize=True,
-        log=True,
-    ):
+    def to_array(self, basis, *, normalize=True, log=True):
         """
         Evaluate the variational state on an ordered computational basis.
 

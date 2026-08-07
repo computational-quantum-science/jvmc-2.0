@@ -32,6 +32,21 @@ REPLICATED_SHARDING = NamedSharding(MESH, P())
 DEVICE_SPEC = P("devices")
 REPLICATED_SPEC = P()
 
+def make_2d_mesh(axis_names=("row", "col")):
+    num_devices = jax.device_count()
+
+    p_rows = int(math.isqrt(num_devices))
+    while num_devices % p_rows != 0:
+        p_rows -= 1
+    p_cols = num_devices // p_rows
+    devices_2d = mesh_utils.create_device_mesh((p_rows, p_cols))
+    
+    return Mesh(devices_2d, axis_names=axis_names)
+
+MESH_2D = make_2d_mesh(axis_names=("row", "col"))
+DEVICE_SPEC_2D = P("row", "col")
+DEVICE_SHARDING_2D = NamedSharding(MESH_2D, DEVICE_SPEC_2D)
+
 @dataclass
 class SizedIterable:
     reusable_iterable: Callable
