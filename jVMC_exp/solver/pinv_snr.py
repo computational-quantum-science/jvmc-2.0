@@ -142,7 +142,7 @@ class PinvSNR(AbstractSolver):
 
         snr = None
         if not exact_sampler:
-            if b_var is not None:
+            if b_var is not None and self.snr_tol != 0:
                 snr = get_snr(
                     Vtb, 
                     unpad(jnp.dot(
