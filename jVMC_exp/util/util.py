@@ -251,14 +251,15 @@ def matrix_to_jvmc_operator(
     return build_from(matrix)
 
 def s_norm_fn(opt: TDVP):
-    if opt.psi.holomorphic:
-        make_cmplx_array_fn = partial(make_cmplx_array, params_shape=opt.psi.paramShapes)
+    make_cmplx_array_fn = partial(make_cmplx_array, params_shape=opt.psi.paramShapes)
+    
+    @jax.jit
+    def _norm_fn(v):
+        if opt.psi.holomorphic:
+            v = make_cmplx_array_fn(v)
+        Sv = jnp.dot(opt._S0, jnp.pad(v, (0, opt._params_pad_size)))
+        Sv = Sv[:-opt._params_pad_size] if opt._params_pad_size else Sv
 
-        @jax.jit
-        def _norm_fn(v):
-            v = make_cmplx_array_fn(v)    
-            return jnp.abs(jnp.real(jnp.vdot(v, jnp.dot(opt._S0, v))))
-        
-        return _norm_fn
-
-    return lambda v: jnp.abs(jnp.real(jnp.vdot(v, jnp.dot(opt._S0, v))))
+        return jnp.abs(jnp.real(jnp.vdot(v, Sv)))
+    
+    return _norm_fn
