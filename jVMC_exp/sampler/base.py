@@ -66,11 +66,13 @@ class AbstractSampler(ABC):
         Sample configurations from the distribution defined by the network.
         
         Args.:
-            numSamples: Optional number of samples to generate. If None, the default number of samples is used.
+            numSamples: Optional number of samples to generate. \
+            If None, the default number of samples is used.
         Returns:
             A tuple of (configs, logPsi, p), where:
             - configs: Sampled configurations.
-            - logPsi: Logarithm of the wave function coefficients for the sampled configurations.
+            - logPsi: Logarithm of the wave function coefficients for \
+            the sampled configurations.
             - p: Normalized probabilities of the sampled configurations.
         '''
         pass
@@ -110,7 +112,6 @@ class AbstractMCSampler(AbstractSampler):
         distribution. For pure wave functions this should be 0.5, and 1.0 for POVMs. In the POVM case, the \
         ``mu`` parameter must be set to 1.0, to sample the unchanged POVM distribution.
     """
-
     def __init__(
             self, psi: NQS, updateProposer: None | AbstractProposer, key=None, 
             numChains=32, numSamples=128, thermalizationSweeps=10, sweepSteps=None, 
@@ -122,20 +123,6 @@ class AbstractMCSampler(AbstractSampler):
                 "'updateProposer' must be an instance of 'jVMC.propose.AbstractProposer'."
             )
         super().__init__(psi)
-
-        self.initial_states = initState
-        if initState is not None: 
-            self.initial_states = jnp.array(initState)
-            if self.initial_states.shape[1:] != self.sampleShape:
-                raise ValueError(
-                    f"The provided initState has the wrog sample shape. "
-                    f"Got {self.initial_states.shape[1:]}, while sampleShape is {self.sampleShape}."
-                )
-            elif numChains - self.initial_states[0] < 0:
-                raise ValueError(
-                    f"The number of chain in initState ({self.states.shape[0]}) "
-                    f"is greater than the provided numChains ({numChains})."
-                )
 
         self.logProbFactor = logProbFactor
         self.mu = mu
@@ -151,6 +138,8 @@ class AbstractMCSampler(AbstractSampler):
         self.thermalizationSweeps = thermalizationSweeps
         self.numSamples = numSamples
         self.numChains = numChains
+
+        self.states = initState
 
         if has_callable_attr(self.psi.net, "eval_real"):
             def log_prob_fun(p, s):
@@ -213,17 +202,6 @@ class AbstractMCSampler(AbstractSampler):
     
     @numChains.setter
     def numChains(self, value):
-        if value > self.psi.batchSize:
-            if jax.process_index() == 0:
-                warnings.warn(
-                    f"numChains ({value}) is larger than the batch size ({self.psi.batchSize}), "
-                    "which may lead to an out-of-memory error. "
-                    "Automatically setting numChains = batchSize."
-                )
-            value = self.psi.batchSize
-            if self.initial_states is not None:
-                if value - self.initial_states[0] < 0:
-                    self.initial_states = self.initial_states[:value]
         if self.numSamples < value:
             raise ValueError(
                 f"The provided number of chains {value} is bigger "
@@ -243,6 +221,37 @@ class AbstractMCSampler(AbstractSampler):
     def key(self, value):
         self._key = format_key(value)
         self._is_state_initialized = False
+
+    @property
+    def states(self):
+        return self._states
+
+    @states.setter
+    def states(self, value):
+        if value is not None:
+            value = jnp.array(value)
+            if value.shape[1:] != self.sampleShape:
+                raise ValueError(
+                    f"The provided state has the wrog sample shape. "
+                    f"Got {value.shape[1:]}, while sampleShape is {self.sampleShape}."
+                )
+
+        self._states = value
+        self._is_state_initialized = False
+
+    @property
+    def sampler_state(self):
+        return dict(
+            parameters=self.psi.parameters,
+            states=self.states,
+            weights=self.weights
+        )
+
+    @sampler_state.setter
+    def sampler_state(self, value):
+        self.psi.parameters = value["parameters"]
+        self.states = value["states"]
+        self._weights = value["weights"]
     
     def __call__(
             self, 
@@ -303,15 +312,17 @@ class AbstractMCSampler(AbstractSampler):
         initStateKey = all_keys[-1]
         self._key = jax.device_put(keys, DEVICE_SHARDING)
 
-        if self.initial_states is not None:
-            self.states = self.initial_states.astype(dtype)
-            res = self.numChains - self.states.shape[0]
+        if self.states is not None:
+            states = self.states.astype(dtype)
+            res = self.numChains - states.shape[0]
             if res > 0:
                 pad = initializer(initStateKey, (res,) + self.sampleShape, dtype)
-                self.states = jnp.concat([self.initial_states, pad])
+                states = jnp.concat([states, pad])
+            elif res < 0:
+                states = states[:self.numChains]
         else:
-            self.states = initializer(initStateKey, (self.numChains,) + self.sampleShape, dtype)
-        self.states = jax.device_put(self.states, DEVICE_SHARDING)
+            states = initializer(initStateKey, (self.numChains,) + self.sampleShape, dtype)
+        self._states = jax.device_put(states, DEVICE_SHARDING)
         
         self.updateProposer.init_arg(self.psi, self.numChains)
 
@@ -437,7 +448,7 @@ class AbstractMCSampler(AbstractSampler):
                 )
             )
 
-        (self.states, self.logProb, self._key, self.numProposed, self.numAccepted), configs, self.updateProposer._arg =\
+        (self._states, self.logProb, self._key, self.numProposed, self.numAccepted), configs, self.updateProposer._arg =\
             self._get_samples_jsh[numSamplesStr](
                 self.psi.sampler_parameters, self.states, self.logProb, self.key, 
                 self.numProposed, self.numAccepted, self.updateProposer._arg
@@ -527,7 +538,6 @@ class AbstractMCSampler(AbstractSampler):
         Returns:
             Acceptance ratio observed in the last call to ``sample()``.
         """
-
         numProp = jnp.sum(self.numProposed)
         if numProp > 0:
             return jnp.sum(self.numAccepted) / numProp

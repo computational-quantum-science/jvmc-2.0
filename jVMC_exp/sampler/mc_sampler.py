@@ -231,7 +231,7 @@ class CutoffSampler(MCSampler):
                 )
             )
 
-        (self.states, self.logProb, self._key, self.numProposed, self.numAccepted), configs, self.updateProposer._arg = \
+        (self._states, self.logProb, self._key, self.numProposed, self.numAccepted), configs, self.updateProposer._arg = \
             self._get_samples_jsh[numSamplesStr](
                     self.psi.sampler_parameters, self.cutoff, self.states, self.logProb, self.key,
                     self.numProposed, self.numAccepted, self.updateProposer._arg
