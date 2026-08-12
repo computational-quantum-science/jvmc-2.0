@@ -150,7 +150,7 @@ class TestTimeEvolutionBatchedJacobian(unittest.TestCase):
                 hamiltonian += J * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) + hx * op.SigmaX(l)
 
             loss_function = jVMC_exp.objective_function.Observable(hamiltonian, batched_jacobian=batched_jacobian)
-            solver = jVMC_exp.solver.PinvSNR(snr_tol=1, pinv_tol=0.0, pinv_cutoff=1e-8)
+            solver = jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-8)
             stepper = jVMC_exp.stepper.Euler(timeStep=1e-3)
             opt = jVMC_exp.optimizer.TDVP(exactSampler, psi, make_real=False, diagonalShift=0, solver=solver)
 

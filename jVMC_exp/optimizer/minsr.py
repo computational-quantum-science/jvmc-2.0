@@ -9,6 +9,7 @@ from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput, AbstractObjectiveFunction
 from jVMC_exp.solver.util import pinvert
 from jVMC_exp.sharding_config import sharded, MESH
+from jVMC_exp.util import OutputManager
 
 @jax.jit
 def _concat_nonholo(arr):
@@ -50,7 +51,7 @@ class MinSR(AbstractOptimizer):
             self, sampler: AbstractSampler, psi: NQS,
             pinv_tol=1e-14, diagonalShift=1e-3, *,
             pinv_mode: Literal["device", "distributed"] = "device", T_A: int | None = None,
-            resample_stepper=True,
+            resample_stepper=True, output_manager: OutputManager | None = None
         ):
         self.pinv_tol = pinv_tol
         self.diag_shift = diagonalShift
@@ -61,7 +62,9 @@ class MinSR(AbstractOptimizer):
         num_params = psi.numParameters * (2 if not psi.realParams else 1)
         self._params_pad_size = (- num_params) % MESH.shape["devices"]
 
-        super().__init__(sampler, psi, resample_stepper, use_cross_valiadation=False)
+        super().__init__(
+            sampler, psi, resample_stepper, use_cross_valiadation=False, output_manager=output_manager
+        )
 
     @property
     def diag_shift(self):

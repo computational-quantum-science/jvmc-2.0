@@ -1,6 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
+
 name = ["force", "qgt"]
 
 plt.figure(figsize=(15, 6))

@@ -13,9 +13,6 @@ class ObjectiveFunctionOutput():
     o_loc: SampledObs | None = None
     grad_log_psi: SampledObs | LazySampledObs | None = None
     grad: jax.Array | None = None
-    grad_var_re: jax.Array | None = None
-    grad_var_im: jax.Array | None = None
-    grad_cov_re_im: jax.Array | None = None
 
 class AbstractObjectiveFunction(ABC):
     @abstractmethod
@@ -42,16 +39,18 @@ class Observable(AbstractObjectiveFunction):
     def value_and_grad(self, sampler: AbstractSampler, compute_grad: bool = True, **op_kwargs):
         o_loc = self(sampler, **op_kwargs)
         if self._batched_jacobian:
-            grad_log_psi = LazySampledObs(sampler.psi.lazy_gradients(sampler.samples), sampler.weights)
+            grad_log_psi = LazySampledObs(
+                sampler.psi.lazy_gradients(sampler.samples), sampler.weights
+            )
         else:
-            grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
+            grad_log_psi = SampledObs(
+                sampler.psi.gradients(sampler.samples), sampler.weights
+            )
 
         if compute_grad:
-            grad, grad_var_re, grad_var_im, grad_cov_re_im = grad_log_psi.get_covar_and_covar_var(o_loc)
+            grad = grad_log_psi.get_covar(o_loc)
             return ObjectiveFunctionOutput(
-                o_loc=o_loc, grad=grad,
-                grad_var_re=grad_var_re, grad_var_im=grad_var_im, grad_cov_re_im=grad_cov_re_im,
-                grad_log_psi=grad_log_psi
+                o_loc=o_loc, grad=grad, grad_log_psi=grad_log_psi
             )
 
         return ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=grad_log_psi)
@@ -73,7 +72,9 @@ class Estimator(AbstractObjectiveFunction):
     
     def value_and_grad(self, sampler: AbstractSampler, **kwargs):
         if not self._is_grad_init:
-            _, _, self._grad_fn, _ = pick_gradient(self.estimator_fn, sampler.psi.parameters, sampler.samples[0])
+            _, _, self._grad_fn, _ = pick_gradient(
+                self.estimator_fn, sampler.psi.parameters, sampler.samples[0]
+            )
             self._is_grad_init = True
 
         value = self(sampler)

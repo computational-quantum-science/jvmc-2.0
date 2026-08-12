@@ -127,12 +127,12 @@ class AbstractOptimizer(ABC):
     
     def step(self, t, stepper: AbstractStepper, objective_function: AbstractObjectiveFunction, **kwargs):
         return stepper.step(
-                t,
-                self,
-                self.psi.parameters_flat,
-                objective_function=objective_function,
-                **kwargs
-            )
+            t,
+            self,
+            self.psi.parameters_flat,
+            objective_function=objective_function,
+            **kwargs
+        )
     
     def ground_state_search(
             self,
@@ -274,23 +274,14 @@ class Evolution(AbstractOptimizer):
             diagonalShift: float | Callable=1e-3, diagonalScale: float | Callable=0., 
             solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None
         ):
-        self.rhsPrefactor = 1 if imag_time else 1j
-        c = - self.rhsPrefactor
-        c_r, c_i = jnp.real(c), jnp.imag(c)
+        self.rhsPrefactor = -1 if imag_time else -1j 
         if psi.holomorphic:
             self._lhs_trans_fn = lambda x: x
-            self._rhs_var_trans_fn = lambda var_re, var_im, cov_re_im: var_re + var_im
         elif make_real:
             self._lhs_trans_fn = lambda x: jnp.real(x)
-            self._rhs_var_trans_fn = lambda var_re, var_im, cov_re_im: (
-                c_r ** 2 * var_re + c_i ** 2 * var_im - 2 * c_r * c_i * cov_re_im
-            )
         else:
             self._lhs_trans_fn = lambda x: 1j * jnp.imag(x)
-            self._rhs_var_trans_fn = lambda var_re, var_im, cov_re_im: (
-                c_r ** 2 * var_im + c_i ** 2 * var_re + 2 * c_r * c_i * cov_re_im
-            )
-        self._rhs_trans_fn = lambda x: self._lhs_trans_fn(c * x)
+        self._rhs_trans_fn = lambda x: self._lhs_trans_fn(self.rhsPrefactor * x)
 
         self.diag_scale = diagonalScale
         self.diag_shift = diagonalShift
@@ -324,7 +315,8 @@ class Evolution(AbstractOptimizer):
         self._solver_state = dict(
             exact_sampler=isinstance(self.sampler, ExactSampler),
             holomorphic=self.psi.holomorphic,
-            pad_size=self._params_pad_size
+            pad_size=self._params_pad_size,
+            transformation=self._rhs_trans_fn
         )
 
         self._F0 = None
@@ -370,27 +362,14 @@ class Evolution(AbstractOptimizer):
             objective_function_output.grad = self._remove_double_fn(
                 objective_function_output.grad
             )
-            objective_function_output.grad_var_re = self._remove_double_fn(
-                objective_function_output.grad_var_re
-            )
-            objective_function_output.grad_var_im = self._remove_double_fn(
-                objective_function_output.grad_var_im
-            )
-            objective_function_output.grad_cov_re_im = self._remove_double_fn(
-                objective_function_output.grad_cov_re_im
-            )
 
-        b, b_var = self._get_rhs(
-            objective_function_output.grad,
-            objective_function_output.grad_var_re,
-            objective_function_output.grad_var_im,
-            objective_function_output.grad_cov_re_im,
-        )
+        b = self._get_rhs(objective_function_output.grad)
         A = self._get_lhs(objective_function_output.grad_log_psi)
         
         update, self._additional_info = self.solver(
-            A, b, b_var=b_var, 
-            effective_num_samples=objective_function_output.o_loc.effective_num_samples,
+            A, b, 
+            grad_log_psi=objective_function_output.grad_log_psi, 
+            o_loc=objective_function_output.o_loc,
             **self.solver_state
         )
         self.update = self._make_real_fn(update) if self.psi.holomorphic else update
@@ -433,10 +412,7 @@ class Evolution(AbstractOptimizer):
             update_1 = self._make_cmplx_fn(update_1)
             objective_fn_out_2.grad_log_psi.transform(self._remove_double_trans)
             objective_fn_out_2.grad = self._remove_double_fn(objective_fn_out_2.grad)
-        F2, _ = self._get_rhs(
-            objective_fn_out_2.grad, objective_fn_out_2.grad_var_re,
-            objective_fn_out_2.grad_var_im, objective_fn_out_2.grad_cov_re_im,
-        )
+        F2 = self._get_rhs(objective_fn_out_2.grad)
         S2 = self._get_lhs(objective_fn_out_2.grad_log_psi)
         Sv = S2(update_1) if callable(S2) else S2.dot(update_1)
         validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / residual
@@ -458,7 +434,7 @@ class Evolution(AbstractOptimizer):
         return jnp.abs(
             1. 
             + (jnp.real(jnp.vdot(update, Sv))
-            - 2 * jnp.real(jnp.vdot(update, - self.rhsPrefactor  * self._F0)))
+            - 2 * jnp.real(jnp.vdot(update, self.rhsPrefactor  * self._F0)))
             / (self.o_loc.var + 1e-14)
         )
     
@@ -552,15 +528,12 @@ class Evolution(AbstractOptimizer):
 
         return matvec
     
-    def _get_rhs(self, grad, grad_var_re, grad_var_im, grad_cov_re_im):
+    def _get_rhs(self, grad):
         self._F0 = grad
         b = self._rhs_trans_fn(grad)
-        b_var = None
-        if grad_var_re is not None:
-            b_var = self._rhs_var_trans_fn(grad_var_re, grad_var_im, grad_cov_re_im)
         b.block_until_ready()
 
-        return b, b_var
+        return b
 
     def _update_meta_data(self):
         self.meta_data = dict(

@@ -283,13 +283,10 @@ class TestLazySampledObs(unittest.TestCase):
         dense = SampledObs(obs, weights)
         lazy = _make_lazy(obs, weights, batch_size=6)
 
-        covar_d, var_re_d, var_im_d, cov_re_im_d = dense.get_covar_and_covar_var()
-        covar_l, var_re_l, var_im_l, cov_re_im_l = lazy.get_covar_and_covar_var()
+        covar_d = dense.get_covar()
+        covar_l = lazy.get_covar()
 
         self.assertTrue(jnp.allclose(covar_l, covar_d, atol=1e-10))
-        self.assertTrue(jnp.allclose(var_re_l, var_re_d, atol=1e-10))
-        self.assertTrue(jnp.allclose(var_im_l, var_im_d, atol=1e-10))
-        self.assertTrue(jnp.allclose(cov_re_im_l, cov_re_im_d, atol=1e-10))
 
     def test_repeated_iteration_gives_consistent_results(self):
         """

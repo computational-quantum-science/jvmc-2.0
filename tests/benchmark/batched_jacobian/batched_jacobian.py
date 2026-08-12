@@ -36,7 +36,8 @@ def host_max_rss_bytes():
 
 def compute(grad_log_psi, o_loc):
     if args.quantity == "force":
-        return grad_log_psi.get_covar_and_covar_var(o_loc)
+        return grad_log_psi.get_covar(o_loc)
+        # return grad_log_psi.get_covar_and_covar_var(o_loc)
     return grad_log_psi.get_covar()
 
 num_hidden = 512
@@ -87,7 +88,7 @@ results = dict(
     peak_bytes_in_use=device_memory()[1],
     host_max_rss_bytes=host_max_rss_bytes(),
 )
-csv_name = f"jacobian_test_{args.quantity}.csv"
+csv_name = f"jacobian_test_{args.quantity}_1gpu.csv"
 df = pd.DataFrame([results])
 df_old = pd.read_csv(csv_name) if os.path.exists(csv_name) else pd.DataFrame()
 df = pd.concat([df_old, df], ignore_index=True)
