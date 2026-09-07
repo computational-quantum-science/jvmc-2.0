@@ -106,13 +106,10 @@ class Operator(AbstractOperator):
 
         return self._get_conn_elements_sh(s, batch_size=batch_size, **kwargs)
 
-    def to_sparse(
-        self,
-        basis,
-        *,
-        zero_tolerance=0.0,
-        **op_kwargs,
-    ):
+    def to_dense(self, basis, *, zero_tolerance=0.0, **op_kwargs):
+        return self.to_sparse(basis, zero_tolerance=0.0, **op_kwargs).todense()
+
+    def to_sparse(self, basis, *, zero_tolerance=0.0, **op_kwargs):
         """
         Return the SciPy sparse matrix representation of this operator
         in the supplied ordered computational basis.

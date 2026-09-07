@@ -14,7 +14,7 @@ class ObjectiveFunctionOutput():
     grad_log_psi: SampledObs | LazySampledObs | None = None
     grad: jax.Array | None = None
 
-class AbstractObjectiveFunction(ABC):
+class AbstractObjectiveFunction(ABC): # TODO: make batched jacobian a flag in the abstract init
     @abstractmethod
     def __call__(self, sampler: AbstractSampler, **kwargs) -> SampledObs:
         pass

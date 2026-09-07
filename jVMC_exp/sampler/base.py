@@ -55,7 +55,8 @@ class AbstractSampler(ABC):
             self.sample()
 
         return self._samples
-    
+
+    # TODO: make this method explicit
     @abstractmethod
     def __call__(self, observable: AbstractOperator, **obs_kwargs) -> SampledObs:
         pass

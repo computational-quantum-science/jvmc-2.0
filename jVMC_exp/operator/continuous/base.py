@@ -1,7 +1,6 @@
 import jax.numpy as jnp
 from abc import abstractmethod
 import inspect
-from functools import partial
 
 from jVMC_exp.geometry import AbstractGeometry
 from jVMC_exp.vqs import NQS

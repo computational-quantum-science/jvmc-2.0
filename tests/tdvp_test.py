@@ -38,7 +38,7 @@ class TestTimeEvolution(unittest.TestCase):
 
         loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
         solver = jVMC_exp.solver.PinvSNR(snr_tol=1, pinv_tol=0.0, pinv_cutoff=1e-8)
-        stepper = jVMC_exp.stepper.AdaptiveHeun(timeStep=1e-3, tol=1e-5)
+        stepper = jVMC_exp.stepper.AdaptiveHeun(timeStep=1e-3, rtol=1e-5, atol=1e-5)
         opt = jVMC_exp.optimizer.TDVP(exactSampler, psi, make_real=False, diagonalShift=0, solver=solver)
 
         t_max = 0.5
@@ -100,7 +100,7 @@ class TestTimeEvolutionMCSampler(unittest.TestCase):
 
         loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
         solver = jVMC_exp.solver.PinvSNR(snr_tol=1, pinv_cutoff=1e-8)
-        stepper = jVMC_exp.stepper.AdaptiveHeun(timeStep=1e-3, tol=1e-4)
+        stepper = jVMC_exp.stepper.AdaptiveHeun(timeStep=1e-3, rtol=0.0, atol=2.5e-5)
         opt = jVMC_exp.optimizer.TDVP(mc_sampler, psi, make_real=False, solver=solver, use_cross_valiadation=True)
 
         t_max = 0.5

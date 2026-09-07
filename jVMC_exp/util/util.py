@@ -251,15 +251,35 @@ def matrix_to_jvmc_operator(
     return build_from(matrix)
 
 def s_norm_fn(opt: TDVP):
-    make_cmplx_array_fn = partial(make_cmplx_array, params_shape=opt.psi.paramShapes)
-    
+    """
+    Norm induced by the quantum geometric tensor, :math:`\\|v\\|_S = \\sqrt{|v^\\dagger S v|}`.
+    """
+    pad_size = opt._params_pad_size
+    make_cmplx_array_fn = jax.jit(partial(make_cmplx_array, params_shape=opt.psi.paramShapes))
+
     @jax.jit
+    def _mat_vec(v, S):
+        Sv = jnp.dot(S, jnp.pad(v, (0, pad_size)))
+
+        return Sv[:-pad_size] if pad_size else Sv
+
+    @jax.jit
+    def _norm_from_sv(v, Sv):
+        return jnp.sqrt(jnp.abs(jnp.real(jnp.vdot(v, Sv))))
+
     def _norm_fn(v):
+        S = opt._S0
+        if S is None:
+            raise RuntimeError(
+                "The S-metric norm was called before the right hand side of the TDVP "
+                "equation was evaluated, so the quantum geometric tensor is not available "
+                "yet. Call the norm only after the first evaluation of f."
+            )
+
         if opt.psi.holomorphic:
             v = make_cmplx_array_fn(v)
-        Sv = jnp.dot(opt._S0, jnp.pad(v, (0, opt._params_pad_size)))
-        Sv = Sv[:-opt._params_pad_size] if opt._params_pad_size else Sv
+        Sv = S(v) if callable(S) else _mat_vec(v, S)
 
-        return jnp.abs(jnp.real(jnp.vdot(v, Sv)))
-    
+        return _norm_from_sv(v, Sv)
+
     return _norm_fn
