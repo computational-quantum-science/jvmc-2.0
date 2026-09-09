@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import inspect
 from jax.sharding import Mesh, NamedSharding
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import PartitionSpec as P

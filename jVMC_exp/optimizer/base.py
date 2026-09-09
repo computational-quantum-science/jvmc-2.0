@@ -16,7 +16,7 @@ from jVMC_exp.util.output_manager import OutputManager
 from jVMC_exp.stepper import AbstractStepper, Euler
 from jVMC_exp.util import ObservableEntry, measure
 from jVMC_exp.solver.base import AbstractSolver
-from jVMC_exp.solver.pinv_snr import PinvSNR
+from jVMC_exp.solver.pinv import PinvSNR
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
 from jVMC_exp.sharding_config import sharded, MESH
 
@@ -311,10 +311,15 @@ class Evolution(AbstractOptimizer):
         double_params = (not psi.realParams) and (not psi.holomorphic)
         num_params = psi.numParameters * (2 if double_params  else 1)
         self._params_pad_size = (- num_params) % MESH.shape["devices"]
+        self._pad_obs = jax.jit(
+            lambda x: jnp.pad(x, ((0, 0), (0, self._params_pad_size)), mode="constant")
+        )
+        self._unpad_obs = jax.jit(
+            lambda x: x[:, :-self._params_pad_size] if self._params_pad_size else x
+        )
 
         self._solver_state = dict(
             exact_sampler=isinstance(self.sampler, ExactSampler),
-            holomorphic=self.psi.holomorphic,
             pad_size=self._params_pad_size,
             transformation=self._rhs_trans_fn
         )
@@ -372,11 +377,19 @@ class Evolution(AbstractOptimizer):
             o_loc=objective_function_output.o_loc,
             **self.solver_state
         )
-        self.update = self._make_real_fn(update) if self.psi.holomorphic else update
+        self.update = self._make_real_fn(update) if self.psi.holomorphic else jnp.real(update)
 
         return self.update
     
     def cross_validation(self, objective_function: AbstractObjectiveFunction, **objective_function_kwargs):
+        if "residual" not in self.meta_data:
+            raise ValueError(
+                f"Cross validation normalizes against the residual of the solve, but solver "
+                f"'{type(self.solver).__name__}' does not report a 'residual' in the info "
+                "dictionary it returns. Either use a solver that does (e.g. Pinv or PinvSNR), "
+                "or construct the optimizer with use_cross_valiadation=False."
+            )
+
         residual = self.meta_data["residual"]
         tvp_error = self.meta_data["tdvp_error"]
 
@@ -445,9 +458,7 @@ class Evolution(AbstractOptimizer):
         If n_parameters is not divisible by the number of devices, the output is padded.
         '''
         if self._params_pad_size != 0:
-            grad_log_psi.transform(
-                lambda x: jnp.pad(x, ((0, 0), (0, self._params_pad_size)), mode="constant")
-            )
+            grad_log_psi.transform(self._pad_obs)
         
         if isinstance(grad_log_psi, SampledObs):
             S = self._get_qgt(grad_log_psi._normalized_obs, batch_size=None)
@@ -463,7 +474,7 @@ class Evolution(AbstractOptimizer):
             S = S - jnp.tensordot(jnp.conj(mean), mean, axes=0)
 
         if self._params_pad_size != 0:
-            grad_log_psi.transform(lambda x: x[:,:-self._params_pad_size])
+            grad_log_psi.transform(self._unpad_obs)
 
         self._S0 = S
         S = self._lhs_trans_fn(S)

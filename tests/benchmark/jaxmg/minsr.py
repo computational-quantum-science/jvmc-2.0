@@ -31,7 +31,9 @@ for i in range(L):
 
 loss_function = jVMC_exp.objective_function.Observable(H)
 stepper = jVMC_exp.stepper.Euler(1e-2)
-opt = jVMC_exp.optimizer.MinSR(sampler, psi, pinv_mode="distributed")
+solver = jVMC_exp.solver.Pinv(diagonalization_mode="distributed")
+opt = jVMC_exp.optimizer.MinSR(sampler, psi, solver=solver)
+
 
 psi.parameters = opt.step(0, stepper, loss_function)[0]
 

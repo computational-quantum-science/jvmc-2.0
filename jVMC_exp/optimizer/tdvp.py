@@ -1,7 +1,7 @@
 from typing import Dict, List, Callable
 
 from .base import Evolution
-from jVMC_exp.solver.pinv_snr import PinvSNR
+from jVMC_exp.solver import PinvSNR
 from jVMC_exp.objective_function import AbstractObjectiveFunction
 from jVMC_exp.stepper import AbstractStepper, Euler
 from jVMC_exp.util import ObservableEntry

@@ -1,15 +1,17 @@
 import jax
 import jax.numpy as jnp
-from typing import Callable, Literal
+from typing import Callable
 
 from jVMC_exp.sampler.base import AbstractSampler
+from jVMC_exp.sampler import ExactSampler
 from jVMC_exp.stats import SampledObs, _reshape_in_batches
 from jVMC_exp.vqs import NQS
 from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput, AbstractObjectiveFunction
-from jVMC_exp.solver.util import pinvert
 from jVMC_exp.sharding_config import sharded, MESH
 from jVMC_exp.util import OutputManager
+from jVMC_exp.solver.base import AbstractSolver
+from jVMC_exp.solver import Pinv
 
 @jax.jit
 def _concat_nonholo(arr):
@@ -35,28 +37,39 @@ class MinSR(AbstractOptimizer):
     Initializer arguments:
         * ``sampler``: A sampler object.
         * ``psi``: The variational wave function (``NQS`` instance) being optimized.
-        * ``pinv_tol``: Regularization parameter :math:`\\epsilon_{SVD}`, the relative cutoff used \
-        when pseudo-inverting the tangent kernel, see above.
         * ``diagonalShift``: Regularization parameter :math:`\\lambda`, the diagonal shift added \
         to the tangent kernel before inversion, see above. May be a constant or a callable \
         ``step -> value``, updated at each step via ``update_hyperparams``.
-        * ``pinv_mode``: Backend used to pseudo-invert the tangent kernel, forwarded to \
-        :func:`jVMC_exp.solver.util.pinvert`. ``"device"`` runs ``jax.numpy.linalg.pinv`` \
-        locally; ``"distributed"`` uses a distributed eigendecomposition via ``jaxmg``. \
-        * ``T_A``: Tile size forwarded to :func:`jVMC_exp.solver.util.pinvert` when \
-        ``pinv_mode="distributed"``. If ``None``, a default is derived automatically.
+        * ``solver``: Solver used to invert the tangent kernel, e.g. \
+        :class:`jVMC_exp.solver.Pinv`. Its ``pinv_cutoff`` plays the role of the \
+        regularization parameter :math:`\\epsilon_{SVD}`, and its \
+        ``diagonalization_mode``/``T_A`` select the (optionally distributed) \
+        eigensolver backend. Only dense solvers are supported: MinSR materializes the \
+        tangent kernel, so a matrix-free solver such as :class:`jVMC_exp.solver.CG` is \
+        rejected at construction. The signal-to-noise regularization of \
+        :class:`jVMC_exp.solver.PinvSNR` is rejected as well, since it estimates the \
+        sampling variance of a Monte Carlo *average*, whereas MinSR's right hand side \
+        holds one local estimator per sample.
         * ``resample_stepper``: Whether the sampler resamples at every stepper substep.
     """
     def __init__(
             self, sampler: AbstractSampler, psi: NQS,
-            pinv_tol=1e-14, diagonalShift=1e-3, *,
-            pinv_mode: Literal["device", "distributed"] = "device", T_A: int | None = None,
+            diagonalShift=1e-3, solver: AbstractSolver=Pinv(),
             resample_stepper=True, output_manager: OutputManager | None = None
         ):
-        self.pinv_tol = pinv_tol
         self.diag_shift = diagonalShift
-        self._pinv_mode = pinv_mode
-        self._T_A = T_A
+
+        if not solver._needs_dense_matrix:
+            raise ValueError(
+                f"Solver {solver.__class__.__name__} is not compatible with MinSR, "
+                "which requires a dense tangent kernel."
+            )
+        if getattr(solver, "snr_tol", 0):
+            raise ValueError(
+                f"Solver {solver.__class__.__name__} has a non-zero SNR tolerance, "
+                "which is not compatible with MinSR."
+            )
+        self._solver = solver
 
         self._concat = (not psi.holomorphic) and (not psi.realParams)
         num_params = psi.numParameters * (2 if not psi.realParams else 1)
@@ -65,6 +78,19 @@ class MinSR(AbstractOptimizer):
         super().__init__(
             sampler, psi, resample_stepper, use_cross_valiadation=False, output_manager=output_manager
         )
+
+        self._solver_state = dict(
+            exact_sampler=isinstance(self.sampler, ExactSampler),
+            pad_size=0
+        )
+
+    @property
+    def solver_state(self):
+        return self._solver_state
+
+    @property
+    def solver(self):
+        return self._solver
 
     @property
     def diag_shift(self):
@@ -130,8 +156,7 @@ class MinSR(AbstractOptimizer):
             idx = jnp.arange(T.shape[0])
             T = T.at[idx, idx].add(self.diag_shift)
 
-        T = pinvert(T, self.pinv_tol, mode=self._pinv_mode, T_A=self._T_A)
-        T = T @ o_loc
+        T, self._additional_info = self.solver(T, o_loc, **self.solver_state)
 
         if isinstance(objective_function_output.grad_log_psi, SampledObs):
             update = - jnp.conj(jnp.transpose(grad)) @ T
@@ -158,7 +183,7 @@ class MinSR(AbstractOptimizer):
         raise NotImplementedError
     
     def _update_meta_data(self):
-        pass
+        self.meta_data = dict(**self._additional_info)
 
     def _get_tangent_kernel(self, grad_l, grad_r=None):
         """
