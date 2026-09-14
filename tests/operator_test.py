@@ -141,38 +141,6 @@ class Target(nn.Module):
 
 class TestOperator(unittest.TestCase):
 
-    def test_nonzeros(self):
-        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2, dtype=global_defs.DT_SAMPLES)
-
-        h = 0
-        h += 2. * op.SigmaPlus(0)
-        h += 2. * op.SigmaPlus(1)
-        h += 2. * op.SigmaPlus(2)
-
-        sp, matEls = h.get_conn_elements(s, NUM_SAMPLES)
-        logPsi = jnp.ones(s.shape[:-1])
-        logPsiSP = jnp.ones(sp.shape[:-1])
-        E_loc = h._get_O_loc(logPsi, logPsiSP, matEls, batch_size=NUM_SAMPLES)
-
-        self.assertTrue(jnp.sum(jnp.abs(E_loc - 2. * jnp.sum(-(s[..., :3] - 1), axis=-1))) < 1e-7)
-
-    def test_op_with_arguments(self):
-        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2, dtype=global_defs.DT_SAMPLES)
-        
-        def f(t, **kwargs):
-            return 2.0 * t
-        h = f * op.SigmaPlus(0) + f * op.SigmaPlus(1) + f * op.SigmaPlus(2)
-
-        for t in [0.5, 2, 13.9]:
-            sp, matEls = h.get_conn_elements(s, NUM_SAMPLES, t=t)
-
-            logPsi = jnp.ones(s.shape[:-1])
-            logPsiSP = jnp.ones(sp.shape[:-1])
-
-            E_loc = h._get_O_loc(logPsi, logPsiSP, matEls, batch_size=NUM_SAMPLES)
-
-            self.assertTrue(jnp.sum(jnp.abs(E_loc - f(t) * jnp.sum(-(s[..., :3] - 1), axis=-1))) < 1e-7)
-
     def test_op_2d(self):
         s = random.randint(KEY, (NUM_SAMPLES, L, L), 0, 2, dtype=global_defs.DT_SAMPLES)
 

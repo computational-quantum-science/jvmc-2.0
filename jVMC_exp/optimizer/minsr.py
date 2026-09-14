@@ -71,7 +71,7 @@ class MinSR(AbstractOptimizer):
             )
         self._solver = solver
 
-        self._concat = (not psi.holomorphic) and (not psi.realParams)
+        self._concat = (not psi.holomorphic) and (jnp.issubdtype(psi.out_dtype, jnp.complexfloating))
         num_params = psi.numParameters * (2 if not psi.realParams else 1)
         self._params_pad_size = (- num_params) % MESH.shape["devices"]
 

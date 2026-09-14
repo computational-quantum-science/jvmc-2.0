@@ -135,6 +135,8 @@ class OutputManager:
 
     def _append_h5(self, parent, name: str, value: Any) -> None:
         arr = _as_h5_array(value)
+        if arr is None:
+            return
         if isinstance(arr, str):
             arr = np.asarray(arr, dtype=h5py.string_dtype(encoding="utf-8"))
         arr = np.asarray(arr)
