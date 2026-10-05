@@ -12,6 +12,12 @@ def _get_snr(Vtb, Vtb_var, num_samples):
         jnp.abs(num_samples * (jnp.conj(Vtb) * Vtb) / (Vtb_var + 1e-14))
     ).ravel()
 
+@jax.jit
+def _get_snr_gaussian(Vtb, ev, num_samples, var):
+    return jnp.sqrt(
+        jnp.abs(num_samples * (jnp.conj(Vtb) * Vtb) / (jnp.abs(var * ev) + 1e-14))
+    ).ravel()
+
 @jax.jit(static_argnums=(4,))
 def _get_vtb_var(centered_data_1, centered_data_2, weights, eigenvectors, transformation):
     @jax.vmap
@@ -27,6 +33,18 @@ def _get_vtb_var(centered_data_1, centered_data_2, weights, eigenvectors, transf
 
 def _unpad(x, pad_size):
     return x[:-pad_size] if pad_size else x
+
+def _snr_step_gaussian(
+        Vtb, ev, o_loc: SampledObs      
+    ):
+    if o_loc is None: 
+        raise ValueError(
+            "PinvSNR has snr_tol != 0, but o_loc for the "
+            "Pass grad_log_psi, o_loc, and transformation to PinvSNR.__call__, "
+            "or set snr_tol=0 to disable SNR regularization."
+        )
+
+    return _get_snr_gaussian(Vtb, ev, o_loc.effective_num_samples, o_loc.var)
 
 def _snr_step(
         grad_log_psi: SampledObs, o_loc: SampledObs, 
@@ -204,7 +222,8 @@ class PinvSNR(Pinv):
         size is chosen automatically.
     """
     def __init__(
-            self, snr_tol=0, pinv_tol=1e-14, pinv_cutoff=1e-8, 
+            self, snr_tol=0, pinv_tol=1e-14, pinv_cutoff=1e-8,
+            snr_mode: Literal["empiric", "gaussian"] = "empiric", 
             diagonalization_mode: Literal["device", "distributed", "host"] = "device",
             T_A: int | None = None
         ):
@@ -212,6 +231,7 @@ class PinvSNR(Pinv):
 
         self._snr_tol = snr_tol
         self._pinv_tol = pinv_tol
+        self.snr_mode = snr_mode
 
     @property
     def snr_tol(self):
@@ -220,6 +240,23 @@ class PinvSNR(Pinv):
     @property
     def pinv_tol(self):
         return self._pinv_tol
+
+    @property
+    def snr_mode(self):
+        return self._snr_mode
+
+    @snr_mode.setter
+    def snr_mode(self, value: str):
+        if not isinstance(value, str):
+            raise ValueError(
+                f"The snr_mode has to be given as a string. Got {value}"
+            )
+        if value.lower() not in ["empiric", "gaussian"]:
+            raise ValueError(
+                f"The snr_mode can only be 'empiric' or 'gaussian'. Got {value}"
+            )
+
+        self._snr_mode = value.lower()
 
     def __call__(
             self, A, b,
@@ -280,9 +317,14 @@ class PinvSNR(Pinv):
 
         snr = None
         if not exact_sampler and self.snr_tol:
-            snr = _snr_step(
-                grad_log_psi, o_loc, V, Vtb, transformation, pad_size
-            )
+            if self.snr_mode == "empiric":
+                snr = _snr_step(
+                    grad_log_psi, o_loc, V, Vtb, transformation, pad_size
+                )
+            elif self.snr_mode == "gaussian":
+                snr = _snr_step_gaussian(
+                    Vtb, ev, o_loc
+                )
 
         # Discard eigenvalues below numerical precision
         invEv = jnp.where(jnp.abs(ev / ev[-1]) > 1e-14, 1. / ev, 0.)

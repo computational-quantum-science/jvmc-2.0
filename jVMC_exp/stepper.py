@@ -109,7 +109,8 @@ class AbstractAdaptiveStepper(AbstractStepper):
         self.rtol = rtol
         self.atol = atol
 
-        super().__init__(_clip(time_step, self.min_step, self.max_step))
+        super().__init__(time_step)
+        self.dt = _clip(time_step, self.min_step, self.max_step)
 
     @property
     def order(self):
@@ -125,6 +126,12 @@ class AbstractAdaptiveStepper(AbstractStepper):
 
     @min_step.setter
     def min_step(self, value):
+        if value is not None and value < 0:
+            raise ValueError(
+                f"min_step can only take positive values. "
+                f"Got {value}"
+            )
+        
         self._min_step = -1 if value is None else value
 
     @property
@@ -133,6 +140,12 @@ class AbstractAdaptiveStepper(AbstractStepper):
 
     @max_step.setter
     def max_step(self, value):
+        if value is not None and value < 0:
+            raise ValueError(
+                f"max_step can only take positive values. "
+                f"Got {value}"
+            )
+        
         self._max_step = 1e10 if value is None else value
 
     def _adaptive_step_control(self, y_norm, dy_low, dy_high, norm_function):
@@ -164,7 +177,7 @@ class AbstractAdaptiveStepper(AbstractStepper):
         )
         dt_new = self.dt * dt_rescale
 
-        converged = scaled_diff < 1 or dt_new < self.min_step
+        converged = scaled_diff < 1 or self.dt <= self.min_step
 
         return converged, _clip(dt_new, self.min_step, self.max_step)
 

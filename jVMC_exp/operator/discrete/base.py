@@ -3,30 +3,20 @@ from abc import abstractmethod
 import jax
 import jax.numpy as jnp
 from scipy.sparse import coo_matrix
-from functools import partial
 
 from jVMC_exp.vqs import NQS
-from jVMC_exp.sharding_config import sharded, DEVICE_SPEC, REPLICATED_SPEC
+from jVMC_exp.sharding_config import sharded, MESH
 from jVMC_exp.operator.base import AbstractOperator
 
 class Operator(AbstractOperator):
-    def __init__(self, ldim, batch_size=None):
+    def __init__(self, ldim):
         self._ldim = ldim
         self._is_compiled = False
         self._scale = 1
-        self.batch_size = batch_size
 
     @property
     def ldim(self):
         return self._ldim
-
-    @property
-    def batch_size(self):
-        return self._batch_size
-
-    @batch_size.setter
-    def batch_size(self, value):
-        self._batch_size = value or jnp.inf
     
     def __add__(self, other) -> Operator:
         if isinstance(other, (int, float, complex)):
@@ -93,31 +83,33 @@ class Operator(AbstractOperator):
         if not self._is_compiled:
             self._compile()
 
+        # Bound the number of simultaneous network evaluations by psi.batchSize,
+        # i.e. by B = psi.batchSize / n_devices on each device:
+        #   - B >= n_conn: all connected configurations of a sample fit at once,
+        #     so each device processes B // n_conn samples per call.
+        #   - B < n_conn: each device processes a single sample per call and
+        #     evaluates its connected configurations in chunks of B (lax.map).
+        evals_per_device = psi.batchSize // MESH.size
+        chunk_size = max(1, min(self.n_conn, evals_per_device))
+        batch_size = MESH.size * (evals_per_device // chunk_size)
+
         return self._get_O_loc(
             s,
             logPsiS,
             parameters=psi.eval_parameters,
             psi=psi,
-            batch_size=min(psi.batchSize, self.batch_size),
+            chunk_size=chunk_size,
+            batch_size=batch_size,
             **kwargs
         )
 
-    @sharded(static_kwarg_names=("psi",))
-    def _get_O_loc(self, s, log_psi_s, *, parameters, psi: NQS, batch_size, **kwargs):
-        s_p, mat_els = self._get_conn_elements(s, kwargs)
-
-        if psi.eval_ratio:
-            psi_ratio = jax.vmap(
-                partial(psi.apply_fun, method=psi.net.eval_ratio),
-                in_axes=(None, None, 0)
-            )(parameters, s, s_p)
-        else:
-            log_psi_s_p = jax.vmap(psi.apply_fun, in_axes=(None, 0))(parameters, s_p)
-            psi_ratio = jnp.exp(log_psi_s_p - log_psi_s)
-
-        return jnp.sum(psi_ratio * mat_els)
-
     def get_conn_elements(self, s, batch_size, **kwargs):
+        """
+        Return the connected configurations and matrix elements of each sample in ``s``.
+
+        The first entry along the connected axis is ``s`` itself, carrying the sum of
+        all diagonal matrix elements; the remaining ones are the non-diagonal connections.
+        """
         if not self._is_compiled:
             self._compile()
 
@@ -268,17 +260,54 @@ class Operator(AbstractOperator):
 
         return matrix
 
-    @sharded(out_specs=(DEVICE_SPEC, DEVICE_SPEC))
+    @sharded(static_kwarg_names=("psi", "chunk_size"))
+    def _get_O_loc(
+        self, s, log_psi_s, *, 
+        parameters, psi: NQS, chunk_size, batch_size, **kwargs
+    ):
+        s_p, mat_els, mat_el_diag = self._get_conn_elements(s, kwargs)
+
+        # Purely diagonal operator: no network evaluation needed
+        if s_p.shape[0] == 0:
+            return mat_el_diag
+
+        if psi.eval_ratio:
+            psi_ratio = jax.lax.map(
+                lambda x: psi.apply_fun(parameters, s, x, method=psi.net.eval_ratio),
+                s_p, batch_size=chunk_size
+            )
+        else:
+            log_psi_s_p = jax.lax.map(
+                lambda x: psi.apply_fun(parameters, x), s_p, batch_size=chunk_size
+            )
+            psi_ratio = jnp.exp(log_psi_s_p - log_psi_s)
+
+        return mat_el_diag + jnp.sum(psi_ratio * mat_els)
+
+    @sharded()
     def _get_conn_elements_sh(self, s, *, batch_size, **kwargs):
-        return  self._get_conn_elements(s, kwargs)
-        
+        s_p, mat_els, mat_el_diag = self._get_conn_elements(s, kwargs)
+
+        return (
+            jnp.concatenate([s[None], s_p], axis=0),
+            jnp.concatenate([mat_el_diag[None], mat_els], axis=0)
+        )
+
+    @property
+    @abstractmethod
+    def n_conn(self):
+        """
+        Number of non-diagonal connected configurations generated per sample.
+        """
+        pass
+
     @abstractmethod
     def _compile(self):
         """
         Compile the operator into JAX arrays for efficient computation.
         """
         pass
-    
+
     @abstractmethod
     def _get_conn_elements(self, s, kwargs):
         """
@@ -287,7 +316,7 @@ class Operator(AbstractOperator):
 
         This method must return:
         (i) all non-diagonal connected configurations with shape (NumConnectedElements, SampleShape),
-        (ii) their associated matrix elements with shape (SampleShape,), and
+        (ii) their associated matrix elements with shape (NumConnectedElements,), and
         (iii) the total diagonal contribution.
 
         Parameters

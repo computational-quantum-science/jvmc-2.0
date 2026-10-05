@@ -5,7 +5,10 @@ import flax.linen as nn
 import numpy as np
 
 import jVMC_exp.operator.discrete as op
+import jVMC_exp.nets as nets
 from jVMC_exp import global_defs
+from jVMC_exp.vqs import NQS
+from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
 
 L = 4
 LDIM = 2
@@ -267,6 +270,24 @@ class TestOperator(unittest.TestCase):
         H_ref = _reference_spinless_tv(L_chain, t, V, mu)
 
         self.assertTrue(np.allclose(H_jvmc, H_ref))
+
+    def test_O_loc_same_operator_different_states(self):
+        L = 6
+        make_H = lambda: sum(
+            -1.0 * op.SigmaZ(i) * op.SigmaZ((i + 1) % L) - 0.7 * op.SigmaX(i) for i in range(L)
+        )
+        s = random.randint(KEY, (NUM_SAMPLES, L), 0, 2).astype(global_defs.DT_SAMPLES)
+        # Different architectures and batch sizes, so the operator must not reuse
+        # the function compiled for the first state
+        psi_a = NQS(nets.CpxRBM(numHidden=4, bias=True), L, 8, seed=1)
+        psi_b = NQS(nets.CpxRBM(numHidden=8, bias=True), L, 4, seed=2)
+        psi_c = NQS(nets.CpxRBM(numHidden=4, bias=True), L, 8, seed=3, orbit=square_translation_symmetry(L, 1, "spin"))
+
+        H = make_H()
+        for psi in (psi_a, psi_b, psi_c, psi_a):
+            O_loc = H.get_O_loc(s, psi)
+            O_loc_ref = make_H().get_O_loc(s, psi)
+            self.assertTrue(np.allclose(O_loc, O_loc_ref))
 
 if __name__ == "__main__":
     unittest.main()

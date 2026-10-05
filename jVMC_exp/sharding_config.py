@@ -218,9 +218,11 @@ class sharded:
         if not hasattr(instance, '_sharded_cache'):
             instance._sharded_cache = {}
 
-        method_name = method.__name__
+        # Static kwargs are baked into the compiled function, so they are part of the key
+        static_kwargs = {k: v for k, v in kwargs.items() if k in self.static_kwarg_names}
+        cache_key = (method.__name__, tuple(sorted(static_kwargs.items())))
 
-        if method_name not in instance._sharded_cache:
+        if cache_key not in instance._sharded_cache:
             if self.in_specs is None:
                 self.in_specs = (DEVICE_SPEC,) * len(args)
             elif len(self.in_specs) != len(args):
@@ -240,11 +242,10 @@ class sharded:
                 raise ValueError(f"The batch size ({kwargs['batch_size']}) "
                                  f"has to be divisible by the number of devices ({MESH.size})")
 
-            static_kwargs = {k: v for k, v in kwargs.items() if k in self.static_kwarg_names}
             base_fn = lambda kw, *a: method(instance, *a, **kw, **static_kwargs)
-            instance._sharded_cache[method_name] = self._create_sharded_versions(base_fn)
+            instance._sharded_cache[cache_key] = self._create_sharded_versions(base_fn)
 
-        return instance._sharded_cache[method_name]['jsh']
+        return instance._sharded_cache[cache_key]['jsh']
 
     def _create_sharded_versions(self, base_fn):
         vmapd_fn = jax.vmap(

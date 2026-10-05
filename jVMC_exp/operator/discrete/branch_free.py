@@ -77,6 +77,13 @@ class Operator(BaseOperator):
     @property
     def diag(self):
         return self._diag
+
+    @property
+    def n_conn(self):
+        if not self._is_compiled:
+            self._compile()
+
+        return self._n_conn
     
     @property
     @abstractmethod
@@ -214,6 +221,7 @@ class Operator(BaseOperator):
         self.nondiagC = ~self.diagC
         self.first_diag_idx = jnp.where(self.diagC)[0][0] if jnp.any(self.diagC) else jnp.zeros((len(self.diagC)), dtype=jnp.bool_)
         self.prefactorsC = prefactors
+        self._n_conn = sum(not d for d in diagonal)
         self._is_compiled = True
 
     def _get_conn_elements(self, s, kwargs):
@@ -266,14 +274,11 @@ class Operator(BaseOperator):
             s, sting_ids, self.idxC, self.mapC, self.matElsC, self.fermionicC, self.spinC, self.spinfulC
         )
         
-        mat_els_diag = jnp.sum(mat_els[self.diagC])
+        mat_el_diag = jnp.sum(mat_els[self.diagC])
         s_p_nondiag = s_p[self.nondiagC]
         mat_els_nondiag = mat_els[self.nondiagC]
 
-        s_p_out = jnp.concatenate([s.reshape(1, *sampleShape), s_p_nondiag], axis=0)
-        mat_els_out = jnp.concatenate([mat_els_diag[None], mat_els_nondiag], axis=0)
-
-        return s_p_out, mat_els_out
+        return s_p_nondiag, mat_els_nondiag, mat_el_diag
     
     @classmethod
     def _create_composite(cls, O_1, O_2, label):
