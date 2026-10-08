@@ -494,6 +494,19 @@ class NQS:
         return self.flat_gradient_function(self.apply_fun, parameters, s)
     
     def lazy_gradients(self, s):
+        """
+        Lazy version of `gradients`: an iterable that computes the gradients one batch of
+        ``batchSize`` configurations at a time, every time it is iterated.
+
+        On more than one device a batch does not consist of consecutive configurations.
+        To line up another array with the batches, split it with the ``layout`` of the
+        returned iterable, e.g. ``lazy.layout.split(pad_to_devices(weights))``: if the number
+        of configurations is not divisible by the number of devices, the configurations are
+        zero padded and the batches include the gradients of the padding configurations.
+
+        Args:
+            * ``s``: Array of computational basis states.
+        """
         return self._lazy_gradients_sh(s, parameters=self.grad_parameters, batch_size=self.batchSize)
     
     @sharded(automatic_sharding=True, yield_iter=True)

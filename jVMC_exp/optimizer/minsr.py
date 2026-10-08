@@ -4,29 +4,35 @@ from typing import Callable
 
 from jVMC_exp.sampler.base import AbstractSampler
 from jVMC_exp.sampler import ExactSampler
-from jVMC_exp.stats import SampledObs, _reshape_in_batches
+from jVMC_exp.stats import SampledObs
 from jVMC_exp.vqs import NQS
 from jVMC_exp.optimizer.base import AbstractOptimizer
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput, AbstractObjectiveFunction
-from jVMC_exp.sharding_config import sharded, MESH
+from jVMC_exp.sharding_config import sharded, MESH, REPLICATED_SHARDING
 from jVMC_exp.util import OutputManager
 from jVMC_exp.solver.base import AbstractSolver
 from jVMC_exp.solver import Pinv
 
-@jax.jit
-def _concat_nonholo(arr):
+def _interleave_re_im(arr):
     """
-    Returns a real array correctly sharded on the first dimension
+    Real array of shape (2N, ...) with the real and imaginary part of each row of ``arr`` next
+    to each other to reduce device communication.
     """
-    return jnp.concatenate([jnp.real(arr), jnp.imag(arr)], axis=0)
+    return jnp.stack([jnp.real(arr), jnp.imag(arr)], axis=1).reshape((2 * arr.shape[0],) + arr.shape[1:])
+
+_concat_nonholo = jax.jit(_interleave_re_im)
 
 @jax.jit(static_argnums=(3,))
 def _normalize_batch(batch, weights, mean, concat):
     batch = jnp.einsum("i, i... -> i...", jnp.sqrt(weights), batch - mean)
     if concat:
-        batch = jnp.concatenate([jnp.real(batch), jnp.imag(batch)], axis=0)
+        batch = _interleave_re_im(batch)
 
     return batch
+
+@jax.jit
+def _take_columns(matrix, positions):
+    return jnp.take(matrix, positions, axis=1)
 
 class MinSR(AbstractOptimizer):
     """
@@ -122,54 +128,54 @@ class MinSR(AbstractOptimizer):
             )
 
         if isinstance(objective_function_output.grad_log_psi, SampledObs):
-            grad = objective_function_output.grad_log_psi._normalized_obs 
+            grad = objective_function_output.grad_log_psi._normalized_obs
             if self._concat:
                 grad = _concat_nonholo(grad)
-                o_loc = _concat_nonholo(o_loc)
 
             T = self._get_tangent_kernel(grad)
 
         else:
+            # T is assembled with rows and columns in the original sample order (with the real
+            # and imaginary rows of each sample next to each other if self._concat), like o_loc.
+            # Each row block is written in place on the devices that hold its samples.
             grad = objective_function_output.grad_log_psi
-            T = []
-            o_loc_batch = []
-            start = 0
-            for batch_l, weights_l in zip(grad.observations, grad._weights):
-                batch_l = _normalize_batch(batch_l, weights_l, grad.mean, self._concat)
-    
-                if self._concat:
-                    size = weights_l.shape[0]
-                    o_loc_batch.append(_concat_nonholo(o_loc[start:start + size]))
-                    start += size
-    
-                T_batch = []
-                for batch_r, weights_r in zip(grad.observations, grad._weights):
-                    batch_r = _normalize_batch(batch_r, weights_r, grad.mean, self._concat)
-                    T_batch.append(self._get_tangent_kernel(batch_l, batch_r))
+            layout = grad.layout.scaled(2 if self._concat else 1)
+            positions = jax.device_put(layout.batch_positions(), REPLICATED_SHARDING)
+            T = None
+            batches_l = iter(grad.observations)
+            for l, weights_l in enumerate(grad._weights):
+                batch_l = _normalize_batch(next(batches_l), weights_l, grad.mean, self._concat)
 
-                T.append(jnp.concatenate(T_batch, axis=1))
-    
-            T = jnp.concatenate(T)
-            o_loc = jnp.concatenate(o_loc_batch) if self._concat else o_loc
+                T_row = []
+                batches_r = iter(grad.observations)
+                for weights_r in grad._weights:
+                    batch_r = _normalize_batch(next(batches_r), weights_r, grad.mean, self._concat)
+                    T_row.append(self._get_tangent_kernel(batch_l, batch_r))
+                # The columns come in batch order: move them to the original sample order
+                T_row = _take_columns(jnp.concatenate(T_row, axis=1), positions)
+
+                if T is None:
+                    T = layout.alloc(T_row)
+                T = layout.put(T, T_row, l)
+
+        if self._concat:
+            o_loc = _concat_nonholo(o_loc)
 
         if self.diag_shift > 1e-15:
             idx = jnp.arange(T.shape[0])
             T = T.at[idx, idx].add(self.diag_shift)
 
-        T, self._additional_info = self.solver(T, o_loc, **self.solver_state)
+        solution, self._additional_info = self.solver(T, o_loc, **self.solver_state)
+        del T
 
         if isinstance(objective_function_output.grad_log_psi, SampledObs):
-            update = - jnp.conj(jnp.transpose(grad)) @ T
+            update = - jnp.conj(jnp.transpose(grad)) @ solution
         else:
-            T = _reshape_in_batches(
-                T,
-                grad._batch_size if self.psi.holomorphic else 2 * grad._batch_size
-            )
-    
             update = 0
-            for grad_batch, weights, T_batch in zip(grad.observations, grad._weights, T):
-                grad_batch = _normalize_batch(grad_batch, weights, grad.mean, self._concat)
-                update -= jnp.conj(jnp.transpose(grad_batch)) @ T_batch
+            batches = iter(grad.observations)
+            for weights, solution_batch in zip(grad._weights, layout.split(solution)):
+                grad_batch = _normalize_batch(next(batches), weights, grad.mean, self._concat)
+                update -= jnp.conj(jnp.transpose(grad_batch)) @ solution_batch
 
         if self._params_pad_size != 0:
             objective_function_output.grad_log_psi.transform(

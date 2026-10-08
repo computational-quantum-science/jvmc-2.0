@@ -1,5 +1,7 @@
 import unittest
+import jax
 import jax.numpy as jnp
+import flax.linen as nn
 import numpy as np
 
 import jVMC_exp
@@ -7,6 +9,8 @@ import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
 import jVMC_exp.operator.discrete as op
 import jVMC_exp.sampler as sampler
+from jVMC_exp.stats import SampledObs, LazySampledObs
+from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
 
 class TestGsSearch(unittest.TestCase):
     def test_gs_search_cpx(self):
@@ -56,7 +60,7 @@ class TestGsSearchBatchedJacobian(unittest.TestCase):
         hx = -0.3
         exE = -4.09296160
 
-        batch_size = 6
+        batch_size = 3 * jax.device_count()
         learning_rate = 1e-2
         num_steps = 300
 
@@ -79,6 +83,69 @@ class TestGsSearchBatchedJacobian(unittest.TestCase):
         E = exact_sampler(H)
         eps_rel = jnp.abs((E.mean.item() - exE) / exE)
         self.assertTrue(eps_rel < 1e-3)
+
+class _RealParamsComplexOut(nn.Module):
+    """Real parameters and a complex output, i.e. a non-holomorphic network"""
+    @nn.compact
+    def __call__(self, s):
+        x = nn.Dense(3)(2 * s.ravel() - 1)
+        return jnp.sum(jnp.log(jnp.cosh(x))) + 1j * jnp.sum(nn.Dense(1)(x))
+
+class TestUpdateBatchedJacobian(unittest.TestCase):
+    """
+    A single MinSR update from a batched (lazy) Jacobian must equal the update from the
+    dense Jacobian. The batches are uneven and, on more than one device, do not consist of
+    consecutive samples, so this checks that the tangent kernel, the local energies and the
+    solution are lined up sample by sample, for real, holomorphic and non-holomorphic networks.
+    """
+    def test_update_matches_dense(self):
+        L = 4
+        H = 0
+        for l in range(L):
+            H += -1.0 * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) - 0.7 * op.SigmaX(l)
+
+        for name, net in (
+            ("real", nets.RBM(numHidden=3, bias=True)),
+            ("holomorphic", nets.CpxRBM(numHidden=3, bias=True)),
+            ("non-holomorphic", _RealParamsComplexOut()),
+        ):
+            with self.subTest(net=name):
+                psi = NQS(net, L, 3 * jax.device_count(), seed=1234)
+                exact_sampler = sampler.ExactSampler(psi)
+                opt = jVMC_exp.optimizer.MinSR(
+                    exact_sampler, psi, solver=jVMC_exp.solver.Pinv(pinv_cutoff=1e-8), diagonalShift=1e-3
+                )
+
+                updates = []
+                for batched_jacobian in (False, True):
+                    loss_function = jVMC_exp.objective_function.Observable(H, batched_jacobian=batched_jacobian)
+                    updates.append(opt.get_update(loss_function.value_and_grad(exact_sampler)))
+
+                self.assertTrue(np.allclose(updates[0], updates[1], atol=1e-10), name)
+
+    @unittest.skipIf(jax.device_count() == 1, "Every number of samples is divisible by one device")
+    def test_update_matches_dense_indivisible_samples(self):
+        """
+        A number of samples that is not divisible by the number of devices is padded with
+        zero-weight samples, both by SampledObs and by the batched Jacobian.
+        """
+        L = 4
+        num_samples = 5 * jax.device_count() + 1
+        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(0), 4)
+        s = jax.random.randint(k1, (num_samples, L), 0, 2).astype(jVMC_exp.global_defs.DT_SAMPLES)
+        weights = jax.random.uniform(k2, (num_samples,))
+        o_loc = SampledObs(jax.random.normal(k3, (num_samples,)) + 1j * jax.random.normal(k4, (num_samples,)), weights)
+
+        for name, net in (("holomorphic", nets.CpxRBM(numHidden=3, bias=True)), ("non-holomorphic", _RealParamsComplexOut())):
+            with self.subTest(net=name):
+                psi = NQS(net, L, 2 * jax.device_count(), seed=1234)
+                opt = jVMC_exp.optimizer.MinSR(
+                    sampler.ExactSampler(psi), psi, solver=jVMC_exp.solver.Pinv(pinv_cutoff=1e-8), diagonalShift=1e-3
+                )
+                dense = ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=SampledObs(psi.gradients(s), weights))
+                lazy = ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=LazySampledObs(psi.lazy_gradients(s), weights))
+
+                self.assertTrue(np.allclose(opt.get_update(dense), opt.get_update(lazy), atol=1e-10), name)
 
 class TestPinvSolve(unittest.TestCase):
     """

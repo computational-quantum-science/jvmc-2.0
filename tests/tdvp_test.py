@@ -1,4 +1,5 @@
 import unittest
+import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import interp1d
@@ -158,7 +159,7 @@ class TestTimeEvolutionBatchedJacobian(unittest.TestCase):
             return np.array(out['energy']['mean'])
 
         energy_dense = run(batch_size=2 ** L, batched_jacobian=False)
-        energy_lazy = run(batch_size=6, batched_jacobian=True)
+        energy_lazy = run(batch_size=3 * jax.device_count(), batched_jacobian=True)
 
         self.assertTrue(np.allclose(energy_dense, energy_lazy, atol=1e-6))
 

@@ -18,6 +18,8 @@ from jVMC_exp.objective_function import (
 
 L = 4 
 N_SAMPLES = 16
+# 3 samples per device and batch: the last batch over N_SAMPLES is never full
+LAZY_BATCH_SIZE = 3 * jax.device_count()
 
 def build_sampler(batch_size=N_SAMPLES):
     model = jVMC_exp.nets.CpxRBM(1, True)
@@ -114,12 +116,12 @@ class TestParametricObservable(unittest.TestCase):
 class TestObservableBatchedJacobian(unittest.TestCase):
     """
     batched_jacobian=True routes grad_log_psi through LazySampledObs
-    (batches of 6 over N_SAMPLES=16 -> uneven [6, 6, 4]) instead of a
+    (batches of 3 samples per device over N_SAMPLES=16 -> uneven) instead of a
     materialized Jacobian. The physics must be identical either way.
     """
     @classmethod
     def setUpClass(cls):
-        cls.sampler, cls.psi = build_sampler(batch_size=6)
+        cls.sampler, cls.psi = build_sampler(batch_size=LAZY_BATCH_SIZE)
         cls.hamiltonian = build_hamiltonian()
 
     def test_grad_log_psi_is_lazy(self):
@@ -136,7 +138,7 @@ class TestObservableBatchedJacobian(unittest.TestCase):
 class TestEstimatorBatchedJacobian(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.sampler, cls.psi = build_sampler(batch_size=6)
+        cls.sampler, cls.psi = build_sampler(batch_size=LAZY_BATCH_SIZE)
 
     def test_matches_dense_estimator(self):
         dense_out = Estimator(dummy_estimator_fn, batched_jacobian=False).value_and_grad(self.sampler)
@@ -147,7 +149,7 @@ class TestEstimatorBatchedJacobian(unittest.TestCase):
 class TestParametricObservableBatchedJacobian(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.sampler, cls.psi = build_sampler(batch_size=6)
+        cls.sampler, cls.psi = build_sampler(batch_size=LAZY_BATCH_SIZE)
         cls.sigma_z_0 = op.SigmaZ(0)
 
     def test_grad_log_psi_is_lazy(self):

@@ -482,7 +482,8 @@ class Evolution(AbstractOptimizer):
         S = self._lhs_trans_fn(S)
 
         if self.diag_scale > 1e-15:
-            S = S + jnp.diag(self.diag_scale * jnp.diag(S))
+            idx = jnp.arange(S.shape[0] - self._params_pad_size)
+            S = S.at[idx, idx].multiply(1 + self.diag_scale)
         if self.diag_shift > 1e-15:
             idx = jnp.arange(S.shape[0] - self._params_pad_size)
             S = S.at[idx, idx].add(self.diag_shift)

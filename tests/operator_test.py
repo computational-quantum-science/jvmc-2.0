@@ -7,6 +7,7 @@ import numpy as np
 import jVMC_exp.operator.discrete as op
 import jVMC_exp.nets as nets
 from jVMC_exp import global_defs
+from jVMC_exp.sharding_config import distribute
 from jVMC_exp.vqs import NQS
 from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
 
@@ -227,7 +228,7 @@ class TestOperator(unittest.TestCase):
     ########################################################################
     def test_spinless_fermionic_onsite_anticommutators(self):
         anti = op.Creation(0) * op.Annihilation(0) + op.Annihilation(0) * op.Creation(0)
-        sp, matEls = anti.get_conn_elements(jnp.array([[0], [1]], dtype=global_defs.DT_SAMPLES), 4)
+        sp, matEls = anti.get_conn_elements(jnp.array([[0], [1]], dtype=global_defs.DT_SAMPLES), distribute(2))
         loc = jnp.sum(matEls, axis=1)
         self.assertTrue(jnp.allclose(loc, jnp.ones(2)))
 
@@ -245,7 +246,7 @@ class TestOperator(unittest.TestCase):
             + op.Creation(1) * op.Creation(0)
         )
 
-        _, matEls = anti.get_conn_elements(s, s.shape[0])
+        _, matEls = anti.get_conn_elements(s, distribute(s.shape[0]))
         loc = jnp.sum(matEls, axis=1)
 
         self.assertTrue(jnp.allclose(loc, jnp.zeros(s.shape[0])))

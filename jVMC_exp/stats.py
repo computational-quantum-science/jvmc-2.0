@@ -3,24 +3,7 @@ import jax
 import jax.numpy as jnp
 from functools import partial, cached_property
 
-from jVMC_exp.sharding_config import DEVICE_SHARDING, MESH, SizedIterable
-from jVMC_exp.sharding_config import SizedIterable
-
-def _reshape_in_batches(data, batch_size: int):
-    num_samples = data.shape[0]
-    append = (-num_samples) % batch_size
-    if append:
-        data = jnp.pad(data, ((0, append),) + ((0, 0),) * (data.ndim - 1), constant_values=0)
-    n_batches = data.shape[0] // batch_size
-
-    batched_data = []
-    for i in range(n_batches):
-        batch = data[i * batch_size:(i + 1) * batch_size]
-        if i == n_batches - 1 and append:
-            batch = batch[:batch_size - append]
-        batched_data.append(jax.device_put(batch, DEVICE_SHARDING))
-
-    return batched_data
+from jVMC_exp.sharding_config import DEVICE_SHARDING, MESH, SizedIterable, pad_to_devices
 
 @jax.jit
 def _get_mean(data, weights):
@@ -310,28 +293,35 @@ class LazySampledObs():
         """
         Args:
             * ``observations``: Batched, lazily (re)computed observations.
-                Its ``batch_size`` (e.g. set by `sharded(..., yield_iter=True)`)
-                is reused to split `weights` into batches that line up
-                exactly with observations' -- a target batch *count* isn't
-                enough for this, since e.g. splitting 20 samples into 4 equal
-                batches ([5,5,5,5]) is a different partition than a
-                batch_size=6 iterable's ([6,6,6,2]).
+                Its ``layout`` (set by `sharded(..., yield_iter=True)`) defines which
+                samples make up each batch. It is reused to split `weights`, and any
+                other full-length array, into batches that line up exactly with the
+                observations'. On more than one device a batch does not consist of
+                consecutive samples, see `jVMC_exp.sharding_config.BatchLayout`.
             * ``weights``: Full-length weights array, matching `observations`
                 sample-for-sample.
         """
         if weights is None:
             raise ValueError("LazySampledObs require weights to be an array")
+        if not isinstance(observations, SizedIterable) or observations.layout is None:
+            raise ValueError("Observations must be a SizedIterable with a BatchLayout")
+        self._layout = observations.layout
+        
+        # Like the observations, the weights are padded to a multiple of the number of devices.
+        # The padding samples get zero weight and do not contribute to any estimate.
+        num_padded = len(pad_to_devices(weights))
+        if num_padded != self._layout.num_samples or len(observations) != self._layout.n_batches:
+            raise ValueError(
+                f"Got {len(weights)} weights and {len(observations)} batches of observations, "
+                f"but the layout describes {self._layout.num_samples} samples "
+                f"in {self._layout.n_batches} batches."
+            )
         weights /= jnp.sum(weights)
         self._num_samples = len(weights)
         self._batch_size = observations.batch_size
 
-        self._weights = _reshape_in_batches(weights, self._batch_size)
-        if len(self._weights) != len(observations):
-            raise ValueError(
-                f"observations.batch_size={self._batch_size} splits {self._num_samples} weights "
-                f"into {len(self._weights)} batches, but observations has {len(observations)} "
-                "batches -- they must be built with the same batch_size."
-            )
+        self._full_weights = jax.device_put(pad_to_devices(weights), DEVICE_SHARDING)
+        self._weights = self._layout.split(self._full_weights)
         self.observations = observations
 
     @property
@@ -353,8 +343,12 @@ class LazySampledObs():
                 self.__dict__.pop(name, None)
     
     @property
+    def layout(self):
+        return self._layout
+
+    @property
     def weights(self):
-        return jnp.concatenate(self._weights)
+        return self._full_weights
     
     @cached_property
     def mean(self):
@@ -396,7 +390,7 @@ class LazySampledObs():
             return (covar - jnp.tensordot(jnp.conj(mean), mean, axes=0)).squeeze()
 
         elif isinstance(other, SampledObs):
-            normalized_obs_other = _reshape_in_batches(other._normalized_obs, self._batch_size)
+            normalized_obs_other = self._layout.split(other._normalized_obs)
 
             for batch, weights, batch_other in zip(self._observations, self._weights, normalized_obs_other):
                 batch = _normalize_no_center(batch, weights)
@@ -405,6 +399,11 @@ class LazySampledObs():
             return covar.squeeze()
 
         elif isinstance(other, LazySampledObs):
+            if other._layout != self._layout:
+                raise ValueError(
+                    f"Both LazySampledObs must be batched with the same layout, "
+                    f"got {self._layout} and {other._layout}"
+                )
             mean_1 = 0
             mean_2 = 0
             for batch_1, weights_1, batch_2, weights_2 in zip(self._observations, self._weights, other._observations, other._weights):
@@ -427,8 +426,12 @@ class LazySampledObs():
             raise NotImplementedError(
                 "A linear map can't be applied without materializing all the observables"
             )
-        
+
         jitted_fn = jax.jit(element_wise_fn)
         iterable = self._observations
-        transormed_iterable = lambda: (jitted_fn(batch) for batch in iterable)
-        self.observations = SizedIterable(transormed_iterable, iterable.n_iterations, iterable.batch_size)
+        self.observations = SizedIterable(
+            lambda: map(jitted_fn, iterable), 
+            iterable.n_iterations, 
+            iterable.batch_size, 
+            iterable.layout
+        )

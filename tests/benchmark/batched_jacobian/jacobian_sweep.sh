@@ -1,19 +1,25 @@
-
 #!/usr/bin/env bash
 set -uo pipefail
 cd "$(dirname "$0")"
 
-N_BATCHES_LIST=(1 2 4 8)
+N_BATCHES_LIST=(1 2 4 8 16)
 QUANTITIES=(force qgt)
+# Every sweep writes to a new folder, so that results of different runs are never mixed
+OUT_DIR="results_$(date +%Y%m%d_%H%M%S)"
+
+run() {
+    echo "=== $* ==="
+    if ! python batched_jacobian.py "$@" --out_dir "$OUT_DIR"; then
+        echo "    FAILED ($*) -- continuing"
+    fi
+}
 
 for quantity in "${QUANTITIES[@]}"; do
-    echo "=== quantity=$quantity  jacobian=dense  n_batches=1 ==="
-    python batched_jacobian.py dense --n_batches 1 --quantity "$quantity"
+    run dense --n_batches 1 --quantity "$quantity"
 
     for n_batches in "${N_BATCHES_LIST[@]}"; do
-        echo "=== quantity=$quantity  jacobian=batched  n_batches=$n_batches ==="
-        if ! python batched_jacobian.py batched --n_batches "$n_batches" --quantity "$quantity"; then
-            echo "    FAILED (quantity=$quantity jacobian=batched n_batches=$n_batches) -- continuing"
-        fi
+        run batched --n_batches "$n_batches" --quantity "$quantity"
     done
 done
+
+python plot_jacobian.py "$OUT_DIR"

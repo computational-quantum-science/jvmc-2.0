@@ -275,11 +275,11 @@ class Operator(AbstractOperator):
             psi_ratio = jax.lax.map(
                 lambda x: psi.apply_fun(parameters, s, x, method=psi.net.eval_ratio),
                 s_p, batch_size=chunk_size
-            )
+            ).astype(psi.out_dtype)
         else:
             log_psi_s_p = jax.lax.map(
                 lambda x: psi.apply_fun(parameters, x), s_p, batch_size=chunk_size
-            )
+            ).astype(psi.out_dtype)
             psi_ratio = jnp.exp(log_psi_s_p - log_psi_s)
 
         return mat_el_diag + jnp.sum(psi_ratio * mat_els)
