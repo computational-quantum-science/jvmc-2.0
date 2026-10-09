@@ -18,7 +18,12 @@ from jVMC_exp.util import ObservableEntry, measure
 from jVMC_exp.solver.base import AbstractSolver
 from jVMC_exp.solver.pinv import PinvSNR
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
-from jVMC_exp.sharding_config import sharded, MESH
+from jVMC_exp.sharding_config import sharded, MESH, DEVICE_SHARDING
+
+def _init_qgt(grad_log_psi):
+    n_params = grad_log_psi.shape[1]
+
+    return jnp.zeros((n_params, n_params), grad_log_psi.dtype, device=DEVICE_SHARDING)
 
 class AbstractOptimizer(ABC):
     def __init__(
@@ -312,7 +317,9 @@ class Evolution(AbstractOptimizer):
 
         double_params = (not psi.realParams) and (not psi.holomorphic)
         num_params = psi.numParameters * (2 if double_params  else 1)
-        self._params_pad_size = (- num_params) % MESH.shape["devices"]
+        # S is built one block of rows per device at a time (see _add_qgt),
+        # which needs the number of parameters to be divisible by the number of devices squared
+        self._params_pad_size = (- num_params) % MESH.shape["devices"] ** 2
         self._pad_obs = jax.jit(
             lambda x: jnp.pad(x, ((0, 0), (0, self._params_pad_size)), mode="constant")
         )
@@ -429,7 +436,11 @@ class Evolution(AbstractOptimizer):
             objective_fn_out_2.grad = self._remove_double_fn(objective_fn_out_2.grad)
         F2 = self._get_rhs(objective_fn_out_2.grad)
         S2 = self._get_lhs(objective_fn_out_2.grad_log_psi)
-        Sv = S2(update_1) if callable(S2) else S2.dot(update_1)
+        if callable(S2):
+            Sv = S2(update_1)
+        else:
+            Sv = S2.dot(jnp.pad(update_1, (0, self._params_pad_size)))
+            Sv = Sv[:-self._params_pad_size] if self._params_pad_size else Sv
         validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / residual
 
         crossValidationFactor_residual = validation_residual
@@ -463,22 +474,33 @@ class Evolution(AbstractOptimizer):
             grad_log_psi.transform(self._pad_obs)
         
         if isinstance(grad_log_psi, SampledObs):
-            S = self._get_qgt(grad_log_psi._normalized_obs, batch_size=None)
+            S = self._add_qgt(
+                _init_qgt(grad_log_psi._normalized_obs), 
+                grad_log_psi._normalized_obs,
+                batch_size=None
+            )
         else:
             mean = 0
-            S = 0
-            for batch, weights in zip(grad_log_psi._observations, grad_log_psi._weights):
-                batch, batch_mean = self._weight_and_mean(batch, weights, batch_size=None)
+            S = None
+            batches = iter(grad_log_psi._observations)
+            for weights in grad_log_psi._weights:
+                batch, batch_mean = self._weight_and_mean(
+                    next(batches), weights, batch_size=None
+                )
                 mean += batch_mean
-                S += self._get_qgt(batch, batch_size=None)
-            del batch
-    
-            S = S - jnp.tensordot(jnp.conj(mean), mean, axes=0)
+
+                if S is None:
+                    S = _init_qgt(batch)
+                S = self._add_qgt(S, batch, batch_size=None)
+
+                del batch
+
+            S = self._subtract_mean_outer(S, mean, batch_size=None)
 
         if self._params_pad_size != 0:
             grad_log_psi.transform(self._unpad_obs)
 
-        self._S0 = S
+        self._S0 = S # TODO: Do we really need to store this?
         S = self._lhs_trans_fn(S)
 
         if self.diag_scale > 1e-15:
@@ -490,14 +512,46 @@ class Evolution(AbstractOptimizer):
 
         return S
 
-    @sharded(use_vmap=False)
-    def _get_qgt(self, grad_log_psi, *, batch_size):
+    @sharded(use_vmap=False, donate_argnums=1)
+    def _add_qgt(self, S, grad_log_psi, *, batch_size):
         """
-        Return the quantum geometric tensor, sharded accross devices on the first axis.
+        Returns ``S + conj(grad_log_psi).T @ grad_log_psi``, with ``S`` sharded across devices
+        on the first axis. ``S`` is donated, so it is updated in place.
+
+        Each device sums over its own samples, and the partial sums are reduced across devices
+        one block of rows at a time: the partial sum of a block has as many rows as the share
+        of ``S`` of one device, so no device ever holds a matrix of the size of the full ``S``.
+        The number of parameters has to be divisible by the number of devices squared.
         """
-        local = jnp.tensordot(jnp.conj(grad_log_psi), grad_log_psi, axes=(0, 0))
-    
-        return jax.lax.psum_scatter(local, "devices", scatter_dimension=0, tiled=True)
+        n_devices = MESH.size
+        n_samples, n_params = grad_log_psi.shape
+        block = n_params // n_devices**2
+        grad_blocks = grad_log_psi.reshape(n_samples, n_devices, n_devices, block)
+
+        def add_block(j, S):
+            # Block j of the rows of every device, in device order
+            rows = jax.lax.dynamic_index_in_dim(grad_blocks, j, axis=2, keepdims=False)
+            local = jnp.tensordot(
+                jnp.conj(rows.reshape(n_samples, n_devices * block)), 
+                grad_log_psi, 
+                axes=(0, 0)
+            )
+            local = jax.lax.psum_scatter(local, "devices", scatter_dimension=0, tiled=True)
+            S_block = jax.lax.dynamic_slice_in_dim(S, j * block, block, axis=0)
+
+            return jax.lax.dynamic_update_slice_in_dim(S, S_block + local, j * block, axis=0)
+
+        return jax.lax.fori_loop(0, n_devices, add_block, S)
+
+    @sharded(use_vmap=False, donate_argnums=1)
+    def _subtract_mean_outer(self, S, mean, *, batch_size):
+        """
+        Returns ``S - outer(conj(mean), mean)``, with ``S`` and ``mean`` sharded across devices
+        on the first axis. ``S`` is donated, so it is updated in place.
+        """
+        full_mean = jax.lax.all_gather(mean, "devices", tiled=True)
+
+        return S - jnp.outer(jnp.conj(mean), full_mean)
 
     @sharded(use_vmap=False)
     def _weight_and_mean(self, batch, weights, *, batch_size):

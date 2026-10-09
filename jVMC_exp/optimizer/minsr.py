@@ -34,6 +34,65 @@ def _normalize_batch(batch, weights, mean, concat):
 def _take_columns(matrix, positions):
     return jnp.take(matrix, positions, axis=1)
 
+def _redistribute(grad):
+    """
+    Turns the local block of ``grad``, sharded along the sample axis, into all its samples
+    and this device's shard of the parameters.
+    """
+    return jax.lax.all_to_all(grad, 'devices', split_axis=1, concat_axis=0, tiled=True)
+
+def _row_blocks(n_local_rows):
+    """
+    Number of blocks in which the rows of the tangent kernel owned by a device are computed:
+    the largest number not larger than the number of devices that divides ``n_local_rows``.
+    """
+    return max(k for k in range(1, MESH.size + 1) if n_local_rows % k == 0)
+
+def _blockwise_tangent_kernel(grad_l, grad_r=None):
+    """
+    Rows of ``grad_l @ conj(grad_r).T`` owned by this device, where ``grad_l`` and ``grad_r``
+    are the local blocks of matrices sharded along the sample axis. ``grad_r=None`` means
+    ``grad_r = grad_l``.
+
+    After `_redistribute`, each device holds a partial sum over its own shard of the
+    parameters, and the partial sums are reduced across devices one block of rows at a time.
+    With as many blocks as devices, the partial sum of a block has as many rows as the share
+    of the kernel of one device, so no device ever holds a matrix of the size of the full kernel.
+    """
+    n_devices = MESH.size
+    n_local_rows, n_params = grad_l.shape
+    n_blocks = _row_blocks(n_local_rows)
+    block = n_local_rows // n_blocks
+    dtype = jnp.result_type(grad_l, grad_l if grad_r is None else grad_r)
+
+    if grad_r is None:
+        grad_r = _redistribute(grad_l)
+        grad_blocks = grad_r.reshape(n_devices, n_blocks, block, grad_r.shape[1])
+        block_rows = lambda j: jax.lax.dynamic_index_in_dim(
+            grad_blocks, j, axis=1, keepdims=False
+        ).reshape(n_devices * block, grad_r.shape[1])
+    else:
+        grad_r = _redistribute(grad_r)
+        # Redistributing grad_l one block at a time avoids holding all of it, redistributed,
+        # next to grad_r. Block j of the rows of every device arrives in device order.
+        grad_blocks = grad_l.reshape(n_blocks, block, n_params)
+        block_rows = lambda j: _redistribute(
+            jax.lax.dynamic_index_in_dim(grad_blocks, j, axis=0, keepdims=False)
+        )
+
+    def add_block(j, T):
+        # conj(grad_l) @ grad_r.T is the complex conjugate of the kernel: conjugating the
+        # reduced block, instead of grad_r, avoids a copy of grad_r
+        local = jax.lax.dot_general(jnp.conj(block_rows(j)), grad_r, (((1,), (1,)), ((), ())))
+        local = jnp.conj(jax.lax.psum_scatter(local, 'devices', scatter_dimension=0, tiled=True))
+
+        return jax.lax.dynamic_update_slice_in_dim(T, local, j * block, axis=0)
+
+    T = jnp.zeros((n_local_rows, grad_r.shape[0]), dtype)
+    T = jax.lax.pcast(T, ('devices',), to='varying')
+
+    return jax.lax.fori_loop(0, n_blocks, add_block, T)
+
 class MinSR(AbstractOptimizer):
     """
     This class provides functionality for energy minimization via MinSR.
@@ -214,12 +273,10 @@ class MinSR(AbstractOptimizer):
         Instead, ``all_to_all`` trades which axis is sharded (each device ends up with all
         samples but only its own shard of parameters), so the local matmul is a valid partial
         sum over that parameter shard; ``psum_scatter`` then reduces and re-shards these partial
-        sums into the exact, correctly-sharded kernel.
+        sums into the exact, correctly-sharded kernel, one block of rows at a time so that the
+        full kernel is never materialized on any device (see `_blockwise_tangent_kernel`).
         """
-        grad = jax.lax.all_to_all(grad, 'devices', split_axis=1, concat_axis=0, tiled=True)
-        local = grad @ jnp.conj(jnp.transpose(grad))
-
-        return jax.lax.psum_scatter(local, 'devices', tiled=True)
+        return _blockwise_tangent_kernel(grad)
 
     @sharded(use_vmap=False)
     def _get_double_tangent_kernel(self, grad_l, grad_r, *, batch_size):
@@ -229,8 +286,4 @@ class MinSR(AbstractOptimizer):
         ``LazySampledObs`` path). Both operands must be redistributed the same way so that
         matching parameter shards land on the same device for both.
         """
-        grad_l = jax.lax.all_to_all(grad_l, 'devices', split_axis=1, concat_axis=0, tiled=True)
-        grad_r = jax.lax.all_to_all(grad_r, 'devices', split_axis=1, concat_axis=0, tiled=True)
-        local = grad_l @ jnp.conj(jnp.transpose(grad_r))
-
-        return jax.lax.psum_scatter(local, 'devices', tiled=True)
+        return _blockwise_tangent_kernel(grad_l, grad_r)
