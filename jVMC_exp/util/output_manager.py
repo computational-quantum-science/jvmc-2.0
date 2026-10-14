@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,41 @@ def _as_h5_array(value: Any):
             text = text.decode("utf-8")
         return str(text)
     return arr
+
+
+def _local_memory_info():
+    """Memory statistics of all devices addressable by this process."""
+    infos = []
+    for device in jax.local_devices():
+        try:
+            stats = device.memory_stats()
+        except Exception:
+            stats = None
+        infos.append({
+            "id": int(device.id),
+            "process_index": int(device.process_index),
+            "platform": str(device.platform),
+            "device_kind": str(device.device_kind),
+            "stats": None if stats is None else {str(k): int(v) for k, v in stats.items()},
+        })
+    return infos
+
+
+def _gather_memory_info():
+    """Collect the memory statistics of all devices of all processes."""
+    local = _local_memory_info()
+    if jax.process_count() == 1:
+        return local
+    from jax.experimental import multihost_utils
+    local_data = np.frombuffer(json.dumps(local).encode("utf-8"), dtype=np.uint8)
+    lengths = np.asarray(multihost_utils.process_allgather(np.asarray(local_data.size, dtype=np.int64))).reshape(-1)
+    padded = np.zeros(int(lengths.max()), dtype=np.uint8)
+    padded[:local_data.size] = local_data
+    gathered_data = np.asarray(multihost_utils.process_allgather(padded))
+    infos = []
+    for row, length in zip(gathered_data, lengths):
+        infos.extend(json.loads(row[:int(length)].tobytes().decode("utf-8")))
+    return infos
 
 
 def check_network_parameter_shape(weights: Any) -> bool:
@@ -77,6 +113,9 @@ class OutputManager:
     start_timing(name), stop_timing(name), add_timing(name, elapsed),
     flush_timings()
         Accumulate timing totals and counts.
+    flush_memory_info()
+        Write ``device.memory_stats()`` of all devices (all processes) under
+        ``memory``.
 
     Examples
     --------
@@ -135,8 +174,6 @@ class OutputManager:
 
     def _append_h5(self, parent, name: str, value: Any) -> None:
         arr = _as_h5_array(value)
-        if arr is None:
-            return
         if isinstance(arr, str):
             arr = np.asarray(arr, dtype=h5py.string_dtype(encoding="utf-8"))
         arr = np.asarray(arr)
@@ -338,7 +375,7 @@ class OutputManager:
                 parent.create_dataset(str(key), data=_as_h5_array(value))
 
     def start_timing(self, name: str) -> None:
-        entry = self._timings.setdefault(name, {"total": 0.0, "last_total": 0.0, "count": 0, "start": 0.0})
+        entry = self._timings.setdefault(name, {"total": 0.0, "last_timing": 0.0, "first_timing": 0.0, "count": 0, "start": 0.0})
         entry["start"] = time.perf_counter()
 
     def stop_timing(self, name: str) -> float:
@@ -347,31 +384,51 @@ class OutputManager:
         return elapsed
 
     def add_timing(self, name: str, elapsed: float) -> None:
-        entry = self._timings.setdefault(name, {"total": 0.0, "last_total": 0.0, "count": 0, "start": 0.0})
+        entry = self._timings.setdefault(name, {"total": 0.0, "last_timing": 0.0, "first_timing": 0.0, "count": 0, "start": 0.0})
+        if entry["count"] == 0:
+            entry["first_timing"] = float(elapsed)
         entry["total"] = float(entry["total"]) + float(elapsed)
         entry["count"] = int(entry["count"]) + 1
+        entry["last_timing"] = float(elapsed)
 
     def print_timings(self, indent: str = "") -> None:
         if not self.is_main_process:
             return
         print(f"{indent}Recorded timings:", flush=True)
         for key, item in self._timings.items():
-            delta = item["total"] - item["last_total"]
-            print(f"{indent}    - {key}: {delta:.6f}s", flush=True)
-            item["last_total"] = item["total"]
+            print(f"{indent}    - {key}: {item["last_timing"]:.6f}s", flush=True)
 
     def flush_timings(self, path: str | Path | None = None) -> None:
         if path is not None:
             raise ValueError("flush_timings() does not bind paths. Use save_to_h5(path=...) to choose an output file.")
-        timings = self.data.setdefault("timings", {})
-        for key, value in self._timings.items():
-            timings[str(key)] = {
-                "total": value["total"],
-                "count": value["count"],
-            }
+        timings = self._timings
+        for key, value in timings.items():
+            value.pop("start", None)
         if self.path is not None and self.is_main_process:
             with h5py.File(self.path, "a") as handle:
                 self._write_dict_to_h5(self._root(handle).require_group("timings"), timings)
+
+    def flush_memory_info(self, path: str | Path | None = None) -> dict[str, dict[str, Any]]:
+        if path is not None:
+            raise ValueError("flush_memory_info() does not bind paths. Use save_to_h5(path=...) to choose an output file.")
+        memory = {}
+        for info in sorted(_gather_memory_info(), key=lambda d: d["id"]):
+            stats = info["stats"]
+            memory[f"device_{info['id']}"] = {
+                "process_index": info["process_index"],
+                "platform": info["platform"],
+                "device_kind": info["device_kind"],
+                "available": stats is not None,
+                **(stats or {}),
+            }
+        self.data["memory"] = memory
+        if self.path is not None and self.is_main_process:
+            with h5py.File(self.path, "a") as handle:
+                root = self._root(handle)
+                if "memory" in root:
+                    del root["memory"]
+                self._write_dict_to_h5(root.require_group("memory"), memory)
+        return memory
 
     def get_network_checkpoint(self, time: float | None = None, idx: int | None = None):
         if time is not None and idx is not None:
