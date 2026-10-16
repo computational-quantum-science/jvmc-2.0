@@ -7,6 +7,7 @@ import warnings
 from typing import Callable
 from functools import partial
 
+from jVMC_exp import global_defs
 from jVMC_exp.stats import LazySampledObs, SampledObs
 from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler.base import AbstractSampler
@@ -279,7 +280,8 @@ class Evolution(AbstractOptimizer):
             self, sampler: AbstractSampler, psi: NQS, resample_stepper: bool,
             imag_time: bool, make_real: bool, use_cross_valiadation: bool=False, 
             diagonalShift: float | Callable=1e-3, diagonalScale: float | Callable=0., 
-            solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None
+            solver: AbstractSolver=PinvSNR(), output_manager: OutputManager | None = None,
+            store_qgt: bool = False, compute_tdvp_error: bool = False
         ):
         self.rhsPrefactor = -1 if imag_time else -1j 
         if psi.holomorphic:
@@ -333,8 +335,19 @@ class Evolution(AbstractOptimizer):
             transformation=self._rhs_trans_fn
         )
 
-        self._F0 = None
-        self._S0 = None
+        self._qgt = None
+
+        if compute_tdvp_error and not store_qgt:
+            raise ValueError(
+                "TDVP error computation requires storing the QGT. "
+                "Set store_qgt=True when constructing the optimizer."
+            )
+        self.store_qgt = store_qgt
+        self.compute_tdvp_error = compute_tdvp_error
+
+    @property
+    def qgt(self):
+        return self._qgt
 
     @property
     def solver(self):
@@ -388,80 +401,27 @@ class Evolution(AbstractOptimizer):
         )
         self.update = self._make_real_fn(update) if self.psi.holomorphic else jnp.real(update)
 
+        if self.compute_tdvp_error:
+            self._additional_info["tdvp_error"] = self._get_tdvp_error(
+                self.update, objective_function_output.grad, objective_function_output.o_loc.var
+            ).item() 
+
         return self.update
-    
-    def cross_validation(self, objective_function: AbstractObjectiveFunction, **objective_function_kwargs):
-        if "residual" not in self.meta_data:
-            raise ValueError(
-                f"Cross validation normalizes against the residual of the solve, but solver "
-                f"'{type(self.solver).__name__}' does not report a 'residual' in the info "
-                "dictionary it returns. Either use a solver that does (e.g. Pinv or PinvSNR), "
-                "or construct the optimizer with use_cross_valiadation=False."
-            )
 
-        residual = self.meta_data["residual"]
-        tvp_error = self.meta_data["tdvp_error"]
-
-        full_samples, full_logPsi, full_weights = (
-            self.sampler.samples, 
-            self.sampler.logPsi, 
-            self.sampler.weights
-        )
-
-        def _value_and_grad_on_subset(start):
-            self.sampler._samples = full_samples[start::2]
-            self.sampler._logPsi = full_logPsi[start::2]
-            w = full_weights[start::2]
-            self.sampler._weights = w / jnp.sum(w)
-
-            return objective_function.value_and_grad(
-                self.sampler, compute_grad=True, **objective_function_kwargs
-            )
-
-        try:
-            objective_fn_out_1 = _value_and_grad_on_subset(0)
-            objective_fn_out_2 = _value_and_grad_on_subset(1)
-        finally:
-            self.sampler._samples, self.sampler._logPsi, self.sampler._weights = (
-                full_samples, 
-                full_logPsi, 
-                full_weights
-            )
-
-        update_1 = self.get_update(objective_fn_out_1)
-        validation_tdvp_err = self._get_tdvp_error(update_1)
-        if self.psi.holomorphic:
-            update_1 = self._make_cmplx_fn(update_1)
-            objective_fn_out_2.grad_log_psi.transform(self._remove_double_trans)
-            objective_fn_out_2.grad = self._remove_double_fn(objective_fn_out_2.grad)
-        F2 = self._get_rhs(objective_fn_out_2.grad)
-        S2 = self._get_lhs(objective_fn_out_2.grad_log_psi)
-        if callable(S2):
-            Sv = S2(update_1)
-        else:
-            Sv = S2.dot(jnp.pad(update_1, (0, self._params_pad_size)))
-            Sv = Sv[:-self._params_pad_size] if self._params_pad_size else Sv
-        validation_residual = (jnp.linalg.norm(Sv - F2) / jnp.linalg.norm(F2)) / residual
-
-        crossValidationFactor_residual = validation_residual
-        crossValidationFactor_tdvpErr = validation_tdvp_err / tvp_error
-        self.meta_data["tdvp_residual_cross_validation_ratio"] = crossValidationFactor_residual
-        self.meta_data["tdvp_error_cross_validation_ratio"] = crossValidationFactor_tdvpErr
-
-    def _get_tdvp_error(self, update):
+    def _get_tdvp_error(self, update, F, var):
         update = self._make_cmplx_fn(update) if self.psi.holomorphic else update
 
-        if callable(self._S0):
-            Sv = self._S0(update)
+        if callable(self.qgt):
+            Sv = self.qgt(update)
         else:
-            Sv = self._S0.dot(jnp.pad(update, (0, self._params_pad_size)))
+            Sv = self.qgt.dot(jnp.pad(update, (0, self._params_pad_size)))
             Sv = Sv[:-self._params_pad_size] if self._params_pad_size else Sv
 
         return jnp.abs(
             1. 
             + (jnp.real(jnp.vdot(update, Sv))
-            - 2 * jnp.real(jnp.vdot(update, self.rhsPrefactor  * self._F0)))
-            / (self.o_loc.var + 1e-14)
+            - 2 * jnp.real(jnp.vdot(update, self.rhsPrefactor  * F)))
+            / (var + 1e-14)
         )
     
     def _get_lhs_dense(self, grad_log_psi: SampledObs | LazySampledObs):
@@ -500,7 +460,8 @@ class Evolution(AbstractOptimizer):
         if self._params_pad_size != 0:
             grad_log_psi.transform(self._unpad_obs)
 
-        self._S0 = S # TODO: Do we really need to store this?
+        if self.store_qgt:
+            self._qgt = S
         S = self._lhs_trans_fn(S)
 
         if self.diag_scale > 1e-15:
@@ -527,15 +488,31 @@ class Evolution(AbstractOptimizer):
         n_samples, n_params = grad_log_psi.shape
         block = n_params // n_devices**2
         grad_blocks = grad_log_psi.reshape(n_samples, n_devices, n_devices, block)
+        # The products are summed over chunks of at most global_defs.MATMUL_CHUNK_BYTES of samples: XLA
+        # autotunes a matrix product on its own copies of the operands, which would otherwise be as
+        # large as grad_log_psi
+        row_bytes = n_params * grad_log_psi.dtype.itemsize
+        chunk = max(1, min(n_samples, (global_defs.MATMUL_CHUNK_BYTES or n_samples * row_bytes) // row_bytes))
 
         def add_block(j, S):
             # Block j of the rows of every device, in device order
-            rows = jax.lax.dynamic_index_in_dim(grad_blocks, j, axis=2, keepdims=False)
-            local = jnp.tensordot(
-                jnp.conj(rows.reshape(n_samples, n_devices * block)), 
-                grad_log_psi, 
-                axes=(0, 0)
-            )
+            rows = jax.lax.dynamic_index_in_dim(
+                grad_blocks, j, axis=2, keepdims=False
+            ).reshape(n_samples, n_devices * block)
+
+            def add_chunk(k, local, size=chunk):
+                r, g = (
+                    jax.lax.dynamic_slice_in_dim(x, k * chunk, size) 
+                    for x in (rows, grad_log_psi)
+                )
+                # Materialized: XLA would otherwise fuse the slices 
+                # into the product and autotune it on whole operands
+                r, g = jax.lax.optimization_barrier((r, g))
+                return local + jnp.tensordot(jnp.conj(r), g, axes=(0, 0))
+
+            local = jax.lax.fori_loop(1, n_samples // chunk, add_chunk, add_chunk(0, 0))
+            if n_samples % chunk:
+                local = add_chunk(n_samples // chunk, local, n_samples % chunk)
             local = jax.lax.psum_scatter(local, "devices", scatter_dimension=0, tiled=True)
             S_block = jax.lax.dynamic_slice_in_dim(S, j * block, block, axis=0)
 
@@ -582,7 +559,8 @@ class Evolution(AbstractOptimizer):
         def raw_matvec(v):
             return (grad.conj().T @ (grad @ v))
 
-        self._S0 = raw_matvec
+        if self.store_qgt:
+            self._qgt = raw_matvec
 
         def matvec(v):
             Sv = self._lhs_trans_fn(raw_matvec(v))
@@ -597,14 +575,10 @@ class Evolution(AbstractOptimizer):
         return matvec
     
     def _get_rhs(self, grad):
-        self._F0 = grad
         b = self._rhs_trans_fn(grad)
         b.block_until_ready()
 
         return b
 
     def _update_meta_data(self):
-        self.meta_data = dict(
-            tdvp_error=self._get_tdvp_error(self.update).item(), 
-            **self._additional_info
-        )
+        self.meta_data = dict(**self._additional_info)

@@ -73,8 +73,12 @@ def pick_gradient(fn, params, single_input):
 
     if holomorphic:
        return real_params, holomorphic, flat_gradient_holo, dict_gradient_real
-    
+
     if real_params:
+        out = jax.eval_shape(fn, params, single_input)
+        if not jnp.issubdtype(out.dtype, jnp.complexfloating):
+            return real_params, holomorphic, flat_gradient_real, dict_gradient_real
+
         return real_params, holomorphic, flat_gradient, dict_gradient
     else:
         return real_params, holomorphic, flat_gradient_nonholo, dict_gradient_real
