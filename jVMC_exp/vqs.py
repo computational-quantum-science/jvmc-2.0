@@ -18,7 +18,7 @@ from jVMC_exp.util.key_gen import generate_seed, format_key
 from jVMC_exp.util.util import has_callable_attr
 from jVMC_exp import global_defs
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
-from jVMC_exp.sharding_config import broadcast_split_key, sharded
+from jVMC_exp.sharding_config import broadcast_split_key, sharded, BatchLayout, SizedIterable, pad_to_devices
 
 def _check_dtype(dtype: jnp.dtype | None, dtype_ref: jnp.dtype, label: str):
     if dtype is None:
@@ -297,6 +297,12 @@ class NQS:
     @property
     def batchSize(self):
         return self._batchSize
+
+    @property
+    def gradientBatchSize(self):
+        """Lazy gradient block size after reducing the symmetry orbit."""
+        nsymm = self.net.symmetry.nsymm if isinstance(self.net, ProjectedOrbitNet) else 1
+        return self.batchSize * nsymm
         
     @property
     def net(self):
@@ -495,8 +501,11 @@ class NQS:
     
     def lazy_gradients(self, s):
         """
-        Lazy version of `gradients`: an iterable that computes the gradients one batch of
-        ``batchSize`` configurations at a time, every time it is iterated.
+        Lazy version of `gradients`: an iterable that recomputes one gradient block
+        at a time. Network evaluations use ``batchSize`` configurations; projected
+        networks collect up to ``gradientBatchSize = batchSize * nsymm`` gradient
+        rows per block, capped at the padded number of samples. Symmetry is reduced
+        before the rows are stored, so it does not multiply the block's row count.
 
         On more than one device a batch does not consist of consecutive configurations.
         To line up another array with the batches, split it with the ``layout`` of the
@@ -507,7 +516,19 @@ class NQS:
         Args:
             * ``s``: Array of computational basis states.
         """
-        return self._lazy_gradients_sh(s, parameters=self.grad_parameters, batch_size=self.batchSize)
+        if self.gradientBatchSize == self.batchSize:
+            return self._lazy_gradients_sh(s, parameters=self.grad_parameters, batch_size=self.batchSize)
+
+        s = jax.device_put(pad_to_devices(s), DEVICE_SHARDING)
+        layout = BatchLayout(s.shape[0], min(self.gradientBatchSize, s.shape[0]))
+        parameters = self.grad_parameters
+
+        def blocks():
+            for i in range(layout.n_batches):
+                samples = layout.trim(layout.take(s, i), i)
+                yield self._gradients_sh(samples, parameters=parameters, batch_size=self.batchSize)
+
+        return SizedIterable(blocks, layout.n_batches, layout.batch_size, layout)
     
     @sharded(automatic_sharding=True, yield_iter=True)
     def _lazy_gradients_sh(self, s, *, parameters, batch_size):
