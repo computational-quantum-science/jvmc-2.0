@@ -479,5 +479,124 @@ class TestCutoffSamplerProperties(unittest.TestCase):
         self.assertTrue(jnp.allclose(s.maxLogPsi, expected))
         self.assertTrue(jnp.allclose(s.cutoff, expected + jnp.log(0.5)))
 
+class TestTargetFractionCutoffSampler(unittest.TestCase):
+    """Cutoff set by the fraction of clipped samples instead of eps * max|psi|^mu."""
+
+    L = 4
+    NUM_SAMPLES = 2 ** 18
+    NUM_CHAINS = 2 ** 16
+
+    def _make_sampler(self, num_samples=2 ** 8, num_chains=2 ** 4, **kwargs):
+        psi, exact_psi = _setup_cutoff_psi(L=self.L, num_samples=num_samples)
+        kwargs = dict(dict(reference=-2.0, logOffset=-1.0), **kwargs)
+
+        return sampler.TargetFractionCutoffSampler(
+            psi, updateProposer=jVMC_exp.propose.SpinFlip(),
+            key=random.PRNGKey(0), numChains=num_chains, numSamples=num_samples,
+            **kwargs
+        ), exact_psi
+
+    def test_cutoff_is_reference_plus_offset(self):
+        s, _ = self._make_sampler(reference=-2.0, logOffset=-1.5)
+        self.assertTrue(jnp.allclose(s.cutoff, -3.5))
+        s.reference = -1.0
+        self.assertTrue(jnp.allclose(s.cutoff, -2.5))
+        s.logOffset = -0.5
+        self.assertTrue(jnp.allclose(s.cutoff, -1.5))
+
+    def test_offset_is_capped(self):
+        s, _ = self._make_sampler(reference=0.0, logOffset=3.0, maxLogOffset=-0.5)
+        self.assertTrue(jnp.allclose(s.logOffset, -0.5))
+
+    def test_rejects_invalid_arguments(self):
+        for kwargs in (dict(targetFraction=0.0), dict(targetFraction=1.0),
+                       dict(damping=1.5), dict(maxIncrease=-1.0)):
+            with self.assertRaises(ValueError):
+                self._make_sampler(**kwargs)
+        s, _ = self._make_sampler()
+        with self.assertRaises(ValueError):
+            s.logOffset = -np.inf
+
+    def test_controller_step(self):
+        s, _ = self._make_sampler(
+            targetFraction=0.1, damping=0.5, maxIncrease=0.25, maxDecrease=2.0,
+            logOffset=-1.0,
+        )
+        n = 1000
+        # Too few samples clipped: raise the cutoff, by at most maxIncrease.
+        up = float(s._next_log_offset(0.0, n)) + 1.0
+        self.assertGreater(up, 0.0)
+        self.assertAlmostEqual(up, 0.25)
+        # On target: no change.
+        self.assertAlmostEqual(float(s._next_log_offset(0.1, n)), -1.0, places=6)
+        # Too many clipped: lower it, proportionally to the logit error.
+        down = float(s._next_log_offset(0.2, n)) + 1.0
+        self.assertAlmostEqual(down, 0.5 * (float(_logit_np(0.1)) - float(_logit_np(0.2))), places=6)
+        # A full plateau gives a finite step, bounded by maxDecrease.
+        self.assertAlmostEqual(float(s._next_log_offset(1.0, n)) + 1.0, -2.0)
+
+    def test_damping_zero_freezes_offset(self):
+        s, _ = self._make_sampler(damping=0.0, logOffset=-0.7)
+        for _ in range(3):
+            s.sample()
+        self.assertTrue(jnp.allclose(s.logOffset, -0.7))
+
+    def test_sampling_is_unbiased_while_adapting(self):
+        """Each batch is reweighted with the cutoff its chains ran with."""
+        s, exact_psi = self._make_sampler(
+            num_samples=self.NUM_SAMPLES, num_chains=self.NUM_CHAINS,
+            targetFraction=0.3, damping=0.5, logOffset=-2.0,
+        )
+        _, log_psi, p_target = sampler.ExactSampler(exact_psi).sample()
+        log_p_mu = 2 * np.real(np.asarray(log_psi))
+
+        for _ in range(3):
+            s.sample()
+        cutoff = float(s.cutoff)
+        samples, _, weights = s.sample()
+        self.assertAlmostEqual(float(s.last_cutoff), cutoff)
+        self.assertNotAlmostEqual(float(s.cutoff), cutoff)  # moved on for the next call
+
+        q_ref = _normalized(np.maximum(log_p_mu, cutoff))
+        # Guard against a vacuous test: the cutoff has to bite.
+        self.assertGreater(np.max(np.abs(q_ref - np.asarray(p_target))), 1e-2)
+
+        self.assertLess(np.max(np.abs(_histogram_from_samples(samples, self.L) - q_ref)), 3e-3)
+        self.assertLess(
+            np.max(np.abs(_histogram_from_samples(samples, self.L, weights) - np.asarray(p_target))),
+            3e-3
+        )
+        self.assertAlmostEqual(
+            float(s.fraction_below), float(np.mean(2 * np.real(np.asarray(s.psi(samples))) < cutoff)),
+            places=6
+        )
+
+    def test_fraction_approaches_target(self):
+        """On a larger system the clipped fraction settles near the target."""
+        L = 10
+        rbm = nets.CpxRBM(numHidden=4, bias=False)
+        psi = NQS(rbm, L, 2 ** 13, seed=1234)
+        # |psi|^2 spread over ~15 in log: a continuum of levels for the cutoff.
+        psi.parameters = 0.4 * random.normal(random.PRNGKey(7), psi.parameters_flat.shape)
+        target = 0.05
+        s = sampler.TargetFractionCutoffSampler(
+            psi, updateProposer=jVMC_exp.propose.SpinFlip(), targetFraction=target,
+            key=random.PRNGKey(1), numChains=2 ** 9, numSamples=2 ** 13,
+            damping=0.5, bootstrap_kwargs=dict(numSamples=2 ** 10, numChains=2 ** 6),
+        )
+        fractions = []
+        for _ in range(40):
+            s.sample()
+            fractions.append(float(s.fraction_below))
+        tail = np.mean(fractions[-15:])
+        self.assertGreater(tail, 0.6 * target)
+        self.assertLess(tail, 1.6 * target)
+        self.assertGreater(float(s.effective_sample_fraction), 0.9)
+
+
+def _logit_np(x):
+    return np.log(x) - np.log1p(-x)
+
+
 if __name__ == "__main__":
     unittest.main()
