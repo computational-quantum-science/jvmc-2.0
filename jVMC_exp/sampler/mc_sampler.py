@@ -316,3 +316,197 @@ class CutoffSampler(MCSampler):
         )
 
         return states, logProb, key, numProposed, numAccepted
+
+def _logit(x):
+    return jnp.log(x) - jnp.log1p(-x)
+
+
+class TargetFractionCutoffSampler(CutoffSampler):
+    """
+    A cutoff sampler whose cutoff is set by the fraction of samples it clips.
+
+    Like :class:`CutoffSampler`, the Markov chain samples the flattened law
+
+        :math:`q(s) \\propto \\max\\{|\\psi(s)|^{\\mu}, e^{c}\\}`
+
+    and the returned weights undo the flattening. The cutoff, however, is not
+    tied to :math:`\\max_s |\\psi(s)|^{\\mu}`. It is
+
+        :math:`c = r + \\delta`,
+
+    where the reference :math:`r` is the importance-weighted mean of
+    :math:`\\mu\\,\\text{Re}\\log\\psi` over the last batch of samples, and the
+    offset :math:`\\delta` is adjusted after every call to :meth:`sample` such that
+    the fraction of samples on the flat part of :math:`q` stays close to
+    ``targetFraction``.
+
+    Why not a fixed ``eps`` relative to the maximum: the flat part of :math:`q`
+    carries the weight :math:`e^{c}` times the number of configurations below the
+    cutoff, which is up to :math:`2^N`. Once the state has spread out, a cutoff at
+    a fixed ratio to the maximum lies above the bulk of :math:`|\\psi|^{\\mu}`, the
+    chains drift onto the plateau where their weights are tiny, and the effective
+    sample size collapses. The sample maximum is in addition an extreme value that
+    fluctuates from batch to batch and feeds back into the next cutoff. The
+    fraction of samples below the cutoff is the weight of the plateau in
+    :math:`q`, an average over the whole batch, and directly bounds the loss of
+    effective sample size.
+
+    Controller: with :math:`f` the fraction of the last batch below the cutoff
+    that batch was sampled with,
+
+        :math:`\\delta \\leftarrow \\min\\{\\delta + \\text{clip}(\\gamma\\,
+        [\\text{logit}(f_{\\text{target}}) - \\text{logit}(f)],
+        -\\Delta_{\\downarrow}, \\Delta_{\\uparrow}),\\ \\delta_{\\max}\\}`.
+
+    :math:`f` is clipped to :math:`[1/(2n), 1 - 1/(2n)]` for a batch of :math:`n`
+    samples, so an empty or a full plateau gives a finite step. The new cutoff
+    applies from the next call on: the weights of each batch are computed with
+    the cutoff its chains were run with, so every batch is unbiased on its own.
+
+    Initializer arguments (beyond those of :class:`MCSampler`):
+        * ``targetFraction``: Target fraction of samples below the cutoff, in the
+            open interval :math:`(0, 1)`.
+        * ``damping``: Gain :math:`\\gamma \\in [0, 1]` of the controller. ``0``
+            freezes the offset.
+        * ``maxIncrease``, ``maxDecrease``: Largest change of :math:`\\delta` per
+            call upwards and downwards. Raising the cutoff is what can make the
+            plateau blow up, so the default step up is smaller than the one down.
+        * ``maxLogOffset``: Upper bound :math:`\\delta_{\\max}` on the offset.
+        * ``logOffset``, ``reference``: Initial :math:`\\delta` and :math:`r`. If
+            either is ``None``, both are obtained from a bootstrap run, see
+            :meth:`initialize_cutoff`.
+        * ``bootstrap_kwargs``: Keyword arguments for the bootstrap
+            :class:`MCSampler`.
+
+    Diagnostics of the last call to :meth:`sample`: ``last_cutoff``,
+    ``fraction_below`` and ``effective_sample_fraction`` (Kish effective sample
+    size divided by the number of samples).
+
+    The ``eps`` and ``maxLogPsi`` attributes inherited from :class:`CutoffSampler`
+    do not enter the cutoff.
+    """
+    def __init__(
+            self, psi: NQS, updateProposer: AbstractProposer, targetFraction=0.02,
+            key=None, numChains=32, numSamples=128,
+            thermalizationSweeps=10, sweepSteps=None, initState=None,
+            mu=2, logProbFactor=0.5, damping=0.3, maxIncrease=0.5, maxDecrease=2.0,
+            maxLogOffset=0.0, logOffset=None, reference=None, bootstrap_kwargs=None
+        ):
+        if not (0.0 <= float(damping) <= 1.0):
+            raise ValueError("`damping` must be in the closed interval [0, 1].")
+        if float(maxIncrease) < 0 or float(maxDecrease) < 0:
+            raise ValueError("`maxIncrease` and `maxDecrease` must be non-negative.")
+
+        self.targetFraction = targetFraction
+        self.damping = float(damping)
+        self.maxIncrease = float(maxIncrease)
+        self.maxDecrease = float(maxDecrease)
+        self.maxLogOffset = float(maxLogOffset)
+
+        # Placeholders, the parent's __init__ already evaluates the cutoff.
+        self._reference = jnp.asarray(0.0)
+        self._logOffset = jnp.asarray(0.0)
+
+        # eps and maxLogPsi are passed only to skip the parent's bootstrap.
+        super().__init__(
+            psi, updateProposer, eps=1.0, key=key, numChains=numChains,
+            numSamples=numSamples, thermalizationSweeps=thermalizationSweeps,
+            sweepSteps=sweepSteps, initState=initState, mu=mu,
+            logProbFactor=logProbFactor, maxLogPsi=0.0
+        )
+
+        self.last_cutoff = None
+        self.fraction_below = None
+        self.effective_sample_fraction = None
+
+        if reference is None or logOffset is None:
+            self.initialize_cutoff(bootstrap_kwargs)
+        if reference is not None:
+            self.reference = reference
+        if logOffset is not None:
+            self.logOffset = logOffset
+
+    @property
+    def targetFraction(self):
+        return self._targetFraction
+
+    @targetFraction.setter
+    def targetFraction(self, value):
+        if not (0.0 < float(value) < 1.0):
+            raise ValueError("`targetFraction` must be in the open interval (0, 1).")
+        self._targetFraction = float(value)
+
+    @property
+    def reference(self):
+        return self._reference
+
+    @reference.setter
+    def reference(self, value):
+        self._reference = jnp.asarray(value)
+        self._update_cutoff()
+
+    @property
+    def logOffset(self):
+        return self._logOffset
+
+    @logOffset.setter
+    def logOffset(self, value):
+        value = jnp.asarray(value)
+        if not jnp.isfinite(value):
+            raise ValueError("`logOffset` must be finite.")
+        self._logOffset = jnp.minimum(value, self.maxLogOffset)
+        self._update_cutoff()
+
+    def _update_cutoff(self):
+        self._cutoff = self._reference + self._logOffset
+
+    def initialize_cutoff(self, bootstrap_kwargs=None):
+        """(Re-)initialize the cutoff from a plain MC run with the current parameters.
+
+        The reference is set to the weighted mean of :math:`\\mu\\,\\text{Re}\\log\\psi`
+        and the cutoff to just below the smallest sampled value, so that the first
+        batch is (almost) not clipped and the controller raises the cutoff from
+        there. Call this after the parameters have been changed by hand, e.g. after
+        loading a state, when the current cutoff is meaningless.
+        """
+        defaults = dict(
+            key=random.PRNGKey(4321),
+            numChains=25,
+            sweepSteps=int(np.prod(self.sampleShape)),
+            numSamples=min(self.numSamples, 1000),
+            thermalizationSweeps=50,
+            mu=self.mu,
+            logProbFactor=self.logProbFactor,
+        )
+        defaults.update(bootstrap_kwargs or {})
+        bootstrap = MCSampler(self.psi, updateProposer=self.updateProposer, **defaults)
+        _, coeffs, p = bootstrap.sample()
+        logPMu = self.mu * jnp.real(coeffs)
+
+        self._reference = jnp.sum(p * logPMu) / jnp.sum(p)
+        self.logOffset = jnp.min(logPMu) - self._reference - 1.0
+
+    def _next_log_offset(self, fraction, num_samples):
+        f = jnp.clip(fraction, 0.5 / num_samples, 1.0 - 0.5 / num_samples)
+        step = self.damping * (_logit(self.targetFraction) - _logit(f))
+        step = jnp.clip(step, -self.maxDecrease, self.maxIncrease)
+
+        return jnp.minimum(self._logOffset + step, self.maxLogOffset)
+
+    def _get_samples_mcmc(self):
+        cutoff = self.cutoff
+        # The parent runs the chains and computes the weights with this cutoff.
+        configs, coeffs, p = super()._get_samples_mcmc()
+
+        logPMu = self.mu * jnp.real(coeffs)
+        num_samples = logPMu.shape[0]
+        self.last_cutoff = cutoff
+        self.fraction_below = jnp.mean(logPMu < cutoff)
+        self.effective_sample_fraction = 1.0 / (num_samples * jnp.sum(p ** 2))
+
+        # Applies from the next call on.
+        self._reference = jnp.sum(p * logPMu)
+        self._logOffset = self._next_log_offset(self.fraction_below, num_samples)
+        self._update_cutoff()
+
+        return configs, coeffs, p
