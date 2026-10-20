@@ -172,39 +172,50 @@ the scan plotted, except the band rotation.
 ## 3. The experiment
 
 * Source folder: `scripts/rsvd/` (`run.py`, `input.json`, `nets/`, `.encap.conf`,
-  `sbatch.sh`, `_sbatch.sh`, `_Cluster/`).
+  `sbatch.sh`, `_sbatch.sh`, `_Cluster/`, the parameter file).
 * Version folder, as requested: `scripts/0encap_folder/rsvd/test/` (identical
-  copy; launch with `encap rerun rsvd -n test ...` from `scripts/`, or with the
-  copied `sbatch.sh` for the rank-per-GPU distributed mode).
+  copy; `encap rerun rsvd -n test -sl -sl_i 2 -vm <cluster>` from `scripts/`, or
+  `sbatch --export=ALL,ENCAP_SLURM_INSTANCE=<grid point> sbatch.sh` in the folder).
 
-`run.py` mirrors `scripts/0encap_folder/tfim_dynamics/Ns_3e5/run.py` and differs
-in exactly these points:
+### 3.1 What it runs (2026-10-20, second iteration)
 
-1. TDVP solver `RandomizedPinvSNR(...)` instead of `PinvSNR(...)`, configured by
-   the new `simulation.rsvd` block of `input.json`
-   (`n_components=4000` of 12592 real parameters, `n_oversamples=0`, `n_iter=4`,
-   `which="LM"`, `seed=4321`, `diagonalization_mode="distributed"`, and the
-   L-BFGS toggle `lbfgs=false` with `lbfgs_tol`, `lbfgs_maxiter`, `lbfgs_rtol`,
-   `lbfgs_max_restarts`); a run entry may override the block. `n_components` is clipped to the number of parameters
-   with a warning. The ground-state search for the x-polarized initial state keeps
-   the dense `PinvSNR`.
-2. `jVMC_exp.sampler.CutoffSampler` instead of `MCSampler`, with the new
-   `simulation.eps = 1e-3` (the value of the old 1D script); the bootstrap run that
-   initializes the cutoff is capped at 20000 samples. `snr_tol` stays 0, as
-   required for importance-weighted samples.
-3. `tdvp_norm` uses `opt.qgt` (upstream renamed `_S0` to `qgt`; for the
-   matrix-free solver it is the operator `S_0 v`).
-4. The data-file name carries `_eps=..._rsvd_nc=..._os=..._it=..._lbfgs=...`, the
-   `config` group of the HDF5 file records the sampler/solver settings, and the
-   per-step log line prints `true_res`, the current sampler cutoff and, with
-   L-BFGS, `res_rsvd`, `n_lbfgs` and `t_lbfgs`.
-5. `sbatch.sh`: job name `rsvd_test`, the stale `--dependency` line removed.
+The port of `old_scripts/0encap_folder/crit_tfim/Resnet_nc56_rsvd_scan_cutoff`
+(jVMC 1) to jvmc-2.0, on two nodes with 8 GPUs:
 
-`diagonalization_mode="distributed"` only takes effect with
-`JVMC_USE_DISTRIBUTED=true` and one rank per GPU (the `sbatch.sh` route,
-`--ntasks-per-node=4`); through `encap`'s `.encap.conf` (`ntasks: 1`) it falls
-back to the on-device `eigh` of the `4000 x 4000` Rayleigh-Ritz matrix with a
-warning.
+| | old nc56 run | `scripts/rsvd` |
+|---|---|---|
+| system | open chain L = 20, H = -sum ZZ - sum X | `system.dimension = 1`, `periodic = false`, `J = 1`, `h = h_ratio * h_crit = 1` |
+| ansatz | 1D ResNet, 56 channels, 2 blocks, filter 10, no bias, 94640 real parameters | `nets/resnet1d.py` (same parameter tree) |
+| symmetry | reflection + spin flip (`get_orbit_1D`) | `compose_projectors(chain_reflection_symmetry, spin_flip_symmetry)`; jvmc-2.0 averages over the orbit where jVMC 1 summed, a constant shift of log psi |
+| initial state | `params_GS_psi2Samp_L=20_numChannels=56_numSamples=40000.npy` | the same file, `simulation.init.params_file`; verified to load unchanged (<X> = 1.000001, Var(H_x)/N = 1e-6, symmetric) |
+| if missing | generated once by `Resnet_nc40_*`: 200 SR steps for H_x, rsvd rank 1000 + L-BFGS, diagonal scale 10 | `init.mode = gs_search` with `init.solver = "rsvd"` (rank 1000 + L-BFGS), 200 Euler steps at dt 1e-2, stopped at Var(H_x)/N < 1e-6, saved under `params_file` |
+| sampler | `CutoffSampler`, eps 1e-3, 40000 samples, 25 chains, 25 thermalization sweeps | same, 32 chains (divisible by 8 GPUs); the TDVP samples are reused for the observables (jVMC 1 used a separate 20000-sample MC sampler) |
+| solver | rsvd, `makeReal = "real"`, pinv cutoff 1e-8 | `RandomizedPinvSNR`, `make_real = True`, `pinv_cutoff = 1e-8`, distributed Ritz diagonalization |
+| grid | n_comps 8000 and 16000, n_oversamples 0, n_iter 1, no L-BFGS | `simulation.runs[0/1]` with `rsvd` overrides; one job per entry via `ENCAP_SLURM_INSTANCE` |
+| stepper | `AdaptiveHeun(dt = 1e-4, tol = 1e-4)`, Fubini-Study norm | `simulation.stepper = "AdaptiveHeun"`, `rtol = 0`, `atol = 1e-4`, same norm, no max step |
+| observables | Z, ZZ1, ZZ2, X, XX1, XX2 per site (divided by L) | X, Z, ZZ_nn, XX_nn, ZZ_d2, XX_d2 per site / per bond (divided by the bond count) |
+| output | CSV per step, h5 at the end | h5 + CSV with checkpoints and restarts (unchanged from `Ns_3e5`) |
+
+Script changes for this (all behind `input.json` keys, the 2D setup is still
+available with `system.dimension = 2`):
+
+1. `system.dimension`, 1D bonds and sample shape; `net.ResNet.bias`.
+2. `simulation.symmetry` gained `"reflection"` and `"reflection_spin_flip"`.
+3. `simulation.init.params_file` (explicit file to load / save), with a parameter
+   count check against the network; `simulation.init.solver` (`"rsvd"` with
+   `init.rsvd`, or `"pinv"`).
+4. `simulation.stepper` (`"RK45"` or `"AdaptiveHeun"`), `maxStep: null` allowed.
+5. The grid point is read from `ENCAP_SLURM_INSTANCE` before `ENCAP_PROCID`: with
+   several ranks per job encap sets `ENCAP_PROCID = SLURM_PROCID`, which differs
+   between ranks.
+6. `.encap.conf`: `nodes: 2`, `ntasks: 8`, `ntasks-per-node: 4`, `gres: gpu:4`,
+   `JVMC_USE_DISTRIBUTED=true` and `JAX_PLATFORMS=cuda` exported before `srun`;
+   `sbatch.sh` likewise for 2 nodes, grid point via `ENCAP_SLURM_INSTANCE`.
+
+Memory on 8 GPUs: the Jacobian (40000 x 94640 complex) is 7.6 GB per GPU; the
+replicated `(94640, r)` float64 blocks of the solver are 6 GB each at r = 8000
+and 12 GB at r = 16000, three of them at once, plus the r x r Ritz matrix
+(distributed). r = 16000 therefore needs the 80/96 GB cards.
 
 ## 4. Things to keep in mind
 
