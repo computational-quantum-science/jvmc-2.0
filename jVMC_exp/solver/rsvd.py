@@ -14,6 +14,7 @@ that is diagonalized, with any of the backends of
 """
 from functools import partial
 from typing import Literal
+import time
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,7 @@ import jax.random as random
 
 from jVMC_exp.sharding_config import MESH, REPLICATED_SHARDING, broadcast_split_key
 from jVMC_exp.solver.pinv import PinvSNR
-from jVMC_exp.solver.qgt_operator import QGTOperator, _qgt_product, transformed_product
+from jVMC_exp.solver.qgt_operator import QGTOperator, _qgt_product, transformed_product, _apply
 from jVMC_exp.solver.util import diagonalize
 
 WHICH = ("LM", "LA")
@@ -192,6 +193,30 @@ def randomized_eigh(
     return _select(ev, jax.device_put(V, REPLICATED_SHARDING), k=k, which=which)
 
 
+def _pack(x, complex_solution):
+    """Real optimization variables for the refinement: ``x`` itself, or ``[Re x, Im x]``."""
+    if complex_solution:
+        return jnp.concatenate([jnp.real(x), jnp.imag(x)])
+
+    return jnp.real(x)
+
+
+def _unpack(z, complex_solution):
+    if complex_solution:
+        n = z.shape[0] // 2
+        return z[:n] + 1j * z[n:]
+
+    return z
+
+
+def _refinement_loss(z, jac, diag, shift, b, b_norm, *, mode, has_diag, complex_solution):
+    """The true residual ``||A x - b|| / ||b||`` as a function of the packed ``x``."""
+    x = _unpack(z, complex_solution)
+    Ax = _apply(jac, x, diag, shift, mode=mode, has_diag=has_diag)
+
+    return jnp.linalg.norm(Ax - b) / b_norm
+
+
 class RandomizedPinvSNR(PinvSNR):
     """
     :class:`PinvSNR` with a randomized eigendecomposition of the quantum geometric
@@ -237,7 +262,30 @@ class RandomizedPinvSNR(PinvSNR):
         Tile size for ``diagonalization_mode="distributed"``.
     compute_true_residual : bool, default=True
         Report ``true_residual`` in the info dictionary, at the cost of one more
-        operator application per solve.
+        operator application per solve. Always on when ``lbfgs`` is set.
+    lbfgs : bool, default=False
+        Refine the truncated solution by minimizing the true residual
+        ``||A x - b|| / ||b||`` with L-BFGS (``jaxopt.LBFGS``), starting from the
+        randomized pseudo-inverse update, whenever that residual exceeds
+        ``lbfgs_tol``. Recovers the force that the truncation to ``n_components``
+        discarded, at the cost of two operator applications per L-BFGS iteration.
+        For a non-holomorphic ansatz the refinement runs over real updates, for a
+        holomorphic one over real and imaginary part. Needs the ``jaxopt`` package.
+    lbfgs_tol : float, default=1e-7
+        Target for the true residual; the refinement stops once it is reached.
+    lbfgs_maxiter : int, default=1000
+        Iterations per L-BFGS run.
+    lbfgs_rtol : float, default=1e-3
+        The L-BFGS run is restarted (warm) while the residual still improves by
+        more than this relative amount per run and ``lbfgs_tol`` is not reached.
+    lbfgs_max_restarts : int, default=10
+        Upper bound on the number of L-BFGS runs per solve.
+
+    With ``lbfgs`` the info dictionary additionally holds ``residual_rsvd`` (the true
+    residual before the refinement), ``n_lbfgs`` (runs), ``lbfgs_iterations``
+    (iterations summed over the runs), ``t_lbfgs`` (wall time in seconds) and
+    ``cos_lbfgs`` (overlap of the update before and after the refinement);
+    ``true_residual`` is the residual after the refinement.
     """
     def __init__(
             self, n_components: int, n_oversamples: int = 0, n_iter: int = 4,
@@ -245,7 +293,9 @@ class RandomizedPinvSNR(PinvSNR):
             snr_tol=0, pinv_tol=1e-14, pinv_cutoff=1e-8,
             snr_mode: Literal["empiric", "gaussian"] = "empiric",
             diagonalization_mode: Literal["device", "distributed", "host"] = "device",
-            T_A: int | None = None, compute_true_residual: bool = True
+            T_A: int | None = None, compute_true_residual: bool = True,
+            lbfgs: bool = False, lbfgs_tol: float = 1e-7, lbfgs_maxiter: int = 1000,
+            lbfgs_rtol: float = 1e-3, lbfgs_max_restarts: int = 10
         ):
         super().__init__(
             snr_tol=snr_tol, pinv_tol=pinv_tol, pinv_cutoff=pinv_cutoff, snr_mode=snr_mode,
@@ -260,8 +310,17 @@ class RandomizedPinvSNR(PinvSNR):
         self._n_oversamples = int(n_oversamples)
         self._n_iter = int(n_iter)
         self._which = which
-        self._compute_true_residual = bool(compute_true_residual)
+        self._compute_true_residual = bool(compute_true_residual) or bool(lbfgs)
         self._key = seed if isinstance(seed, jax.Array) else random.PRNGKey(seed)
+
+        if int(lbfgs_maxiter) <= 0 or int(lbfgs_max_restarts) <= 0:
+            raise ValueError("lbfgs_maxiter and lbfgs_max_restarts have to be positive.")
+        self._lbfgs = bool(lbfgs)
+        self._lbfgs_tol = float(lbfgs_tol)
+        self._lbfgs_maxiter = int(lbfgs_maxiter)
+        self._lbfgs_rtol = float(lbfgs_rtol)
+        self._lbfgs_max_restarts = int(lbfgs_max_restarts)
+        self._lbfgs_solvers = {}
 
     @property
     def n_components(self):
@@ -280,8 +339,71 @@ class RandomizedPinvSNR(PinvSNR):
         return self._which
 
     @property
+    def lbfgs(self):
+        return self._lbfgs
+
+    @property
+    def lbfgs_tol(self):
+        return self._lbfgs_tol
+
+    @property
     def _needs_dense_matrix(self) -> bool:
         return False
+
+    def _lbfgs_solver(self, mode, has_diag, complex_solution):
+        """One ``jaxopt.LBFGS`` per operator type, so that its compiled loop is reused."""
+        key = (mode, has_diag, complex_solution)
+        if key not in self._lbfgs_solvers:
+            try:
+                import jaxopt
+            except ImportError as err:
+                raise ImportError(
+                    f"{type(self).__name__}(lbfgs=True) needs the 'jaxopt' package "
+                    "(`pip install jaxopt`)."
+                ) from err
+
+            self._lbfgs_solvers[key] = jaxopt.LBFGS(
+                fun=partial(
+                    _refinement_loss, mode=mode, has_diag=has_diag,
+                    complex_solution=complex_solution
+                ),
+                tol=1e-10, maxiter=self._lbfgs_maxiter
+            )
+
+        return self._lbfgs_solvers[key]
+
+    def _refine(self, A: QGTOperator, b, x, residual):
+        """
+        L-BFGS minimization of the true residual, warm-started from the randomized
+        solution ``x`` with true residual ``residual``.
+        """
+        info = dict(residual_rsvd=residual, n_lbfgs=0, lbfgs_iterations=0, t_lbfgs=0.0, cos_lbfgs=1.0)
+        if not residual > self._lbfgs_tol:
+            return x, residual, info
+
+        complex_solution = A.mode == "identity"
+        solver = self._lbfgs_solver(A.mode, A.has_diagonal_terms, complex_solution)
+        args = (A.jacobian, A._diag, A._shift, b, jnp.linalg.norm(b))
+
+        tic = time.perf_counter()
+        z = _pack(x, complex_solution)
+        for _ in range(self._lbfgs_max_restarts):
+            z, state = solver.run(z, *args)
+            new_residual = float(state.value)
+            info["n_lbfgs"] += 1
+            info["lbfgs_iterations"] += int(state.iter_num)
+            improvement = (residual - new_residual) / residual
+            residual = min(residual, new_residual)
+            if new_residual <= self._lbfgs_tol or improvement < self._lbfgs_rtol:
+                break
+        jax.block_until_ready(z)
+        info["t_lbfgs"] = time.perf_counter() - tic
+
+        x_new = _unpack(z, complex_solution)
+        norms = jnp.linalg.norm(x_new) * jnp.linalg.norm(x)
+        info["cos_lbfgs"] = float(jnp.real(jnp.vdot(x_new, x)) / norms) if norms > 0 else 1.0
+
+        return x_new, residual, info
 
     def _next_key(self):
         self._key, subkey = broadcast_split_key(self._key, 2)
@@ -320,6 +442,10 @@ class RandomizedPinvSNR(PinvSNR):
 
         info["n_components"] = self.n_components
         if self._compute_true_residual:
-            info["true_residual"] = (jnp.linalg.norm(A(x) - b) / jnp.linalg.norm(b)).item()
+            residual = (jnp.linalg.norm(A(x) - b) / jnp.linalg.norm(b)).item()
+            if self._lbfgs:
+                x, residual, lbfgs_info = self._refine(A, b, x, residual)
+                info.update(lbfgs_info)
+            info["true_residual"] = residual
 
         return x, info

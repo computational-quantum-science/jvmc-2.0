@@ -70,6 +70,12 @@ def _qgt_product_transpose(jac, ct):
     return jnp.conj(_qgt_product_impl(jac, jnp.conj(ct)))
 
 
+def _qgt_product_transpose_real(jac, ct):
+    # For a real input the map is (S_0 . cast) and the cotangent of the cast is the
+    # real part, as in JAX's own transpose of a real -> complex conversion
+    return jnp.real(_qgt_product_transpose(jac, ct))
+
+
 @jax.jit
 def _qgt_product(jac, v):
     """
@@ -80,7 +86,8 @@ def _qgt_product(jac, v):
     samples is not transposable by JAX itself, and ``jax.scipy.sparse.linalg.cg``
     transposes the operator it is given.
     """
-    return linear_call(_qgt_product_impl, _qgt_product_transpose, jac, v)
+    transpose = _qgt_product_transpose if jnp.iscomplexobj(v) else _qgt_product_transpose_real
+    return linear_call(_qgt_product_impl, transpose, jac, v)
 
 
 @jax.jit

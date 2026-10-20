@@ -318,6 +318,94 @@ class TestTimeEvolutionRandomizedPinvSNR(unittest.TestCase):
                 self.assertEqual(np.asarray(opt.meta_data["spectrum"]).shape, (6,))
 
 
+class TestLBFGSRefinement(unittest.TestCase):
+    """The optional L-BFGS refinement recovers the force discarded by the truncation."""
+
+    def _problem(self):
+        psi, exactSampler, hamiltonian, _ = _reference_problem()
+        loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+        objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+
+        def update_with(solver, make_real=False):
+            opt = jVMC_exp.optimizer.TDVP(
+                exactSampler, psi, make_real=make_real, diagonalShift=0, solver=solver
+            )
+            update = opt.get_update(objective_fn_out)
+            return np.asarray(update), dict(opt._additional_info)
+
+        return update_with
+
+    def test_refinement_reduces_true_residual_towards_dense_solution(self):
+        update_with = self._problem()
+        dense, _ = update_with(jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-6))
+
+        kwargs = dict(n_components=2, n_oversamples=1, n_iter=2, pinv_tol=0.0, pinv_cutoff=1e-6)
+        truncated, info_t = update_with(RandomizedPinvSNR(**kwargs))
+        refined, info_r = update_with(
+            RandomizedPinvSNR(**kwargs, lbfgs=True, lbfgs_tol=1e-6, lbfgs_maxiter=500)
+        )
+
+        # the truncation discards force, the refinement recovers it
+        self.assertGreater(info_t["true_residual"], 1e-3)
+        self.assertAlmostEqual(info_r["residual_rsvd"], info_t["true_residual"], places=10)
+        self.assertLess(info_r["true_residual"], info_r["residual_rsvd"])
+        self.assertLess(info_r["true_residual"], 1e-5)
+        self.assertGreaterEqual(info_r["n_lbfgs"], 1)
+        self.assertGreater(info_r["lbfgs_iterations"], 0)
+        self.assertGreater(info_r["t_lbfgs"], 0.0)
+        self.assertLess(info_r["cos_lbfgs"], 1.0)
+        self.assertLess(
+            np.linalg.norm(refined - dense), 0.1 * np.linalg.norm(truncated - dense)
+        )
+        # the regularized quantities of the truncated basis are untouched
+        self.assertAlmostEqual(info_r["residual"], info_t["residual"], places=10)
+
+    def test_refinement_is_skipped_below_tolerance(self):
+        update_with = self._problem()
+        n_params = _reference_problem()[0].numParameters
+        plain, _ = update_with(RandomizedPinvSNR(n_components=n_params, n_iter=1, pinv_tol=0.0))
+        refined, info = update_with(
+            RandomizedPinvSNR(n_components=n_params, n_iter=1, pinv_tol=0.0, lbfgs=True, lbfgs_tol=1e-3)
+        )
+        self.assertEqual(info["n_lbfgs"], 0)
+        self.assertEqual(info["cos_lbfgs"], 1.0)
+        self.assertTrue(np.allclose(plain, refined))
+
+    def test_refinement_for_non_holomorphic_reductions(self):
+        L = 4
+        model = nets.TwoNets((nets.RBM(numHidden=3, bias=False), nets.RBM(numHidden=3, bias=False)))
+        psi = NQS(model, L, 2 ** L, seed=1234)
+        exactSampler = sampler.ExactSampler(psi)
+        hamiltonian = 0
+        for l in range(L):
+            hamiltonian += -1.0 * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) - 0.3 * op.SigmaX(l)
+        loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+        objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+
+        # The refinement runs over real updates. With q = i Im a diagonal shift adds a
+        # real component to the purely imaginary equation, which no real update can
+        # satisfy, so the shift is only used with q = Re here.
+        for make_real, diagonal_shift in ((True, 1e-3), (False, 0.0)):
+            with self.subTest(make_real=make_real):
+                solver = RandomizedPinvSNR(
+                    n_components=4, n_oversamples=2, n_iter=2, pinv_tol=0.0, pinv_cutoff=1e-6,
+                    lbfgs=True, lbfgs_tol=1e-6, lbfgs_maxiter=500
+                )
+                opt = jVMC_exp.optimizer.TDVP(
+                    exactSampler, psi, make_real=make_real, diagonalShift=diagonal_shift, solver=solver
+                )
+                update = opt.get_update(objective_fn_out)
+                info = opt._additional_info
+                self.assertFalse(jnp.iscomplexobj(update))
+                self.assertGreaterEqual(info["n_lbfgs"], 1)
+                self.assertLess(info["true_residual"], info["residual_rsvd"])
+                self.assertLess(info["true_residual"], 1e-5)
+
+    def test_rejects_bad_arguments(self):
+        with self.assertRaises(ValueError):
+            RandomizedPinvSNR(n_components=2, lbfgs=True, lbfgs_maxiter=0)
+
+
 class TestNonHolomorphicRandomizedPinvSNR(unittest.TestCase):
     def _setup(self):
         L = 4

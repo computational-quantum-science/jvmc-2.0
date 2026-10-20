@@ -101,6 +101,26 @@ is the port of `REIGH.randomized_eigh_jac`:
   operator application). `residual` keeps the `PinvSNR` meaning (force discarded
   inside the retained subspace) so that cross validation etc. are unchanged.
 
+* **L-BFGS refinement (toggle, port of `use_implicit` of the old `mytdvp.py`).**
+  `lbfgs=True` minimizes the true residual `||A x - b|| / ||b||` with
+  `jaxopt.LBFGS`, warm-started from the randomized pseudo-inverse update,
+  whenever that residual exceeds `lbfgs_tol` (default `1e-7`). As in the old
+  code the L-BFGS run (`lbfgs_maxiter=1000` iterations) is restarted while the
+  residual still improves by more than `lbfgs_rtol=1e-3` per run; new is the
+  hard cap `lbfgs_max_restarts=10`. The optimization variables are real: the
+  update itself for a non-holomorphic ansatz (as in the old script), real and
+  imaginary part for a holomorphic one (new). The loss is a module-level
+  function of the Jacobian, so jaxopt compiles it once per operator type and
+  reuses it across steps. Extra info/metadata: `residual_rsvd` (before),
+  `true_residual` (after), `n_lbfgs` (runs), `lbfgs_iterations`, `t_lbfgs`,
+  `cos_lbfgs`. `jaxopt` is imported lazily; without it `lbfgs=True` raises an
+  `ImportError` at the first solve. Note: with `q = i Im` and a diagonal shift
+  the equation has no real solution, so the refinement cannot reach a small
+  residual there (the shift adds a real component to a purely imaginary system).
+* The explicit transpose of the product returns the real part of the
+  cotangent for a real input (JAX's convention for a real-to-complex map), which
+  is what makes the L-BFGS gradient well typed for real updates.
+
 Exports: `jVMC_exp.solver.RandomizedPinvSNR`, `jVMC_exp.solver.randomized_eigh`,
 `jVMC_exp.solver.QGTOperator`.
 
@@ -125,23 +145,29 @@ dynamics of `tdvp_test.py` at full rank, step-for-step agreement with `PinvSNR`,
 low-rank solve equal to the dense one when the retained spectrum reaches the
 cutoff, SNR regularization with an MC sampler in both modes, batched Jacobian
 rejected), non-holomorphic ansatz for `make_real=True/False` (real update, equal
-to the dense solve), `SR` ground-state search. Run with one CPU device and with
+to the dense solve), `SR` ground-state search, and the L-BFGS refinement (recovers
+the discarded force at rank 2 of 8 and moves the update towards the dense one, is
+skipped below tolerance, works for both non-holomorphic reductions). Run with one CPU device and with
 `XLA_FLAGS=--xla_force_host_platform_device_count=4` (sharded paths).
 
 Results on 2026-10-20 (conda env `jvmc`, jax 0.9.1, CPU): `rsvd_test`, `cg_test`,
 `tdvp_test`, `sr_test` -- 30 passed on one device; `rsvd_test` + `cg_test` -- 20
 passed on four emulated devices. The experiment script ran end to end on CPU with a
 tiny configuration (L=4, 184 parameters, rank 40, 2000 samples, 3 steps).
+After adding the L-BFGS refinement: 34 passed on one device, 24 on four; the
+same tiny script run with `lbfgs=true` brought the true residual from 5e-2 to 3e-3
+(5 runs of 200 iterations, tolerance 1e-4 not yet reached at that budget).
 
 ### Not ported (on purpose)
 
-From the old `mytdvp.py`: the L-BFGS refinement of the update (`use_implicit`,
-jaxopt), the Hutchinson reconstruction-error estimate, the nullspace/band-rotation
-diagnostics (`commit_step`, `band_*`), `clear_caches`, and the per-solve
-`solve_log`. They were scan diagnostics around the solver rather than part of it;
-the metadata the optimizer already writes (`spectrum`, `residual`,
-`true_residual`, `pinv_cutoff`, `effective_rank`, `condition_number`,
-`tdvp_error`) covers the quantities the scan plotted, except the band rotation.
+From the old `mytdvp.py`: the Hutchinson reconstruction-error estimate, the
+nullspace/band-rotation diagnostics (`commit_step`, `band_*`), `clear_caches`,
+and the per-solve `solve_log`. They were scan diagnostics around the solver
+rather than part of it (the band diagnostics are to be added in the experiment
+script); the metadata the optimizer already writes (`spectrum`, `residual`,
+`true_residual`, `residual_rsvd`, `pinv_cutoff`, `effective_rank`,
+`condition_number`, `tdvp_error`, the `*_lbfgs` entries) covers the quantities
+the scan plotted, except the band rotation.
 
 ## 3. The experiment
 
@@ -157,8 +183,9 @@ in exactly these points:
 1. TDVP solver `RandomizedPinvSNR(...)` instead of `PinvSNR(...)`, configured by
    the new `simulation.rsvd` block of `input.json`
    (`n_components=4000` of 12592 real parameters, `n_oversamples=0`, `n_iter=4`,
-   `which="LM"`, `seed=4321`, `diagonalization_mode="distributed"`); a run entry
-   may override the block. `n_components` is clipped to the number of parameters
+   `which="LM"`, `seed=4321`, `diagonalization_mode="distributed"`, and the
+   L-BFGS toggle `lbfgs=false` with `lbfgs_tol`, `lbfgs_maxiter`, `lbfgs_rtol`,
+   `lbfgs_max_restarts`); a run entry may override the block. `n_components` is clipped to the number of parameters
    with a warning. The ground-state search for the x-polarized initial state keeps
    the dense `PinvSNR`.
 2. `jVMC_exp.sampler.CutoffSampler` instead of `MCSampler`, with the new
@@ -167,9 +194,10 @@ in exactly these points:
    required for importance-weighted samples.
 3. `tdvp_norm` uses `opt.qgt` (upstream renamed `_S0` to `qgt`; for the
    matrix-free solver it is the operator `S_0 v`).
-4. The data-file name carries `_eps=..._rsvd_nc=..._os=..._it=...`, the `config`
-   group of the HDF5 file records the sampler/solver settings, and the per-step
-   log line prints `true_res` and the current sampler cutoff.
+4. The data-file name carries `_eps=..._rsvd_nc=..._os=..._it=..._lbfgs=...`, the
+   `config` group of the HDF5 file records the sampler/solver settings, and the
+   per-step log line prints `true_res`, the current sampler cutoff and, with
+   L-BFGS, `res_rsvd`, `n_lbfgs` and `t_lbfgs`.
 5. `sbatch.sh`: job name `rsvd_test`, the stale `--dependency` line removed.
 
 `diagonalization_mode="distributed"` only takes effect with
