@@ -18,6 +18,7 @@ from jVMC_exp.stepper import AbstractStepper, Euler
 from jVMC_exp.util import ObservableEntry, measure
 from jVMC_exp.solver.base import AbstractSolver
 from jVMC_exp.solver.pinv import PinvSNR
+from jVMC_exp.solver.qgt_operator import QGTOperator
 from jVMC_exp.objective_function.base import AbstractObjectiveFunction, ObjectiveFunctionOutput
 from jVMC_exp.sharding_config import sharded, MESH, DEVICE_SHARDING
 
@@ -285,10 +286,13 @@ class Evolution(AbstractOptimizer):
         ):
         self.rhsPrefactor = -1 if imag_time else -1j 
         if psi.holomorphic:
+            self._lhs_trans_mode = "identity"
             self._lhs_trans_fn = lambda x: x
         elif make_real:
+            self._lhs_trans_mode = "real"
             self._lhs_trans_fn = lambda x: jnp.real(x)
         else:
+            self._lhs_trans_mode = "imag"
             self._lhs_trans_fn = lambda x: 1j * jnp.imag(x)
         self._rhs_trans_fn = lambda x: self._lhs_trans_fn(self.rhsPrefactor * x)
 
@@ -541,38 +545,31 @@ class Evolution(AbstractOptimizer):
 
         return weighted_batch, mean
     
-    def _get_lhs_lazy(self, grad_log_psi: SampledObs | LazySampledObs):
+    def _get_lhs_lazy(self, grad_log_psi: SampledObs | LazySampledObs) -> QGTOperator:
         '''
-        Returns a function that computes the matrix vector product with the left hand side of the TDVP equation
+        Returns the left hand side of the TDVP equation as a matrix-free linear operator
+        (see `jVMC_exp.solver.qgt_operator.QGTOperator`), which applies it to a vector
+        or to a block of vectors without forming the matrix. The products are sharded
+        over the samples of the Jacobian.
         '''
         if isinstance(grad_log_psi, LazySampledObs):
             raise ValueError(
                 f"Solver '{type(self.solver).__name__}' is matrix-free (_needs_dense_matrix=False) "
-                "and builds its matvec directly from the fully materialized Jacobian, but the "
+                "and builds its products directly from the fully materialized Jacobian, but the "
                 "Jacobian was computed in batches (LazySampledObs), which has no such materialized "
                 "array. Either use a solver with _needs_dense_matrix=True (e.g. PinvSNR), or "
                 "compute the Jacobian without batching."
             )
 
-        grad = grad_log_psi._normalized_obs
-        
-        def raw_matvec(v):
-            return (grad.conj().T @ (grad @ v))
+        operator = QGTOperator(
+            grad_log_psi._normalized_obs, self._lhs_trans_mode,
+            diag_scale=self.diag_scale, diag_shift=self.diag_shift
+        )
 
         if self.store_qgt:
-            self._qgt = raw_matvec
+            self._qgt = operator.raw
 
-        def matvec(v):
-            Sv = self._lhs_trans_fn(raw_matvec(v))
-            if self.diag_scale > 1e-15:
-                diag = jnp.sum(jnp.abs(grad) ** 2, axis=0)
-                Sv = Sv + self.diag_scale * diag * v
-            if self.diag_shift > 1e-15:
-                Sv = Sv + self.diag_shift * v
-
-            return Sv
-
-        return matvec
+        return operator
     
     def _get_rhs(self, grad):
         b = self._rhs_trans_fn(grad)
