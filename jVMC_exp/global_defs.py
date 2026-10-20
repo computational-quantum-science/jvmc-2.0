@@ -66,6 +66,37 @@ DT_OPERATORS_CPX = DT_OUT_CPX
 
 USE_DISTRIBUTED = os.environ.get('JVMC_USE_DISTRIBUTED', 'false').lower() == 'true'
 
+# Where the loop over the batches of a sharded call runs (see jVMC_exp.sharding_config.sharded):
+#   "python":   one dispatch per batch; the network is compiled once per batch size, whatever the number of samples
+#   "compiled": one dispatch per call (faster when batches are cheap); everything, the network included,
+#               is compiled again for every new number of samples
+# Read every time a sharded method is called, so it can be changed at any time with update().
+BATCH_LOOPS = ("python", "compiled")
+
+def _read_batch_loop(batch_loop: str):
+    batch_loop = batch_loop.lower()
+    if batch_loop not in BATCH_LOOPS:
+        raise ValueError(
+            f"Allowed batch loops are {', '.join(BATCH_LOOPS)}. "
+            f"Got {batch_loop}."
+        )
+
+    return batch_loop
+
+BATCH_LOOP = _read_batch_loop(os.environ.get("JVMC_BATCH_LOOP", "python"))
+
+# Largest chunk, in bytes, of the Jacobian that the products building the S matrix of SR/TDVP and
+# the tangent kernel of MinSR handle at once (0: the whole Jacobian at once). When it compiles a
+# matrix product, XLA autotunes it on its own copies of the operands, as large as the operands.
+def _read_matmul_chunk_bytes(chunk_bytes):
+    chunk_bytes = int(chunk_bytes)
+    if chunk_bytes < 0:
+        raise ValueError(f"The matmul chunk size has to be non-negative, got {chunk_bytes}.")
+
+    return chunk_bytes
+
+MATMUL_CHUNK_BYTES = _read_matmul_chunk_bytes(os.environ.get("JVMC_MATMUL_CHUNK_BYTES", 2**30))
+
 def update(
     *,
     dt_params_real: None | jnp.dtype = None,
@@ -73,6 +104,8 @@ def update(
     dt_out_real: None | jnp.dtype = None,
     dt_out_cpx: None | jnp.dtype = None,
     use_distributed: None | bool = None,
+    batch_loop: None | str = None,
+    matmul_chunk_bytes: None | int = None,
 ):
     """
     Update the global configuration.
@@ -82,6 +115,7 @@ def update(
     >>> jVMC_exp.global_defs.update(
     ...     dt_out_real=jnp.float32,
     ...     dt_out_cpx=jnp.complex64,
+    ...     batch_loop="compiled",
     ... )
     """
     global DT_PARAMS_REAL
@@ -89,6 +123,8 @@ def update(
     global DT_OUT_REAL
     global DT_OUT_CPX
     global USE_DISTRIBUTED
+    global BATCH_LOOP
+    global MATMUL_CHUNK_BYTES
     global DT_OPERATORS_REAL
     global DT_OPERATORS_CPX
     
@@ -120,3 +156,9 @@ def update(
 
     if use_distributed is not None:
         USE_DISTRIBUTED = bool(use_distributed)
+
+    if batch_loop is not None:
+        BATCH_LOOP = _read_batch_loop(batch_loop)
+
+    if matmul_chunk_bytes is not None:
+        MATMUL_CHUNK_BYTES = _read_matmul_chunk_bytes(matmul_chunk_bytes)

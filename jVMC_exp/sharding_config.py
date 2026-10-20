@@ -298,7 +298,7 @@ def broadcast_split_key(key, n_out_keys: int):
 
     return out_keys.astype(jnp.uint32)
 
-class sharded:
+class sharded_python:
     """
     Decorator to automatically create sharded versions of methods.
 
@@ -481,3 +481,51 @@ class sharded:
             out = jax.tree_util.tree_map(lambda o, r: layout.put(o, r, i), out, result)
 
         return jax.block_until_ready(out)
+
+class sharded_compiled(sharded_python):
+    def _call_local(self, layout: BatchLayout, kwargs, args, jsh_fn):
+        if layout.n_batches == 1:
+            return next(self._iter_local_batches(layout, kwargs, args, jsh_fn))
+
+        return jax.block_until_ready(
+            _jitted_call_local(kwargs, args, layout=layout, jsh_fn=jsh_fn)
+        )
+
+@jax.jit(static_argnames=("layout", "jsh_fn"))
+def _jitted_call_local(kwargs, args, *, layout: BatchLayout, jsh_fn):
+    """
+    The loop of `sharded._call_local` as a compiled function. It has at least two batches.
+    The last batch is written separately, since it can have fewer rows than the others.
+    """
+    def put(out, result, i, rows):
+        return jax.tree_util.tree_map(
+            lambda o, r: _put_batch(o, r, i, b=layout._local_batch_size, rows=rows), out, result
+        )
+
+    def batch(i):
+        return jsh_fn(kwargs, *(layout.take(a, i) for a in args))
+
+    last = layout.n_batches - 1
+    first = batch(0)
+    out = jax.tree_util.tree_map(
+        lambda r: jax.lax.with_sharding_constraint(
+            jnp.zeros((layout.num_samples,) + r.shape[1:], r.dtype), DEVICE_SHARDING
+        ),
+        first
+    )
+    out = put(out, first, 0, layout._local_batch_size)
+    out = jax.lax.fori_loop(
+        1, last, lambda i, out: put(out, batch(i), i, layout._local_batch_size), out
+    )
+
+    return put(out, batch(last), last, layout._last_local_size)
+
+_BATCH_LOOPS = {"python": sharded_python._call_local, "compiled": sharded_compiled._call_local}
+
+class sharded(sharded_python):
+    """
+    The decorator of the library: loops over the batches of a call as `sharded_python` or as
+    `sharded_compiled`, as set by `global_defs.BATCH_LOOP` when the decorated method is called.
+    """
+    def _call_local(self, layout: BatchLayout, kwargs, args, jsh_fn):
+        return _BATCH_LOOPS[global_defs.BATCH_LOOP](self, layout, kwargs, args, jsh_fn)

@@ -31,8 +31,21 @@ def _inv_normalize(data, inv_weights, mean, mask):
     return jnp.einsum("i, i... -> i...", mask, raw)
 
 @jax.jit
-def _normalize_no_center(data, weights):
-    return jnp.einsum("i, i... -> i...", jnp.sqrt(weights), data)
+def _get_weighted_covar(data, weights, other_normalized):
+    """
+    Covariance of ``data`` with the normalized observations of another observable, without
+    copies of ``data``: the weights and the complex conjugate are applied to the other
+    observable, and a real ``data`` is never converted to complex.
+    """
+    v = jnp.einsum("i, i... -> i...", jnp.sqrt(weights), other_normalized)
+    if jnp.iscomplexobj(data):
+        return jnp.conj(jnp.tensordot(data, jnp.conj(v), axes=(0, 0))).squeeze()
+    if jnp.iscomplexobj(v):
+        k = v.shape[-1]
+        covar = jnp.tensordot(data, jnp.concatenate([v.real, v.imag], axis=-1), axes=(0, 0))
+        return (covar[..., :k] + 1j * covar[..., k:]).squeeze()
+
+    return jnp.tensordot(data, v, axes=(0, 0)).squeeze()
 
 @jax.jit
 def _mean_and_weighted_no_center(data, weights):
@@ -190,8 +203,7 @@ class SampledObs():
         if other is None:
             return _get_self_covar(self._normalized_obs)
         
-        weighted = _normalize_no_center(self.observations, self.weights)
-        return _get_covar(weighted, other._normalized_obs)
+        return _get_weighted_covar(self.observations, self.weights, other._normalized_obs)
 
     def get_covar_obs(self, other: SampledObs | None = None) -> SampledObs:
         """
@@ -393,8 +405,7 @@ class LazySampledObs():
             normalized_obs_other = self._layout.split(other._normalized_obs)
 
             for batch, weights, batch_other in zip(self._observations, self._weights, normalized_obs_other):
-                batch = _normalize_no_center(batch, weights)
-                covar += _get_covar(batch, batch_other)
+                covar += _get_weighted_covar(batch, weights, batch_other)
 
             return covar.squeeze()
 

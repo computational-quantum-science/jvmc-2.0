@@ -495,14 +495,13 @@ class AbstractMCSampler(AbstractSampler):
         ):
         def perform_mc_update_single_chain(state, logProb, key_single, ProposerArg):
             # Generate update proposal
-            proposerKey, newKey = random.split(key_single)
+            proposerKey, newKey, acceptKey = random.split(key_single, 3)
             newState, log_prob_correction = updateProposer(proposerKey, state, ProposerArg)  
             
             # Compute acceptance probability
             P, newLogProb = get_ratio(logProb, log_prob_correction, params, state, newState)
             
             # Roll dice
-            acceptKey, newKey = random.split(newKey)
             accepted = random.bernoulli(acceptKey, P)
             
             # Perform update if accepted

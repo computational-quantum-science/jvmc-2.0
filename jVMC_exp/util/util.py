@@ -254,6 +254,13 @@ def s_norm_fn(opt: TDVP):
     """
     Norm induced by the quantum geometric tensor, :math:`\\|v\\|_S = \\sqrt{|v^\\dagger S v|}`.
     """
+    if not opt.store_qgt:
+        raise ValueError(
+            "The S-metric norm was requested, but the optimizer was not constructed "
+            "with store_qgt=True. Either construct the optimizer with store_qgt=True, "
+            "or use a different norm function."
+        )
+
     pad_size = opt._params_pad_size
     make_cmplx_array_fn = jax.jit(partial(make_cmplx_array, params_shape=opt.psi.paramShapes))
 
@@ -268,7 +275,7 @@ def s_norm_fn(opt: TDVP):
         return jnp.sqrt(jnp.abs(jnp.real(jnp.vdot(v, Sv))))
 
     def _norm_fn(v):
-        S = opt._S0
+        S = opt.qgt
         if S is None:
             raise RuntimeError(
                 "The S-metric norm was called before the right hand side of the TDVP "

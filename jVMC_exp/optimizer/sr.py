@@ -10,13 +10,15 @@ from jVMC_exp.util.output_manager import OutputManager
 class SR(Evolution):
     def __init__(
             self, sampler, psi, 
-            use_cross_valiadation=False, diagonalShift=0.001, diagonalScale=0., solver=PinvSNR(),
-            resample_stepper=True, output_manager: OutputManager | None = None
+            diagonalShift=0.001, diagonalScale=0., solver=PinvSNR(),
+            resample_stepper=True, output_manager: OutputManager | None = None,
+            store_qgt: bool = False
         ):
         super().__init__(
             sampler, psi, resample_stepper, True, True, 
-            use_cross_valiadation, diagonalShift, diagonalScale, solver,
-            output_manager=output_manager
+            False, diagonalShift, diagonalScale, solver,
+            output_manager=output_manager, store_qgt=store_qgt,
+            compute_tdvp_error=False
         )
 
     def time_evolution(
@@ -33,3 +35,6 @@ class SR(Evolution):
             "The SR optimizer is intended for ground state search only and "
             "cannot be used for time evolution. Use jVMC_exp.optimizer.TDVP instead."
         )
+
+    def cross_validation(self):
+            pass
