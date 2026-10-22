@@ -73,17 +73,36 @@ class TestQGTOperator(unittest.TestCase):
         self.assertTrue(jnp.allclose(A(Q[:, 0]), S @ Q[:, 0], atol=1e-12))
 
     def test_chunked_product_matches(self):
-        """The product is summed over chunks of samples; a tiny chunk must not change it."""
-        Q = jax.random.normal(jax.random.PRNGKey(3), (self.n, 2)) + 0j
-        A = QGTOperator(self.jac, "identity", diag_scale=0.0, diag_shift=0.0)
+        """
+        The product is summed over chunks of samples and accumulated in blocks of
+        parameter rows; a tiny chunk budget (one sample per chunk, several blocks)
+        must not change it, for any reduction and real or complex input.
+        """
+        k1, k2 = jax.random.split(jax.random.PRNGKey(3))
+        Q_real = jax.random.normal(k1, (self.n, 2))
+        Q_cpx = Q_real + 1j * jax.random.normal(k2, (self.n, 2))
+        trans = {"identity": lambda x: x, "real": jnp.real, "imag": lambda x: 1j * jnp.imag(x)}
         old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
         try:
-            jVMC_exp.global_defs.update(matmul_chunk_bytes=self.n * 16 * 3)  # three rows per chunk
-            A_small = QGTOperator(self.jac, "identity", diag_scale=0.0, diag_shift=0.0)
-            self.assertTrue(jnp.allclose(A_small(Q), self.S0 @ Q, atol=1e-12))
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=64)
+            for mode, tr in trans.items():
+                A = QGTOperator(self.jac, mode, diag_scale=0.0, diag_shift=0.0)
+                for Q in (Q_real, Q_cpx, Q_real[:, 0]):
+                    with self.subTest(mode=mode, dtype=str(Q.dtype), ndim=Q.ndim):
+                        self.assertTrue(jnp.allclose(A(Q), tr(self.S0) @ Q, atol=1e-12))
+                        self.assertTrue(jnp.allclose(A.raw(Q), self.S0 @ Q, atol=1e-12))
         finally:
             jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
-        self.assertTrue(jnp.allclose(A(Q), self.S0 @ Q, atol=1e-12))
+
+    def test_real_reduction_stays_in_real_arithmetic(self):
+        """For q = Re and a real block the result is real (no complex accumulator)."""
+        Q = jax.random.normal(jax.random.PRNGKey(4), (self.n, 3))
+        A = QGTOperator(self.jac, "real", diag_scale=0.0, diag_shift=0.0)
+        out = A(Q)
+        self.assertFalse(jnp.iscomplexobj(out))
+        self.assertTrue(jnp.allclose(out, jnp.real(self.S0) @ Q, atol=1e-12))
+        A = QGTOperator(self.jac, "imag", diag_scale=0.0, diag_shift=0.0)
+        self.assertTrue(jnp.allclose(A(Q), 1j * jnp.imag(self.S0) @ Q, atol=1e-12))
 
 
 class TestRandomizedEigh(unittest.TestCase):

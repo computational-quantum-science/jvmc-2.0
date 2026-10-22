@@ -42,7 +42,17 @@ matrix-free solver (`_needs_dense_matrix == False`), replacing the bare closure
   `global_defs.MATMUL_CHUNK_BYTES` of the Jacobian (same knob and same
   `optimization_barrier` trick as upstream's `Evolution._add_qgt`), so the
   intermediate `J_chunk @ Q` is bounded in size instead of being
-  `(num_samples_local, r)`.
+  `(num_samples_local, r)`. Since 2026-10-22 the result is also accumulated in
+  blocks of parameter rows bounded by the same budget: XLA fuses the accumulation
+  into the GEMM and autotunes it on copies of all operands, accumulator included,
+  which for a single `(94640, 16000)` complex output was a 22.6 GiB allocation
+  that ran out of memory on 96 GB cards.
+* **Real arithmetic for the reductions.** For `q = Re` and `q = i Im` with a real
+  input (the subspace iteration and every non-holomorphic update) the product is
+  `A^T(Av) + B^T(Bv)` resp. `A^T(Bv) - B^T(Av)` with `J = A + iB`
+  (`_qgt_product_re` / `_qgt_product_im`): a real accumulator, half the memory and
+  two thirds of the flops of the complex product followed by taking the part. Both
+  carry explicit transposes (symmetric resp. antisymmetric).
 * **Transpose.** `jax.scipy.sparse.linalg.cg` transposes the operator it is given
   and the chunked loop is not transposable by JAX itself, so the product is
   wrapped in `jax.custom_derivatives.linear_call` with the explicit transpose
@@ -214,8 +224,12 @@ available with `system.dimension = 2`):
 
 Memory on 8 GPUs: the Jacobian (40000 x 94640 complex) is 7.6 GB per GPU; the
 replicated `(94640, r)` float64 blocks of the solver are 6 GB each at r = 8000
-and 12 GB at r = 16000, three of them at once, plus the r x r Ritz matrix
-(distributed). r = 16000 therefore needs the 80/96 GB cards.
+and 12 GB at r = 16000, about four of them at once (`Q`, `Y`, the reduction
+buffer, the QR workspace), plus the r x r Ritz matrix (distributed). More GPUs
+do not shrink the replicated blocks, only the Jacobian shard. The first attempt
+at r = 16000 on JUPITER (2 x 4 GH200, 96 GB) died in the autotuner of the
+product with a 22.6 GiB complex accumulator; see the chunking and real-arithmetic
+entries in section 2 for the fix.
 
 ## 4. Things to keep in mind
 

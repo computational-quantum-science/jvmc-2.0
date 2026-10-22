@@ -22,7 +22,7 @@ import jax.random as random
 
 from jVMC_exp.sharding_config import MESH, REPLICATED_SHARDING, broadcast_split_key
 from jVMC_exp.solver.pinv import PinvSNR
-from jVMC_exp.solver.qgt_operator import QGTOperator, _qgt_product, transformed_product, _apply
+from jVMC_exp.solver.qgt_operator import QGTOperator, _qgt_product_im, transformed_product, _apply
 from jVMC_exp.solver.util import diagonalize
 
 WHICH = ("LM", "LA")
@@ -52,14 +52,17 @@ def _subspace_iteration(jac, key, diag, diag_shift, *, total_rank, n_iter, apply
     The operator is applied ``2 * n_iter + 2`` times. ``Q`` is drawn inside the jit so
     that it is created replicated on every device. The ``(num_params, r)`` blocks are
     replicated because ``jnp.linalg.qr`` has no distributed lowering; the parallelism
-    lies in the products with the sample-sharded Jacobian.
+    lies in the products with the sample-sharded Jacobian. For the real probe modes
+    every ``(num_params, r)`` block, the accumulator of the product included, is
+    real: about four of them (``Q``, ``Y``, the reduction buffer and the QR
+    workspace) live at once, 12 GB each for 94640 x 16000 doubles.
     """
     n = jac.shape[1]
     real_dtype = jnp.real(jac).dtype
 
     def apply(Q):
         if apply_mode == "imag_real":
-            SQ = jnp.imag(_qgt_product(jac, Q))
+            SQ = _qgt_product_im(jac, Q)
         else:
             SQ = transformed_product(jac, Q, "imag" if apply_mode == "imag_cpx" else apply_mode)
         if has_diag:

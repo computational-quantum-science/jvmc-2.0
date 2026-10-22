@@ -22,47 +22,118 @@ TransformMode = Literal["identity", "real", "imag"]
 TRANSFORM_MODES = ("identity", "real", "imag")
 
 
-def _local_product(jac, v):
+Part = Literal["cpx", "re", "im"]
+
+
+def _chunk_sizes(n_samples, n_params, width, jac_itemsize, out_itemsize):
     """
-    ``conj(jac).T @ (jac @ v)`` over the samples of this device, summed over chunks of
-    at most ``global_defs.MATMUL_CHUNK_BYTES`` of the Jacobian: XLA autotunes a matrix
-    product on its own copies of the operands, which would otherwise be as large as
-    the Jacobian, and the intermediate ``jac @ v`` is bounded in the same way.
+    Rows of the Jacobian per chunk and rows of the result per block, both bounded by
+    ``global_defs.MATMUL_CHUNK_BYTES`` (0: no bound).
+    """
+    budget = global_defs.MATMUL_CHUNK_BYTES or n_samples * n_params * jac_itemsize
+    chunk = max(1, min(n_samples, budget // (n_params * jac_itemsize)))
+    block = max(1, min(n_params, budget // max(1, width * out_itemsize)))
+
+    return chunk, block
+
+
+def _local_product(jac, v, part: Part):
+    """
+    Over the samples of this device, ``part`` of ``conj(jac).T @ (jac @ v)``:
+
+    * ``"cpx"``: the complex product, for a real or complex ``v``;
+    * ``"re"`` / ``"im"``: its real / imaginary part for a REAL ``v``, in real
+      arithmetic. With ``jac = A + iB`` these are ``A^T (A v) + B^T (B v)`` and
+      ``A^T (B v) - B^T (A v)``: a real accumulator (half the memory of the complex
+      one) and two thirds of the flops of the complex product.
+
+    The sum runs over chunks of at most ``global_defs.MATMUL_CHUNK_BYTES`` of the
+    Jacobian, and the result is accumulated in blocks of parameter rows bounded by the
+    same size: XLA autotunes a matrix product on its own copies of the operands,
+    including the accumulator the product is fused into, so neither the operands nor
+    the output of any single product may be large. (A single product with a
+    ``(num_params, r)`` output was what ran out of memory at r = 16000.)
     """
     n_samples, n_params = jac.shape
-    row_bytes = n_params * jac.dtype.itemsize
-    chunk = max(1, min(n_samples, (global_defs.MATMUL_CHUNK_BYTES or n_samples * row_bytes) // row_bytes))
+    width = v.shape[1] if v.ndim == 2 else 1
+    if part == "cpx":
+        out_dtype = jnp.result_type(jac.dtype, v.dtype)
+    else:
+        out_dtype = jnp.result_type(jnp.real(jac).dtype, v.dtype)
+    chunk, block = _chunk_sizes(
+        n_samples, n_params, width, jac.dtype.itemsize, jnp.dtype(out_dtype).itemsize
+    )
 
-    out_dtype = jnp.result_type(jac.dtype, v.dtype)
-    acc0 = jnp.zeros((n_params,) + v.shape[1:], out_dtype)
+    # The accumulator has to be 'varying' over the devices from the start (shard_map's
+    # rule for loop carries)
+    acc = jax.lax.pvary(jnp.zeros((n_params,) + v.shape[1:], out_dtype), ("devices",))
 
     def add_chunk(k, acc, size=chunk):
         rows = jax.lax.dynamic_slice_in_dim(jac, k * chunk, size)
         # Materialized: XLA would otherwise fuse the slice into the product and
         # autotune it on the whole operand
         rows = jax.lax.optimization_barrier(rows)
-        return acc + jnp.conj(rows).T @ (rows @ v)
 
-    # The carry has to be 'varying' over the devices from the start (shard_map's
-    # scan rule), so the first chunk seeds it instead of a plain zero block
+        if part == "cpx":
+            jv = rows @ v
+
+            def contribution(j, bsize):
+                cols = jax.lax.dynamic_slice_in_dim(rows, j * block, bsize, axis=1)
+                return jnp.conj(cols).T @ jv
+        else:
+            ar, ai = jnp.real(rows), jnp.imag(rows)
+            av, bv = ar @ v, ai @ v
+
+            def contribution(j, bsize):
+                cr = jax.lax.dynamic_slice_in_dim(ar, j * block, bsize, axis=1)
+                ci = jax.lax.dynamic_slice_in_dim(ai, j * block, bsize, axis=1)
+                if part == "re":
+                    return cr.T @ av + ci.T @ bv
+                return cr.T @ bv - ci.T @ av
+
+        def add_block(j, acc, bsize=block):
+            old = jax.lax.dynamic_slice_in_dim(acc, j * block, bsize, axis=0)
+            return jax.lax.dynamic_update_slice_in_dim(
+                acc, old + contribution(j, bsize), j * block, axis=0
+            )
+
+        n_full = n_params // block
+        acc = jax.lax.fori_loop(0, n_full, add_block, acc)
+        if n_params % block:
+            acc = add_block(n_full, acc, n_params % block)
+
+        return acc
+
     n_full = n_samples // chunk
-    acc = jax.lax.fori_loop(1, n_full, add_chunk, add_chunk(0, acc0))
+    acc = jax.lax.fori_loop(0, n_full, add_chunk, acc)
     if n_samples % chunk:
         acc = add_chunk(n_full, acc, n_samples % chunk)
 
     return acc
 
 
-@jax.jit
-def _qgt_product_impl(jac, v):
-    product = jax.shard_map(
-        lambda j, x: jax.lax.psum(_local_product(j, x), "devices"),
+def _sharded_product(part: Part):
+    return jax.shard_map(
+        lambda j, x: jax.lax.psum(_local_product(j, x, part), "devices"),
         mesh=MESH,
         in_specs=(DEVICE_SPEC, REPLICATED_SPEC),
         out_specs=REPLICATED_SPEC,
     )
 
-    return product(jac, v)
+
+@jax.jit
+def _qgt_product_impl(jac, v):
+    return _sharded_product("cpx")(jac, v)
+
+
+@jax.jit
+def _qgt_product_re_impl(jac, v):
+    return _sharded_product("re")(jac, v)
+
+
+@jax.jit
+def _qgt_product_im_impl(jac, v):
+    return _sharded_product("im")(jac, v)
 
 
 def _qgt_product_transpose(jac, ct):
@@ -74,6 +145,16 @@ def _qgt_product_transpose_real(jac, ct):
     # For a real input the map is (S_0 . cast) and the cotangent of the cast is the
     # real part, as in JAX's own transpose of a real -> complex conversion
     return jnp.real(_qgt_product_transpose(jac, ct))
+
+
+def _qgt_product_re_transpose(jac, ct):
+    # Re(S_0) is symmetric
+    return _qgt_product_re_impl(jac, ct)
+
+
+def _qgt_product_im_transpose(jac, ct):
+    # Im(S_0) is antisymmetric
+    return -_qgt_product_im_impl(jac, ct)
 
 
 @jax.jit
@@ -88,6 +169,18 @@ def _qgt_product(jac, v):
     """
     transpose = _qgt_product_transpose if jnp.iscomplexobj(v) else _qgt_product_transpose_real
     return linear_call(_qgt_product_impl, transpose, jac, v)
+
+
+@jax.jit
+def _qgt_product_re(jac, v):
+    """``Re(conj(jac).T @ jac) @ v`` for a REAL ``v``, in real arithmetic; see :func:`_qgt_product`."""
+    return linear_call(_qgt_product_re_impl, _qgt_product_re_transpose, jac, v)
+
+
+@jax.jit
+def _qgt_product_im(jac, v):
+    """``Im(conj(jac).T @ jac) @ v`` for a REAL ``v``, in real arithmetic; see :func:`_qgt_product`."""
+    return linear_call(_qgt_product_im_impl, _qgt_product_im_transpose, jac, v)
 
 
 @jax.jit
@@ -114,21 +207,34 @@ def _transform(x, mode: TransformMode):
     raise ValueError(f"The transformation mode has to be one of {TRANSFORM_MODES}, got {mode!r}.")
 
 
+def _transformed_product_real_input(jac, v, mode: TransformMode):
+    """``q[S_0] v`` for a real ``v`` without ever forming the complex product."""
+    if mode == "real":
+        return _qgt_product_re(jac, v)
+    if mode == "imag":
+        return 1j * _qgt_product_im(jac, v)
+
+    raise ValueError(f"The transformation mode has to be one of {TRANSFORM_MODES}, got {mode!r}.")
+
+
 def transformed_product(jac, v, mode: TransformMode):
     """
     ``q[S_0] @ v`` for the matrix :math:`q[S_0]`, ``v`` of shape ``(num_params,)`` or
     ``(num_params, r)``. The transformations :math:`\\text{Re}` and :math:`i\\,\\text{Im}`
     are only real-linear, so ``q[S_0 v]`` equals ``q[S_0] v`` for a real ``v`` only; a
     complex ``v`` is split into real and imaginary part, which doubles the width of
-    the product.
+    the product. For these two transformations the product is done in real
+    arithmetic (:func:`_qgt_product_re`, :func:`_qgt_product_im`).
     """
-    if mode == "identity" or not jnp.iscomplexobj(v):
-        return _transform(_qgt_product(jac, v), mode)
+    if mode == "identity":
+        return _qgt_product(jac, v)
+    if not jnp.iscomplexobj(v):
+        return _transformed_product_real_input(jac, v, mode)
 
     v2d = v.reshape(v.shape[0], -1)
     r = v2d.shape[1]
     parts = jnp.concatenate([jnp.real(v2d), jnp.imag(v2d)], axis=1)
-    Sp = _transform(_qgt_product(jac, parts), mode)
+    Sp = _transformed_product_real_input(jac, parts, mode)
 
     return (Sp[:, :r] + 1j * Sp[:, r:]).reshape(v.shape)
 
