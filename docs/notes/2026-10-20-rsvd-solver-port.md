@@ -47,6 +47,23 @@ matrix-free solver (`_needs_dense_matrix == False`), replacing the bare closure
   into the GEMM and autotunes it on copies of all operands, accumulator included,
   which for a single `(94640, 16000)` complex output was a 22.6 GiB allocation
   that ran out of memory on 96 GB cards.
+* **Eager, block-wise subspace iteration (2026-10-22, second attempt at r = 16000).**
+  The whole iteration used to be one jitted kernel; XLA's buffer assignment for it
+  kept several full `(94640, 16000)` temporaries (accumulator and all-reduce
+  output of an application next to `Q`, `Y` and the QR workspace): a 72.9 GiB
+  peak and a 47.4 GiB temporary that could not be allocated. The stages are now
+  separate dispatches (`rsvd._subspace_iteration`): an application is done in
+  column blocks of at most `MATMUL_CHUNK_BYTES` of output, each written into a
+  preallocated result, the QR donates its input, and buffers are released between
+  stages, so at most two full blocks plus the temporaries of one column block (or
+  the QR workspace) are alive: about 25 GB for 94640 x 16000 doubles plus the
+  Jacobian shard. Doing the blocking inside the single kernel was tried first and
+  made XLA's temporary buffer larger. `randomized_eigh` also replicates the small
+  eigenvector matrix explicitly before forming the Ritz vectors and skips the
+  final column selection when it is the identity (no oversampling, ascending
+  spectrum). `JVMC_RSVD_DEBUG=1` synchronizes after every stage and prints the
+  device memory of process 0, so an out-of-memory error is reported where it
+  happens.
 * **Real arithmetic for the reductions.** For `q = Re` and `q = i Im` with a real
   input (the subspace iteration and every non-holomorphic update) the product is
   `A^T(Av) + B^T(Bv)` resp. `A^T(Bv) - B^T(Av)` with `J = A + iB`
@@ -227,9 +244,10 @@ replicated `(94640, r)` float64 blocks of the solver are 6 GB each at r = 8000
 and 12 GB at r = 16000, about four of them at once (`Q`, `Y`, the reduction
 buffer, the QR workspace), plus the r x r Ritz matrix (distributed). More GPUs
 do not shrink the replicated blocks, only the Jacobian shard. The first attempt
-at r = 16000 on JUPITER (2 x 4 GH200, 96 GB) died in the autotuner of the
-product with a 22.6 GiB complex accumulator; see the chunking and real-arithmetic
-entries in section 2 for the fix.
+at r = 16000 on JUPITER (2 x 4 GH200 120 GB) died in the autotuner of the
+product with a 22.6 GiB complex accumulator, the second in the 47.4 GiB
+temporary of the subspace-iteration executable; see the chunking, real-arithmetic
+and column-blocking entries in section 2 for the fixes.
 
 ## 4. Things to keep in mind
 

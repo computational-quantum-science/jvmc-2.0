@@ -14,12 +14,15 @@ that is diagonalized, with any of the backends of
 """
 from functools import partial
 from typing import Literal
+import os
 import time
 
 import jax
 import jax.numpy as jnp
 import jax.random as random
+import numpy as np
 
+from jVMC_exp import global_defs
 from jVMC_exp.sharding_config import MESH, REPLICATED_SHARDING, broadcast_split_key
 from jVMC_exp.solver.pinv import PinvSNR
 from jVMC_exp.solver.qgt_operator import QGTOperator, _qgt_product_im, transformed_product, _apply
@@ -32,67 +35,166 @@ def _pin(x):
     return jax.lax.with_sharding_constraint(x, REPLICATED_SHARDING)
 
 
-@partial(jax.jit, static_argnames=("total_rank", "n_iter", "apply_mode", "has_diag"))
-def _subspace_iteration(jac, key, diag, diag_shift, *, total_rank, n_iter, apply_mode, has_diag):
-    """
-    Orthonormal basis ``Q`` of the dominant subspace of the operator and its
-    Rayleigh-Ritz matrix ``B = Q^H A Q``.
+# JVMC_RSVD_DEBUG=1: wait for every stage of randomized_eigh and print the device memory
+# of process 0 afterwards, so that an out-of-memory error is reported at the stage that
+# caused it instead of at the next host synchronization
+_DEBUG = os.environ.get("JVMC_RSVD_DEBUG", "").lower() in ("1", "true", "yes")
 
-    ``apply_mode`` selects how the operator is applied to a block:
+
+def _debug_stage(name, *arrays):
+    if not _DEBUG:
+        return
+    jax.block_until_ready(arrays)
+    if jax.process_index() == 0:
+        stats = jax.local_devices()[0].memory_stats() or {}
+        in_use = stats.get("bytes_in_use", 0) / 2 ** 30
+        peak = stats.get("peak_bytes_in_use", 0) / 2 ** 30
+        print(f"[rsvd] {name}: {in_use:.1f} GiB in use, peak {peak:.1f} GiB", flush=True)
+
+
+@jax.jit
+def _ritz_vectors(Q, V_small):
+    return _pin(Q @ V_small)
+
+
+@partial(jax.jit, static_argnames=("apply_mode", "has_diag"))
+def _apply_block(jac, Q, diag, diag_shift, *, apply_mode, has_diag):
+    """
+    The operator applied to a block ``Q``. ``apply_mode`` selects how:
 
     * ``"identity"``: :math:`S_0 Q` (complex probe),
     * ``"real"``: :math:`\\text{Re}(S_0) Q` (real probe),
     * ``"imag_real"``: :math:`\\text{Im}(S_0) Q` for a real probe. The operator is
       :math:`i\\,\\text{Im}(S_0)`; the global factor ``i`` is stripped so that the
-      iterate stays real, and restored once in ``B``. Only valid without
-      diagonal terms, which do not share the factor ``i``.
+      iterate stays real, and restored once in the Rayleigh-Ritz matrix. Only valid
+      without diagonal terms, which do not share the factor ``i``.
     * ``"imag_cpx"``: :math:`i\\,\\text{Im}(S_0) Q` (complex probe), used with
       diagonal terms.
-
-    The operator is applied ``2 * n_iter + 2`` times. ``Q`` is drawn inside the jit so
-    that it is created replicated on every device. The ``(num_params, r)`` blocks are
-    replicated because ``jnp.linalg.qr`` has no distributed lowering; the parallelism
-    lies in the products with the sample-sharded Jacobian. For the real probe modes
-    every ``(num_params, r)`` block, the accumulator of the product included, is
-    real: about four of them (``Q``, ``Y``, the reduction buffer and the QR
-    workspace) live at once, 12 GB each for 94640 x 16000 doubles.
     """
-    n = jac.shape[1]
-    real_dtype = jnp.real(jac).dtype
-
-    def apply(Q):
-        if apply_mode == "imag_real":
-            SQ = _qgt_product_im(jac, Q)
-        else:
-            SQ = transformed_product(jac, Q, "imag" if apply_mode == "imag_cpx" else apply_mode)
-        if has_diag:
-            SQ = SQ + diag[:, None] * Q + diag_shift * Q
-
-        return _pin(SQ)
-
-    if apply_mode in ("real", "imag_real"):
-        Omega = random.normal(key, (n, total_rank), dtype=real_dtype)
+    if apply_mode == "imag_real":
+        SQ = _qgt_product_im(jac, Q)
     else:
+        SQ = transformed_product(jac, Q, "imag" if apply_mode == "imag_cpx" else apply_mode)
+    if has_diag:
+        SQ = SQ + diag[:, None] * Q + diag_shift * Q
+
+    return _pin(SQ)
+
+
+@partial(jax.jit, static_argnames=("width",))
+def _alloc_output(piece, *, width):
+    return _pin(jnp.zeros((piece.shape[0], width), piece.dtype))
+
+
+@partial(jax.jit, static_argnames=("start",), donate_argnums=0)
+def _put_block(out, piece, *, start):
+    return jax.lax.dynamic_update_slice_in_dim(out, piece, start, axis=1)
+
+
+@partial(jax.jit, static_argnames=("start", "stop"))
+def _take_block(Q, *, start, stop):
+    return jax.lax.slice_in_dim(Q, start, stop, axis=1)
+
+
+def _apply_operator(jac, Q, diag, diag_shift, *, apply_mode, has_diag):
+    """
+    The operator applied to the ``(num_params, r)`` block ``Q``, one column block of at
+    most ``global_defs.MATMUL_CHUNK_BYTES`` of output per dispatch, written into a
+    preallocated result.
+
+    Done eagerly rather than inside one jitted kernel on purpose: this bounds what
+    is alive at once to the input, the output and the temporaries of one block
+    (XLA's buffer assignment for the whole iteration in one executable kept several
+    full ``(num_params, r)`` temporaries, 47 GiB for 94640 x 16000 doubles).
+    """
+    n, r = Q.shape
+    out_dtype = jnp.result_type(jac.dtype, Q.dtype) if apply_mode in ("identity", "imag_cpx") else Q.dtype
+    budget = global_defs.MATMUL_CHUNK_BYTES
+    block = r if not budget else max(1, min(r, budget // (n * jnp.dtype(out_dtype).itemsize)))
+    if block >= r:
+        return _apply_block(jac, Q, diag, diag_shift, apply_mode=apply_mode, has_diag=has_diag)
+
+    out = None
+    for start in range(0, r, block):
+        stop = min(start + block, r)
+        piece = _apply_block(
+            jac, _take_block(Q, start=start, stop=stop), diag, diag_shift,
+            apply_mode=apply_mode, has_diag=has_diag
+        )
+        if out is None:
+            out = _alloc_output(piece, width=r)
+        out = _put_block(out, piece, start=start)
+        del piece
+
+    return out
+
+
+@partial(jax.jit, static_argnames=("real_dtype", "n", "total_rank", "complex_probe"))
+def _probe(key, *, real_dtype, n, total_rank, complex_probe):
+    """The random probe block, drawn inside the jit so that it is created replicated."""
+    if complex_probe:
         key_re, key_im = random.split(key)
         Omega = (
             random.normal(key_re, (n, total_rank), dtype=real_dtype)
             + 1j * random.normal(key_im, (n, total_rank), dtype=real_dtype)
         )
-    Omega = _pin(Omega)
+    else:
+        Omega = random.normal(key, (n, total_rank), dtype=real_dtype)
 
-    Y = apply(Omega)
-    for _ in range(n_iter):
-        Q, _ = jnp.linalg.qr(Y, mode="reduced")
-        Y = apply(Q)
-        Q, _ = jnp.linalg.qr(Y, mode="reduced")
-        Y = apply(Q)
+    return _pin(Omega)
+
+
+@partial(jax.jit, donate_argnums=0)
+def _orthonormalize(Y):
+    """``Q`` of the reduced QR of ``Y``; ``Y`` is donated so that the factorization can reuse its buffer."""
     Q, _ = jnp.linalg.qr(Y, mode="reduced")
 
-    B = jnp.conj(Q).T @ apply(Q)
-    if apply_mode == "imag_real":
+    return _pin(Q)
+
+
+@partial(jax.jit, static_argnames=("restore_i",))
+def _rayleigh_ritz(Q, SQ, *, restore_i):
+    B = jnp.conj(Q).T @ SQ
+    if restore_i:
         B = 1j * B
     # Hermitian by construction, symmetrized against round-off
-    B = 0.5 * (B + jnp.conj(B).T)
+    return 0.5 * (B + jnp.conj(B).T)
+
+
+def _subspace_iteration(jac, key, diag, diag_shift, *, total_rank, n_iter, apply_mode, has_diag):
+    """
+    Orthonormal basis ``Q`` of the dominant subspace of the operator and its
+    Rayleigh-Ritz matrix ``B = Q^H A Q``, see :func:`_apply_block` for ``apply_mode``.
+
+    The operator is applied ``2 * n_iter + 2`` times. The ``(num_params, r)`` blocks
+    are replicated because ``jnp.linalg.qr`` has no distributed lowering; the
+    parallelism lies in the products with the sample-sharded Jacobian. The stages
+    are separate dispatches (see :func:`_apply_operator`), so that at most two of
+    these blocks plus the temporaries of one column block (applications) or the QR
+    workspace (orthonormalization) are alive at once: for 94640 x 16000 doubles
+    about 25 GB plus the Jacobian shard.
+    """
+    n = jac.shape[1]
+    real_dtype = jnp.real(jac).dtype
+    kwargs = dict(apply_mode=apply_mode, has_diag=has_diag)
+
+    Y = _apply_operator(
+        jac, _probe(key, real_dtype=real_dtype, n=n, total_rank=total_rank, complex_probe=apply_mode not in ("real", "imag_real")),
+        diag, diag_shift, **kwargs
+    )
+    _debug_stage("first application", Y)
+    for _ in range(n_iter):
+        Q = _orthonormalize(Y)
+        Y = _apply_operator(jac, Q, diag, diag_shift, **kwargs)
+        del Q
+        Q = _orthonormalize(Y)
+        Y = _apply_operator(jac, Q, diag, diag_shift, **kwargs)
+        del Q
+    Q = _orthonormalize(Y)
+    del Y
+    SQ = _apply_operator(jac, Q, diag, diag_shift, **kwargs)
+    B = _rayleigh_ritz(Q, SQ, restore_i=apply_mode == "imag_real")
+    del SQ
 
     return Q, B
 
@@ -181,6 +283,7 @@ def randomized_eigh(
         total_rank=total_rank, n_iter=int(n_iter),
         apply_mode=_apply_mode(operator), has_diag=operator.has_diagonal_terms
     )
+    _debug_stage("subspace iteration", Q, B)
 
     # The distributed backend needs a size divisible by the number of devices; the
     # padded modes get a huge eigenvalue and end up last in the ascending spectrum.
@@ -189,11 +292,30 @@ def randomized_eigh(
         B = jnp.pad(B, ((0, pad), (0, pad)))
         Q = jnp.pad(Q, ((0, 0), (0, pad)))
     ev, V_small = diagonalize(B, pad_size=pad, mode=diagonalization_mode, T_A=T_A)
-    V = Q @ V_small
+    _debug_stage("Rayleigh-Ritz diagonalization", ev, V_small)
+
+    # The small eigenvector matrix is replicated explicitly (r x r) before the product
+    # with the replicated Q, so that the partitioner does not build partial
+    # (num_params, r) products on every device.
+    V_small = jax.device_put(V_small, REPLICATED_SHARDING)
+    V = _ritz_vectors(Q, V_small)
+    del Q, V_small
     if pad:
         ev, V = ev[:total_rank], V[:, :total_rank]
+    _debug_stage("Ritz vectors", V)
 
-    return _select(ev, jax.device_put(V, REPLICATED_SHARDING), k=k, which=which)
+    # Selecting and reordering is a copy of the (num_params, k) block; skipped when
+    # it would be the identity (k == total_rank with an already ascending spectrum).
+    ev_host = np.asarray(ev)
+    idx = np.argsort(np.abs(ev_host))[::-1][:k] if which == "LM" else np.argsort(ev_host)[::-1][:k]
+    idx = idx[np.argsort(ev_host[idx])]
+    if k == total_rank and np.array_equal(idx, np.arange(total_rank)):
+        return ev, V
+
+    ev, V = _select(ev, V, k=k, which=which)
+    _debug_stage("selection", ev, V)
+
+    return ev, V
 
 
 def _pack(x, complex_solution):

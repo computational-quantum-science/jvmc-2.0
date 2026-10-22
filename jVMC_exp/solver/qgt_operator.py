@@ -140,19 +140,50 @@ def _sharded_product(part: Part):
     )
 
 
+def _blocked_product(jac, v, part: Part):
+    """
+    The sharded product applied to column blocks of ``v``, each with an output of at
+    most ``global_defs.MATMUL_CHUNK_BYTES``, written into one ``(num_params, r)``
+    result. Bounds the temporaries of one application: the accumulator and the
+    all-reduce buffer of a block instead of two full ``(num_params, r)`` blocks
+    (12 GB each for 94640 x 16000 doubles) next to the input and the output.
+    """
+    product = _sharded_product(part)
+    if v.ndim == 1:
+        return product(jac, v)
+
+    n, width = v.shape
+    out_itemsize = jnp.dtype(
+        jnp.result_type(jac.dtype, v.dtype) if part == "cpx" else jnp.result_type(jnp.real(jac).dtype, v.dtype)
+    ).itemsize
+    budget = global_defs.MATMUL_CHUNK_BYTES
+    block = width if not budget else max(1, min(width, budget // (n * out_itemsize)))
+    if block >= width:
+        return product(jac, v)
+
+    out = None
+    for start in range(0, width, block):
+        piece = product(jac, v[:, start:start + block])
+        if out is None:
+            out = jnp.zeros((n, width), piece.dtype)
+        out = jax.lax.dynamic_update_slice_in_dim(out, piece, start, axis=1)
+
+    return out
+
+
 @jax.jit
 def _qgt_product_impl(jac, v):
-    return _sharded_product("cpx")(jac, v)
+    return _blocked_product(jac, v, "cpx")
 
 
 @jax.jit
 def _qgt_product_re_impl(jac, v):
-    return _sharded_product("re")(jac, v)
+    return _blocked_product(jac, v, "re")
 
 
 @jax.jit
 def _qgt_product_im_impl(jac, v):
-    return _sharded_product("im")(jac, v)
+    return _blocked_product(jac, v, "im")
 
 
 def _qgt_product_transpose(jac, ct):
