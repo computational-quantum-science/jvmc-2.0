@@ -39,17 +39,22 @@ def _pin(x):
 # of process 0 afterwards, so that an out-of-memory error is reported at the stage that
 # caused it instead of at the next host synchronization
 _DEBUG = os.environ.get("JVMC_RSVD_DEBUG", "").lower() in ("1", "true", "yes")
+_debug_clock = [None]
 
 
 def _debug_stage(name, *arrays):
+    """With JVMC_RSVD_DEBUG: wait for ``arrays`` and print the time since the previous stage and the device memory."""
     if not _DEBUG:
         return
     jax.block_until_ready(arrays)
+    now = time.perf_counter()
+    elapsed = 0.0 if _debug_clock[0] is None else now - _debug_clock[0]
+    _debug_clock[0] = now
     if jax.process_index() == 0:
         stats = jax.local_devices()[0].memory_stats() or {}
         in_use = stats.get("bytes_in_use", 0) / 2 ** 30
         peak = stats.get("peak_bytes_in_use", 0) / 2 ** 30
-        print(f"[rsvd] {name}: {in_use:.1f} GiB in use, peak {peak:.1f} GiB", flush=True)
+        print(f"[rsvd] {name}: {elapsed:.1f}s, {in_use:.1f} GiB in use, peak {peak:.1f} GiB", flush=True)
 
 
 @jax.jit
@@ -178,23 +183,31 @@ def _subspace_iteration(jac, key, diag, diag_shift, *, total_rank, n_iter, apply
     real_dtype = jnp.real(jac).dtype
     kwargs = dict(apply_mode=apply_mode, has_diag=has_diag)
 
-    Y = _apply_operator(
-        jac, _probe(key, real_dtype=real_dtype, n=n, total_rank=total_rank, complex_probe=apply_mode not in ("real", "imag_real")),
-        diag, diag_shift, **kwargs
-    )
-    _debug_stage("first application", Y)
-    for _ in range(n_iter):
+    _debug_stage("start of the subspace iteration")
+    Omega = _probe(key, real_dtype=real_dtype, n=n, total_rank=total_rank, complex_probe=apply_mode not in ("real", "imag_real"))
+    _debug_stage("probe", Omega)
+    Y = _apply_operator(jac, Omega, diag, diag_shift, **kwargs)
+    del Omega
+    _debug_stage("application 1", Y)
+    for it in range(n_iter):
         Q = _orthonormalize(Y)
+        _debug_stage(f"QR {2 * it + 1}", Q)
         Y = _apply_operator(jac, Q, diag, diag_shift, **kwargs)
         del Q
+        _debug_stage(f"application {2 * it + 2}", Y)
         Q = _orthonormalize(Y)
+        _debug_stage(f"QR {2 * it + 2}", Q)
         Y = _apply_operator(jac, Q, diag, diag_shift, **kwargs)
         del Q
+        _debug_stage(f"application {2 * it + 3}", Y)
     Q = _orthonormalize(Y)
     del Y
+    _debug_stage(f"QR {2 * n_iter + 1}", Q)
     SQ = _apply_operator(jac, Q, diag, diag_shift, **kwargs)
+    _debug_stage(f"application {2 * n_iter + 2}", SQ)
     B = _rayleigh_ritz(Q, SQ, restore_i=apply_mode == "imag_real")
     del SQ
+    _debug_stage("Rayleigh-Ritz matrix", B)
 
     return Q, B
 
@@ -283,7 +296,6 @@ def randomized_eigh(
         total_rank=total_rank, n_iter=int(n_iter),
         apply_mode=_apply_mode(operator), has_diag=operator.has_diagonal_terms
     )
-    _debug_stage("subspace iteration", Q, B)
 
     # The distributed backend needs a size divisible by the number of devices; the
     # padded modes get a huge eigenvalue and end up last in the ascending spectrum.
