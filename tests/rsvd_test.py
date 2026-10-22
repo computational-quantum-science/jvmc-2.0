@@ -94,6 +94,25 @@ class TestQGTOperator(unittest.TestCase):
         finally:
             jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
 
+    def test_varying_zeros_fallback(self):
+        """
+        JAX versions without ``jax.lax.pcast`` / ``pvary`` get the accumulator seeded
+        from the Jacobian instead; the product must not change.
+        """
+        from jVMC_exp.solver import qgt_operator
+        Q = jax.random.normal(jax.random.PRNGKey(5), (self.n, 2))
+        old_api, old_chunk = qgt_operator._USE_VARYING_API, jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            qgt_operator._USE_VARYING_API = False
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=64)
+            for mode, tr in (("identity", lambda x: x), ("real", jnp.real), ("imag", lambda x: 1j * jnp.imag(x))):
+                A = QGTOperator(self.jac, mode, diag_scale=0.0, diag_shift=0.0)
+                self.assertTrue(jnp.allclose(A(Q), tr(self.S0) @ Q, atol=1e-12))
+                self.assertTrue(jnp.allclose(A(Q + 0j), tr(self.S0) @ Q, atol=1e-12))
+        finally:
+            qgt_operator._USE_VARYING_API = old_api
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old_chunk)
+
     def test_real_reduction_stays_in_real_arithmetic(self):
         """For q = Re and a real block the result is real (no complex accumulator)."""
         Q = jax.random.normal(jax.random.PRNGKey(4), (self.n, 3))

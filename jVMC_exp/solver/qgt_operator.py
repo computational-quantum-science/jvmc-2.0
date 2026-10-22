@@ -37,6 +37,27 @@ def _chunk_sizes(n_samples, n_params, width, jac_itemsize, out_itemsize):
     return chunk, block
 
 
+# Use jax.lax.pcast / pvary for `_varying_zeros` when they exist (False only for testing the fallback)
+_USE_VARYING_API = True
+
+
+def _varying_zeros(shape, dtype, like):
+    """
+    Zeros that are 'varying' over the devices inside a ``shard_map``: the carry of a
+    loop has to be, when a loop body makes it so (shard_map's rule for loop carries).
+    ``jax.lax.pcast`` (``pvary`` before it) does exactly that but exists only in some
+    JAX versions; otherwise the zeros are derived from ``like``, which is varying.
+    """
+    zeros = jnp.zeros(shape, dtype)
+    if _USE_VARYING_API:
+        if hasattr(jax.lax, "pcast"):
+            return jax.lax.pcast(zeros, ("devices",), to="varying")
+        if hasattr(jax.lax, "pvary"):
+            return jax.lax.pvary(zeros, ("devices",))
+
+    return zeros + jnp.zeros((), dtype) * jnp.real(like.reshape(-1)[0]).astype(dtype)
+
+
 def _local_product(jac, v, part: Part):
     """
     Over the samples of this device, ``part`` of ``conj(jac).T @ (jac @ v)``:
@@ -64,9 +85,7 @@ def _local_product(jac, v, part: Part):
         n_samples, n_params, width, jac.dtype.itemsize, jnp.dtype(out_dtype).itemsize
     )
 
-    # The accumulator has to be 'varying' over the devices from the start (shard_map's
-    # rule for loop carries)
-    acc = jax.lax.pvary(jnp.zeros((n_params,) + v.shape[1:], out_dtype), ("devices",))
+    acc = _varying_zeros((n_params,) + v.shape[1:], out_dtype, like=jac)
 
     def add_chunk(k, acc, size=chunk):
         rows = jax.lax.dynamic_slice_in_dim(jac, k * chunk, size)
