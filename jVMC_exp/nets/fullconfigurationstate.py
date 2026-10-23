@@ -25,12 +25,10 @@ class FullConfigurationState(nn.Module):
 	def __call__(self, s):
 		kernel = self.param(
 			'kernel',
-			nn.initializers.constant(
-				1, dtype=global_defs.DT_PARAMS_REAL
-			), 
+			nn.initializers.constant(1, dtype=global_defs.DT_PARAMS_CPX), 
 			(self.num_parameters)
 		)
 		
 		idx = ((self.d**jnp.arange(self.L - 1, -1, -1)).dot(s)).astype(int)
 
-		return jnp.log(abs(kernel[idx] + self.delta)) + 1.j * jnp.angle(kernel[idx])
+		return jnp.log(kernel[idx] + self.delta)
