@@ -260,3 +260,150 @@ and column-blocking entries in section 2 for the fixes.
   0.4 GB each.
 * A batched Jacobian (`Observable(..., batched_jacobian=True)`) is rejected, as
   for every matrix-free solver.
+
+## 5. Parameter-sharded layout (2026-10-23)
+
+Motivation: in the `"samples"` layout above the `(num_params, r)` blocks are
+replicated, 12 GB each for 94640 x 16000 doubles, whatever the number of GPUs. The
+sample count stays at 40000 while the networks grow, so memory has to scale with
+`num_params / n_GPUs`. `RandomizedPinvSNR(layout="parameters", mesh_shape=(P_s, P_p))`
+does that; `Evolution`, `SampledObs`, the dense path, MinSR and the steppers are
+unchanged (the conversion happens inside the solver). The library default stays
+`layout="samples"`; the experiment script defaults to `"parameters"`.
+
+### 5.1 Layout
+
+* **Mesh** (`qgt_operator.parameter_mesh`): `P_s` sample groups x `P_p` parameter
+  groups over the devices of `MESH` in the same order (device `i` at
+  `(i // P_p, i % P_p)`), axes `("samples", "params")`. Default `(1, n_devices)`:
+  pure parameter sharding. `P_s * P_p` must equal the device count.
+* **Jacobian** (`ShardedQGTOperator`, built per solve by `from_operator` from the
+  optimizer's `QGTOperator`): the sample-sharded normalized Jacobian is
+  redistributed once per solve by one `jax.lax.all_to_all` along `"params"` (each
+  device splits its columns into `P_p` blocks and concatenates the row blocks it
+  receives) into a second copy, `J[s, p]` of shape
+  `(num_samples / P_s, padded_num_params / P_p)` on device `(s, p)`. The
+  `SampledObs` copy is untouched; the second copy lives only during the solve.
+  `num_params` is padded with zero columns to a multiple of `P_p`; the compiled
+  redistribution contains only the all-to-all (checked in the HLO).
+* **Blocks**: probe, iterates `Y`, `Q`, `A Q` and the Ritz vectors `V` are
+  row-sharded, `padded_num_params / P_p` rows per device, replicated over the sample
+  groups. Padding rows are zero in the probe and stay zero (zero Jacobian
+  columns, zero diagonal entries).
+* **Application** (`qgt_operator._column_block_product`): for sample chunks of at
+  most `MATMUL_CHUNK_BYTES` (also bounding the `Z` chunk) `Z = J[s, p] Q[p]` +
+  `psum` over `"params"`, then `Y[p] += q[J[s, p]^H Z]` locally, accumulated in row
+  blocks of at most the same size; at the end a `psum` over `"samples"` (a no-op for
+  `P_s = 1`). `Z` is never formed for all samples. `q = Re` / `i Im` with real
+  blocks in real arithmetic (`Z = (A Q, B Q)` reduced in one `psum`, then
+  `A^T Za + B^T Zb` resp. `A^T Zb - B^T Za`); diagonal terms as in `QGTOperator`.
+* **Vectors**: `ShardedQGTOperator.__call__` / `.raw` take and return REPLICATED
+  vectors or blocks (`(num_params,)` / `(num_params, r)`): the input is padded and
+  split (no communication), the row-sharded result all-gathered by a sharding
+  constraint and stripped. Explicit transposes through `linear_call` as in the
+  existing operator, so CG (`jax.scipy.sparse.linalg.cg` and `solver.CG`), the
+  L-BFGS loss (`_refinement_loss(..., layout=...)`), the true residual,
+  `s_norm_fn` and `_get_tdvp_error` work with it unchanged (tested; the optimizer
+  itself keeps `opt.qgt = QGTOperator.raw`).
+* **Orthonormalization** (`rsvd._cholesky_qr`): shifted CholeskyQR3 (Fukaya et al.,
+  SIAM J. Sci. Comput. 42, A477 (2020)). Gram matrix `G = psum_p(Y_p^H Y_p)`
+  (replicated `r x r`), Cholesky of `G + s I` with
+  `s = 11 (m r + r (r + 1)) u ||G||_F` (`||G||_F >= ||Y||_2^2`, the computable upper
+  bound), local triangular solve `Q_p = Y_p L^{-H}` (donating `Y`), then two plain
+  CholeskyQR passes. A plain pass whose Cholesky factor is not finite (`Q` still
+  conditioned above `u^{-1/2}`, e.g. a numerically rank-deficient block, or
+  `kappa(Y) > ~1/(u sqrt(11 m r))`, about 3e10 at the production size) is redone
+  shifted, up to 6 passes in total (a warning if two plain passes were not reached).
+  `JVMC_RSVD_DEBUG=1` prints the number of passes and `||Q^H Q - I||_F` after every QR.
+  Tests: `||Q^H Q - I||_F < 1e-12` for singular values spanning 1 ... 1e-8 (real and
+  complex) and for a rank-6 block with 9 columns.
+* **Rayleigh-Ritz**: `B = psum_p(Q_p^H (A Q)_p)`, replicated, diagonalized through
+  `solver.util.diagonalize` (default `"device"`; for `"distributed"` `B` is padded
+  and the padded eigenpairs are cut from the small eigenvector matrix, which is
+  block diagonal). Ritz vectors `V_p = Q_p V_small` locally, row-sharded; the
+  selection of `_select` is done row by row. `randomized_eigh` returns `V` padded,
+  `(padded_num_params, k)`, row-sharded (stripping it would gather it).
+* **Solver** (`RandomizedPinvSNR`): `V^H b` is a `psum` of local `k`-vectors
+  (`_project_rows`); `PinvSNR.__call__` is reused unchanged: its
+  `jnp.dot(V, pinvEv * V^H b)` partitions as a local GEMV with a row-sharded result
+  (checked in the HLO: no collective), which is all-gathered and stripped into the
+  replicated update. `info["spectrum"]` etc. are unchanged. `snr_mode="gaussian"`
+  works; `snr_mode="empiric"` with `snr_tol != 0` raises `NotImplementedError` in
+  this layout (it needs per-sample projections onto `V`). The L-BFGS refinement and
+  the true residual use the sharded operator's vector products.
+
+### 5.2 Memory per device
+
+Production case: 94640 real parameters (complex Jacobian, `q = Re`, real blocks),
+40000 samples, r = 16000, 8 GPUs, mesh `(1, 8)` (94640 = 8 x 11830, no padding),
+`MATMUL_CHUNK_BYTES` = 1 GiB. Derived from the shapes in the code (GB = 1e9 bytes):
+
+| object | shape per device | size |
+|---|---|---|
+| sample-sharded Jacobian (`SampledObs`, complex128) | 5000 x 94640 | 7.6 GB |
+| column-sharded copy (complex128, per solve) | 40000 x 11830 | 7.6 GB |
+| one block (`Q`, `Y`, `A Q`, `V`; float64) | 11830 x 16000 | 1.5 GB |
+| streamed `Z` chunk (`(A Q, B Q)`, float64) | 2 x 4194 x 16000 | 1.07 GB (+ the same for the all-reduce) |
+| Jacobian chunk + its real/imag parts | 4194 x 11830 complex + 2 real | 0.8 + 0.8 GB |
+| Gram matrix / Cholesky factor (during a QR) | 16000 x 16000 float64 | 2 GB each |
+| Rayleigh-Ritz `B`, small eigenvectors `V_small` | 16000 x 16000 float64 | 2 GB each (+ eigh workspace) |
+
+The chunk has `min(2^30 / (11830 * 16), 2^30 / (2 * 16000 * 8)) = 4194` rows. At
+most two blocks are alive at once (input and output of an application; the QR
+donates its input), so an application peaks at about 7.6 + 7.6 + 2 x 1.5 + 2.1 +
+1.6 = 22 GB, the Rayleigh-Ritz stage at about 7.6 + 7.6 + 1.5 (`Q`) + 2 + 2 + the
+eigh workspace. The `"samples"` layout needed 7.6 GB plus four 12 GB blocks. In
+general, per device: Jacobian copies `2 x 16 N n / P` bytes, blocks `8 n r / P_p`
+each, `Z` bounded by the chunk budget, and the `r x r` matrices `8 r^2` each
+(replicated, independent of the GPU count). The redistribution itself briefly
+needs the output copy next to the input (plus a padded copy of the local shard
+if `num_params` is not divisible by `P_p`). For `P_s > 1` the blocks are
+`n / P_p` rows (larger) and the Jacobian copy `N / P_s x n / P_p`.
+
+### 5.3 Communication per application
+
+| collective | `(1, P)` | `(P_s, P_p)` |
+|---|---|---|
+| `psum` of `Z` over the parameter group | `N x r` values (complex, or two real) in chunks: 10.2 GB for the production case | `N / P_s x r` per group |
+| `psum` of `Y` over the sample group | none | `n / P_p x r` |
+| redistribution (once per solve) | all-to-all of the Jacobian shard (7.6 GB, 7/8 of it leaves the device) | within each sample group |
+| CholeskyQR (per pass, 3 per QR) | all-reduce of the `r x r` Gram matrix, 2 GB | over `P_p` |
+| Rayleigh-Ritz | all-reduce of `r x r` | over `P_p` |
+| vector product (`A(x)`, L-BFGS) | `N` values + all-gather of `n` | |
+
+The all-reduced volume per application (10.2 GB of `Z`) is comparable to the
+12 GB `(num_params, r)` all-reduce of the `"samples"` layout, at the same flops
+(each GPU does `1/P` of both GEMMs). New per QR are three 2 GB all-reduces,
+replacing a redundant Householder QR of the full `(94640, 16000)` block on every
+GPU (about 4e13 flops each) by about 3e13 flops of GEMM/TRSM split over the GPUs.
+
+### 5.4 Tests and status
+
+`tests/rsvd_test.py` (new classes `TestShardedQGTOperator`, `TestCholeskyQR`,
+`TestRandomizedEighParameterLayout`, `TestRandomizedPinvSNRParameterLayout`), on 1
+and 4 emulated CPU devices, mesh shapes `(4, 1)`, `(1, 4)`, `(2, 2)` (on one
+device `(1, 1)`): the operator against the dense matrix for the three reductions
+(real and complex vectors and blocks, with and without diagonal terms, with a
+64-byte chunk budget, `num_params` not divisible by 4), the redistributed copy,
+the row-sharded block kernel for all four apply modes, CG, gradients through the
+vector product; CholeskyQR3 orthogonality; `randomized_eigh` exact at full rank,
+low-rank eigenpairs, `"LA"`, diagonal terms, the distributed padding, agreement
+with the sample layout; `RandomizedPinvSNR(layout="parameters")` step for step
+equal to dense `PinvSNR` (holomorphic reference evolution), equal to the dense
+update for both non-holomorphic reductions (with 30 parameters, i.e. padding),
+low-rank solve equal to the dense one, S-norm and TDVP error unchanged (also when
+computed with the sharded operator), L-BFGS refinement, Gaussian SNR, empiric SNR
+rejected. The experiment script has `simulation.rsvd.layout` (default
+`"parameters"`) and `simulation.rsvd.mesh_shape` (`[P_s, P_p]`, `null` = `[1, n_GPUs]`);
+`scripts/0encap_folder/rsvd/test/` (running experiment) was not touched.
+
+Results on 2026-10-23 (CPU, jax 0.9.1): `rsvd_test`, `cg_test`, `tdvp_test`,
+`sr_test` -- 57 passed on one device and 57 passed on four emulated devices. The
+experiment script ran 3 TDVP steps on four emulated devices with a tiny
+configuration (L = 4, 2000 samples, rank 30 + 4) for `layout = "parameters"` with
+mesh `(1, 4)` (+ L-BFGS) and `(2, 2)`, and for `"samples"`; true residuals
+~1e-14 in all three. The layout is not part of the output file name (it changes
+the numerics, not the physics), so a run with another layout resumes the same
+checkpoint.
+
+Not done yet: a run on GPUs (timings and the measured peak memory at r = 16000).

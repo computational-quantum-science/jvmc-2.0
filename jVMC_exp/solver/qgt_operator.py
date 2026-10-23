@@ -6,14 +6,22 @@ with blocks of vectors are computed from the (mean-subtracted, :math:`\\sqrt{w}`
 weighted) Jacobian :math:`J` of shape ``(num_samples, num_params)``, which is sharded
 across the devices along the sample axis. Each device contracts its own samples
 and the partial sums are reduced with a ``psum``, so the only replicated arrays are
-the ``(num_params, r)`` blocks that go in and out.
+the ``(num_params, r)`` blocks that go in and out (:class:`QGTOperator`).
+
+:class:`ShardedQGTOperator` splits the parameters as well: on a 2D mesh of
+``P_s`` sample groups times ``P_p`` parameter groups it holds a copy of the Jacobian
+sharded over both axes, and the blocks it is applied to are sharded over the
+parameter rows, so that everything whose size grows with the number of parameters
+is divided by ``P_p``.
 """
-from functools import partial
+from dataclasses import dataclass
+from functools import lru_cache, partial
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
 from jax.custom_derivatives import linear_call
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from jVMC_exp import global_defs
 from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, REPLICATED_SPEC, DEVICE_SHARDING, REPLICATED_SHARDING
@@ -41,21 +49,44 @@ def _chunk_sizes(n_samples, n_params, width, jac_itemsize, out_itemsize):
 _USE_VARYING_API = True
 
 
-def _varying_zeros(shape, dtype, like):
+def _varying_zeros(shape, dtype, like, axes=("devices",)):
     """
-    Zeros that are 'varying' over the devices inside a ``shard_map``: the carry of a
-    loop has to be, when a loop body makes it so (shard_map's rule for loop carries).
-    ``jax.lax.pcast`` (``pvary`` before it) does exactly that but exists only in some
-    JAX versions; otherwise the zeros are derived from ``like``, which is varying.
+    Zeros that are 'varying' over the mesh ``axes`` inside a ``shard_map``: the carry
+    of a loop has to be, when a loop body makes it so (shard_map's rule for loop
+    carries). ``jax.lax.pcast`` (``pvary`` before it) does exactly that but exists
+    only in some JAX versions; otherwise the zeros are derived from ``like``, which
+    is varying over ``axes``.
     """
     zeros = jnp.zeros(shape, dtype)
     if _USE_VARYING_API:
         if hasattr(jax.lax, "pcast"):
-            return jax.lax.pcast(zeros, ("devices",), to="varying")
+            return jax.lax.pcast(zeros, axes, to="varying")
         if hasattr(jax.lax, "pvary"):
-            return jax.lax.pvary(zeros, ("devices",))
+            return jax.lax.pvary(zeros, axes)
 
     return zeros + jnp.zeros((), dtype) * jnp.real(like.reshape(-1)[0]).astype(dtype)
+
+
+def _add_in_row_blocks(acc, contribution, block):
+    """
+    ``acc + contribution`` written in blocks of ``block`` rows, ``contribution(j, size)``
+    being rows ``j * block`` to ``j * block + size`` of the summand: no single product
+    has an output larger than one block.
+    """
+    n_rows = acc.shape[0]
+
+    def add_block(j, acc, bsize=block):
+        old = jax.lax.dynamic_slice_in_dim(acc, j * block, bsize, axis=0)
+        return jax.lax.dynamic_update_slice_in_dim(
+            acc, old + contribution(j, bsize), j * block, axis=0
+        )
+
+    n_full = n_rows // block
+    acc = jax.lax.fori_loop(0, n_full, add_block, acc)
+    if n_rows % block:
+        acc = add_block(n_full, acc, n_rows % block)
+
+    return acc
 
 
 def _local_product(jac, v, part: Part):
@@ -110,18 +141,7 @@ def _local_product(jac, v, part: Part):
                     return cr.T @ av + ci.T @ bv
                 return cr.T @ bv - ci.T @ av
 
-        def add_block(j, acc, bsize=block):
-            old = jax.lax.dynamic_slice_in_dim(acc, j * block, bsize, axis=0)
-            return jax.lax.dynamic_update_slice_in_dim(
-                acc, old + contribution(j, bsize), j * block, axis=0
-            )
-
-        n_full = n_params // block
-        acc = jax.lax.fori_loop(0, n_full, add_block, acc)
-        if n_params % block:
-            acc = add_block(n_full, acc, n_params % block)
-
-        return acc
+        return _add_in_row_blocks(acc, contribution, block)
 
     n_full = n_samples // chunk
     acc = jax.lax.fori_loop(0, n_full, add_chunk, acc)
@@ -257,17 +277,18 @@ def _transform(x, mode: TransformMode):
     raise ValueError(f"The transformation mode has to be one of {TRANSFORM_MODES}, got {mode!r}.")
 
 
-def _transformed_product_real_input(jac, v, mode: TransformMode):
+def _transformed_product_real_input(jac, v, mode: TransformMode, products):
     """``q[S_0] v`` for a real ``v`` without ever forming the complex product."""
+    _, product_re, product_im = products
     if mode == "real":
-        return _qgt_product_re(jac, v)
+        return product_re(jac, v)
     if mode == "imag":
-        return 1j * _qgt_product_im(jac, v)
+        return 1j * product_im(jac, v)
 
     raise ValueError(f"The transformation mode has to be one of {TRANSFORM_MODES}, got {mode!r}.")
 
 
-def transformed_product(jac, v, mode: TransformMode):
+def transformed_product(jac, v, mode: TransformMode, products=None):
     """
     ``q[S_0] @ v`` for the matrix :math:`q[S_0]`, ``v`` of shape ``(num_params,)`` or
     ``(num_params, r)``. The transformations :math:`\\text{Re}` and :math:`i\\,\\text{Im}`
@@ -275,23 +296,32 @@ def transformed_product(jac, v, mode: TransformMode):
     complex ``v`` is split into real and imaginary part, which doubles the width of
     the product. For these two transformations the product is done in real
     arithmetic (:func:`_qgt_product_re`, :func:`_qgt_product_im`).
+
+    ``products`` are the three products ``(S_0, Re S_0, Im S_0)`` as functions of
+    ``(jac, v)``; by default those of the sample-sharded Jacobian.
     """
+    products = products or (_qgt_product, _qgt_product_re, _qgt_product_im)
     if mode == "identity":
-        return _qgt_product(jac, v)
+        return products[0](jac, v)
     if not jnp.iscomplexobj(v):
-        return _transformed_product_real_input(jac, v, mode)
+        return _transformed_product_real_input(jac, v, mode, products)
 
     v2d = v.reshape(v.shape[0], -1)
     r = v2d.shape[1]
     parts = jnp.concatenate([jnp.real(v2d), jnp.imag(v2d)], axis=1)
-    Sp = _transformed_product_real_input(jac, parts, mode)
+    Sp = _transformed_product_real_input(jac, parts, mode, products)
 
     return (Sp[:, :r] + 1j * Sp[:, r:]).reshape(v.shape)
 
 
-@partial(jax.jit, static_argnames=("mode", "has_diag"))
-def _apply(jac, v, diag, diag_shift, *, mode, has_diag):
-    Sv = transformed_product(jac, v, mode)
+@partial(jax.jit, static_argnames=("mode", "has_diag", "layout"))
+def _apply(jac, v, diag, diag_shift, *, mode, has_diag, layout=None):
+    """
+    ``A v`` for a replicated ``v``, from the sample-sharded Jacobian (``layout=None``)
+    or from the column-sharded one of a :class:`ShardedQGTOperator` with that layout.
+    """
+    products = None if layout is None else _column_products(layout)
+    Sv = transformed_product(jac, v, mode, products)
     if has_diag:
         Sv = Sv + diag.reshape(diag.shape + (1,) * (v.ndim - 1)) * v + diag_shift * v
 
@@ -378,4 +408,329 @@ class QGTOperator:
     def __call__(self, v):
         return _apply(
             self._jacobian, v, self._diag, self._shift, mode=self._mode, has_diag=self._has_diag
+        )
+
+
+# ----------------------------------------------------------------------------------
+# Parameter-sharded layout: the Jacobian sharded over samples AND parameters
+# ----------------------------------------------------------------------------------
+
+SAMPLES_AXIS = "samples"
+PARAMS_AXIS = "params"
+_MESH_AXES = (SAMPLES_AXIS, PARAMS_AXIS)
+JACOBIAN_SPEC = P(SAMPLES_AXIS, PARAMS_AXIS)
+ROWS_SPEC = P(PARAMS_AXIS)
+
+
+@lru_cache(maxsize=None)
+def _parameter_mesh(shape):
+    return Mesh(MESH.devices.reshape(shape), _MESH_AXES)
+
+
+def parameter_mesh(shape=None) -> Mesh:
+    """
+    The 2D mesh of ``P_s`` sample groups times ``P_p`` parameter groups, ``shape =
+    (P_s, P_p)``, over the devices of ``MESH`` in the same order: device ``i`` of
+    ``MESH`` sits at ``(i // P_p, i % P_p)``, so that the sample-sharded Jacobian is
+    sharded over both axes of this mesh (samples major) without moving any data.
+    ``None`` is ``(1, number of devices)``: pure parameter sharding.
+    """
+    n_devices = MESH.size
+    shape = (1, n_devices) if shape is None else tuple(int(p) for p in shape)
+    if len(shape) != 2 or min(shape) < 1 or shape[0] * shape[1] != n_devices:
+        raise ValueError(
+            "The mesh shape (P_s, P_p) has to be two positive integers whose product is "
+            f"the number of devices ({n_devices}), got {shape}."
+        )
+
+    return _parameter_mesh(shape)
+
+
+@dataclass(frozen=True)
+class ParameterLayout:
+    """
+    ``num_params`` parameter rows split over the ``P_p`` parameter groups of ``mesh``:
+    zero padded to ``padded``, a multiple of ``P_p``, ``local`` rows per group. Row
+    ``i`` of a row-sharded array lives in group ``i // local``. Hashable, so that it
+    is a static argument of the jitted kernels.
+    """
+    mesh: Mesh
+    num_params: int
+
+    @property
+    def groups(self) -> int:
+        return self.mesh.shape[PARAMS_AXIS]
+
+    @property
+    def sample_groups(self) -> int:
+        return self.mesh.shape[SAMPLES_AXIS]
+
+    @property
+    def padded(self) -> int:
+        return -(-self.num_params // self.groups) * self.groups
+
+    @property
+    def local(self) -> int:
+        return self.padded // self.groups
+
+    @property
+    def pad(self) -> int:
+        return self.padded - self.num_params
+
+    def sharding(self, spec=ROWS_SPEC) -> NamedSharding:
+        return NamedSharding(self.mesh, spec)
+
+
+@partial(jax.jit, static_argnames=("layout",))
+def _column_sharded_jacobian(jac, *, layout: ParameterLayout):
+    """
+    The sample-sharded Jacobian redistributed to the 2D mesh: device ``(s, p)`` gets
+    the rows of sample group ``s`` and the columns of parameter group ``p``, the
+    columns zero padded to ``layout.padded``. One ``all_to_all`` within every sample
+    group: each device splits its rows into the column blocks of the group and
+    concatenates the row blocks it receives.
+    """
+    def local(j):
+        if layout.pad:
+            j = jnp.pad(j, ((0, 0), (0, layout.pad)))
+        return jax.lax.all_to_all(j, PARAMS_AXIS, 1, 0, tiled=True)
+
+    return jax.shard_map(
+        local, mesh=layout.mesh, in_specs=(P(_MESH_AXES),), out_specs=JACOBIAN_SPEC
+    )(jac)
+
+
+def _column_block_product(jac, q, part: Part):
+    """
+    On one device ``(s, p)`` of the 2D mesh, with ``jac`` its block ``J[s, p]`` and
+    ``q`` the rows ``p`` of a block: rows ``p`` of ``part`` of ``J^\\dagger (J q)``,
+    summed over all samples, as in :func:`_local_product`:
+
+    * ``Z = J[s, :] q`` is the local product ``J[s, p] q[p]`` summed over the
+      parameter groups (``psum``); it is formed for chunks of the samples of at most
+      ``global_defs.MATMUL_CHUNK_BYTES`` (also as a ``Z`` chunk), so that it is
+      never materialized for all samples;
+    * the chunk's ``J[s, p]^\\dagger Z`` is accumulated locally, in blocks of rows of
+      at most the same size, and summed over the sample groups at the end.
+
+    For ``"re"`` / ``"im"`` (real ``q``) both products are real: ``Z`` is the pair
+    ``(A q, B q)`` with ``J = A + iB``, reduced in one ``psum``.
+    """
+    n_samples, n_local = jac.shape
+    width = q.shape[1]
+    if part == "cpx":
+        out_dtype = jnp.result_type(jac.dtype, q.dtype)
+        n_z = 1
+    else:
+        out_dtype = jnp.result_type(jnp.real(jac).dtype, q.dtype)
+        n_z = 2
+    itemsize = jnp.dtype(out_dtype).itemsize
+    jac_row = n_local * jac.dtype.itemsize
+    z_row = n_z * width * itemsize
+    budget = global_defs.MATMUL_CHUNK_BYTES or n_samples * max(jac_row, z_row)
+    chunk = max(1, min(n_samples, budget // jac_row, budget // z_row))
+    block = max(1, min(n_local, budget // max(1, width * itemsize)))
+
+    acc = _varying_zeros((n_local, width), out_dtype, like=jac, axes=_MESH_AXES)
+
+    def add_chunk(k, acc, size=chunk):
+        rows = jax.lax.dynamic_slice_in_dim(jac, k * chunk, size)
+        # Materialized, see _local_product
+        rows = jax.lax.optimization_barrier(rows)
+
+        if part == "cpx":
+            z = jax.lax.psum(rows @ q, PARAMS_AXIS)
+
+            def contribution(j, bsize):
+                cols = jax.lax.dynamic_slice_in_dim(rows, j * block, bsize, axis=1)
+                return jnp.conj(cols).T @ z
+        else:
+            ar, ai = jnp.real(rows), jnp.imag(rows)
+            za, zb = jax.lax.psum((ar @ q, ai @ q), PARAMS_AXIS)
+
+            def contribution(j, bsize):
+                cr = jax.lax.dynamic_slice_in_dim(ar, j * block, bsize, axis=1)
+                ci = jax.lax.dynamic_slice_in_dim(ai, j * block, bsize, axis=1)
+                if part == "re":
+                    return cr.T @ za + ci.T @ zb
+                return cr.T @ zb - ci.T @ za
+
+        return _add_in_row_blocks(acc, contribution, block)
+
+    n_full = n_samples // chunk
+    acc = jax.lax.fori_loop(0, n_full, add_chunk, acc)
+    if n_samples % chunk:
+        acc = add_chunk(n_full, acc, n_samples % chunk)
+
+    return jax.lax.psum(acc, SAMPLES_AXIS)
+
+
+@partial(jax.jit, static_argnames=("layout", "part"))
+def _gathered_product_impl(jac, v, *, layout: ParameterLayout, part: Part):
+    """
+    ``part`` of ``S_0 v`` for the column-sharded ``jac`` and a replicated ``v`` of shape
+    ``(num_params,)`` or ``(num_params, r)``: ``v`` is padded and split over the
+    parameter groups (no communication), the row-sharded result all-gathered (a
+    sharding constraint, the version-independent way out of a ``shard_map``) and
+    stripped of the padding, so that the result is replicated.
+    """
+    n = layout.num_params
+    v2d = jnp.pad(v.reshape(n, -1), ((0, layout.pad), (0, 0)))
+    Sv = jax.shard_map(
+        partial(_column_block_product, part=part),
+        mesh=layout.mesh,
+        in_specs=(JACOBIAN_SPEC, ROWS_SPEC),
+        out_specs=ROWS_SPEC,
+    )(jac, v2d)
+    Sv = jax.lax.with_sharding_constraint(Sv, layout.sharding(REPLICATED_SPEC))
+
+    return Sv[:n].reshape(v.shape)
+
+
+@lru_cache(maxsize=None)
+def _column_products(layout: ParameterLayout):
+    """
+    The products ``(S_0, Re S_0, Im S_0)`` of the column-sharded Jacobian with
+    replicated vectors, as functions of ``(jac, v)`` for :func:`transformed_product`,
+    with the same explicit transposes as :func:`_qgt_product`, :func:`_qgt_product_re`
+    and :func:`_qgt_product_im`.
+    """
+    impl_cpx, impl_re, impl_im = (
+        partial(_gathered_product_impl, layout=layout, part=part) for part in ("cpx", "re", "im")
+    )
+
+    def transpose(jac, ct):
+        return jnp.conj(impl_cpx(jac, jnp.conj(ct)))
+
+    def transpose_real(jac, ct):
+        return jnp.real(transpose(jac, ct))
+
+    def product(jac, v):
+        return linear_call(impl_cpx, transpose if jnp.iscomplexobj(v) else transpose_real, jac, v)
+
+    def product_re(jac, v):
+        return linear_call(impl_re, impl_re, jac, v)
+
+    def product_im(jac, v):
+        return linear_call(impl_im, lambda jac, ct: -impl_im(jac, ct), jac, v)
+
+    return product, product_re, product_im
+
+
+@partial(jax.jit, static_argnames=("layout",))
+def _column_qgt_product(jac, v, *, layout: ParameterLayout):
+    return _column_products(layout)[0](jac, v)
+
+
+class ShardedQGTOperator:
+    """
+    :class:`QGTOperator` with the parameters sharded as well as the samples.
+
+    On the 2D mesh of ``P_s`` sample groups times ``P_p`` parameter groups
+    (:func:`parameter_mesh`, ``mesh_shape = (P_s, P_p)``, default ``(1, number of
+    devices)``) the operator holds its own copy of the Jacobian, ``J[s, p]`` of shape
+    ``(num_samples / P_s, padded_num_params / P_p)`` on device ``(s, p)``, made from
+    the sample-sharded Jacobian by one ``all_to_all`` within every sample group; the
+    sample-sharded Jacobian itself is left untouched. ``num_params`` is padded with
+    zero columns to a multiple of ``P_p``.
+
+    The operator is applied to blocks in two ways:
+
+    * :meth:`__call__` and :meth:`raw` take and return REPLICATED vectors or blocks of
+      shape ``(num_params,)`` / ``(num_params, r)``, exactly like
+      :class:`QGTOperator` (same transposes, so also as ``A`` of
+      ``jax.scipy.sparse.linalg.cg`` or in an L-BFGS loss). The row-sharded result is
+      all-gathered and the padding stripped.
+    * The randomized eigensolver (:mod:`jVMC_exp.solver.rsvd`) applies it to
+      ROW-SHARDED, padded blocks of shape ``(padded_num_params, r)``, i.e.
+      ``padded_num_params / P_p`` rows per device, and keeps the result row-sharded.
+
+    Per application to a block ``Q``: ``Z = J Q`` as a local product plus a ``psum``
+    over the parameter groups, in sample chunks (``Z`` is never formed for all
+    samples), then ``Y[p] = q[J[:, p]^\\dagger Z]`` locally plus a ``psum`` over the
+    sample groups when ``P_s > 1``; see :func:`_column_block_product`.
+    """
+    def __init__(
+            self, jacobian, mode: TransformMode, diag_scale: float = 0., diag_shift: float = 0.,
+            mesh_shape=None
+        ):
+        self._init_from(QGTOperator(jacobian, mode, diag_scale, diag_shift), mesh_shape)
+
+    @classmethod
+    def from_operator(cls, operator: QGTOperator, mesh_shape=None) -> "ShardedQGTOperator":
+        """The same operator as ``operator``, with its Jacobian redistributed to the 2D mesh."""
+        self = cls.__new__(cls)
+        self._init_from(operator, mesh_shape)
+
+        return self
+
+    def _init_from(self, operator: QGTOperator, mesh_shape):
+        self._layout = ParameterLayout(parameter_mesh(mesh_shape), operator.shape[0])
+        self._jacobian = _column_sharded_jacobian(operator.jacobian, layout=self._layout)
+        self._mode = operator.mode
+        self._diag_scale = operator.diag_scale
+        self._diag_shift = operator.diag_shift
+        self._has_diag = operator.has_diagonal_terms
+        self._dtype = operator.dtype
+        self._diag = operator._diag
+        self._shift = operator._shift
+        self._diag_rows = jax.device_put(
+            jnp.pad(self._diag, (0, self._layout.pad)), self._layout.sharding(ROWS_SPEC)
+        )
+
+    @property
+    def jacobian(self):
+        """The column-sharded copy of the Jacobian, shape ``(num_samples, padded_num_params)``."""
+        return self._jacobian
+
+    @property
+    def layout(self) -> ParameterLayout:
+        return self._layout
+
+    @property
+    def mesh(self) -> Mesh:
+        return self._layout.mesh
+
+    @property
+    def num_params(self) -> int:
+        return self._layout.num_params
+
+    @property
+    def padded_num_params(self) -> int:
+        return self._layout.padded
+
+    @property
+    def mode(self) -> TransformMode:
+        return self._mode
+
+    @property
+    def diag_scale(self):
+        return self._diag_scale
+
+    @property
+    def diag_shift(self):
+        return self._diag_shift
+
+    @property
+    def has_diagonal_terms(self) -> bool:
+        return self._has_diag
+
+    @property
+    def shape(self):
+        n = self._layout.num_params
+        return (n, n)
+
+    @property
+    def dtype(self):
+        """dtype of ``A v`` for a real ``v``."""
+        return self._dtype
+
+    def raw(self, v):
+        """The bare quantum geometric tensor applied to the replicated ``v``: :math:`S_0 v`."""
+        return _column_qgt_product(self._jacobian, v, layout=self._layout)
+
+    def __call__(self, v):
+        return _apply(
+            self._jacobian, v, self._diag, self._shift,
+            mode=self._mode, has_diag=self._has_diag, layout=self._layout
         )

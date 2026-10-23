@@ -10,8 +10,11 @@ import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
 import jVMC_exp.operator.discrete as op
 import jVMC_exp.sampler as sampler
+from jax.sharding import PartitionSpec as P
 from jVMC_exp.sharding_config import MESH, DEVICE_SHARDING
-from jVMC_exp.solver.qgt_operator import QGTOperator
+from jVMC_exp.solver.qgt_operator import (
+    QGTOperator, ShardedQGTOperator, ParameterLayout, parameter_mesh, SAMPLES_AXIS, PARAMS_AXIS
+)
 from jVMC_exp.solver.rsvd import RandomizedPinvSNR, randomized_eigh
 
 
@@ -520,6 +523,440 @@ class TestGroundStateSearchRandomizedPinvSNR(unittest.TestCase):
         opt.ground_state_search(500, loss_function, stepper)
         eps_rel = jnp.abs((exactSampler(hamiltonian).mean.item() - exE) / exE)
         self.assertTrue(eps_rel < 1e-3)
+
+
+# ----------------------------------------------------------------------------------
+# Parameter-sharded layout (ShardedQGTOperator, layout="parameters")
+# ----------------------------------------------------------------------------------
+
+def _mesh_shapes():
+    """(P_s, P_p) meshes to test on: pure sample, pure parameter and, if possible, mixed sharding."""
+    n = MESH.size
+    shapes = [(1, n), (n, 1)]
+    if n % 2 == 0 and n > 2:
+        shapes.append((2, n // 2))
+
+    return list(dict.fromkeys(shapes))
+
+
+def _assert_sharded(test, x, sharding):
+    """``x`` is laid out as ``sharding`` (specs are compared by equivalence: JAX drops axes of size 1)."""
+    test.assertTrue(x.sharding.is_equivalent_to(sharding, x.ndim), msg=f"{x.sharding} vs {sharding}")
+
+
+_TRANSFORMS = {"identity": lambda x: x, "real": jnp.real, "imag": lambda x: 1j * jnp.imag(x)}
+
+
+class TestShardedQGTOperator(unittest.TestCase):
+    def setUp(self):
+        self.N = 8 * MESH.size
+        # not divisible by the number of devices (> 1): the columns are padded
+        self.n = 4 * MESH.size + 3
+        self.jac = _random_jacobian(jax.random.PRNGKey(0), self.N, self.n)
+        self.S0 = jnp.conj(self.jac).T @ self.jac
+
+    def test_column_sharded_copy(self):
+        for shape in _mesh_shapes():
+            with self.subTest(mesh_shape=shape):
+                A = ShardedQGTOperator(self.jac, "real", mesh_shape=shape)
+                self.assertEqual(A.mesh.devices.shape, shape)
+                p = shape[1]
+                n_pad = -(-self.n // p) * p
+                self.assertEqual(A.padded_num_params, n_pad)
+                self.assertEqual(A.jacobian.shape, (self.N, n_pad))
+                _assert_sharded(self, A.jacobian, A.layout.sharding(P(SAMPLES_AXIS, PARAMS_AXIS)))
+                jac = np.asarray(A.jacobian)
+                self.assertTrue(np.array_equal(jac[:, :self.n], np.asarray(self.jac)))
+                self.assertFalse(np.any(jac[:, self.n:]))
+                # the shard of every device has num_samples / P_s rows and n_pad / P_p columns
+                for shard in A.jacobian.addressable_shards:
+                    self.assertEqual(shard.data.shape, (self.N // shape[0], n_pad // p))
+
+    def test_products_match_dense(self):
+        """
+        Vectors and blocks, real and complex, all three reductions, with and without
+        diagonal terms, with the default and with a tiny chunk budget (one sample per
+        chunk, several blocks of rows), on every mesh shape.
+        """
+        k1, k2 = jax.random.split(jax.random.PRNGKey(3))
+        Q_real = jax.random.normal(k1, (self.n, 3))
+        Q_cpx = Q_real + 1j * jax.random.normal(k2, (self.n, 3))
+        diag = jnp.real(jnp.diag(self.S0))
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            for budget in (old, 64):
+                jVMC_exp.global_defs.update(matmul_chunk_bytes=budget)
+                for shape in _mesh_shapes():
+                    for mode, tr in _TRANSFORMS.items():
+                        for scale, shift in ((0.0, 0.0), (0.3, 0.1)):
+                            A = ShardedQGTOperator(self.jac, mode, scale, shift, mesh_shape=shape)
+                            S = tr(self.S0) + scale * jnp.diag(diag) + shift * jnp.eye(self.n)
+                            for Q in (Q_real, Q_cpx, Q_real[:, 0], Q_cpx[:, 0]):
+                                with self.subTest(budget=budget, mesh_shape=shape, mode=mode, shift=shift,
+                                                  dtype=str(Q.dtype), ndim=Q.ndim):
+                                    out = A(Q)
+                                    self.assertEqual(out.shape, Q.shape)
+                                    self.assertTrue(jnp.allclose(out, S @ Q, atol=1e-12))
+                                    self.assertTrue(jnp.allclose(A.raw(Q), self.S0 @ Q, atol=1e-12))
+                                    self.assertTrue(out.sharding.is_fully_replicated)
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_real_reduction_stays_real(self):
+        Q = jax.random.normal(jax.random.PRNGKey(4), (self.n, 3))
+        A = ShardedQGTOperator(self.jac, "real")
+        self.assertFalse(jnp.iscomplexobj(A(Q)))
+
+    def test_row_sharded_block_application(self):
+        """The kernel of the randomized solver: padded, row-sharded blocks in and out."""
+        from jVMC_exp.solver import rsvd
+        Q = jax.random.normal(jax.random.PRNGKey(6), (self.n, 4))
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=64)
+            for shape in _mesh_shapes():
+                for mode, apply_mode, probe in (
+                    ("identity", "identity", Q + 0.5j * Q[::-1]),
+                    ("real", "real", Q),
+                    ("imag", "imag_real", Q),
+                    ("imag", "imag_cpx", Q + 0.5j * Q[::-1]),
+                ):
+                    with self.subTest(mesh_shape=shape, apply_mode=apply_mode):
+                        A = ShardedQGTOperator(self.jac, mode, 0.0, 0.1, mesh_shape=shape)
+                        layout = A.layout
+                        rows = jax.device_put(jnp.pad(probe, ((0, layout.pad), (0, 0))), layout.sharding())
+                        out = rsvd._apply_rows(
+                            A.jacobian, rows, A._diag_rows, A._shift,
+                            layout=layout, apply_mode=apply_mode, has_diag=True
+                        )
+                        _assert_sharded(self, out, layout.sharding())
+                        M = _TRANSFORMS[mode](self.S0)
+                        if apply_mode == "imag_real":
+                            M = jnp.imag(self.S0)
+                        expected = M @ probe + 0.1 * probe
+                        out = np.asarray(out)
+                        self.assertTrue(np.allclose(out[:self.n], expected, atol=1e-12))
+                        self.assertFalse(np.any(out[self.n:]))
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_cg_with_sharded_operator(self):
+        """jax.scipy.sparse.linalg.cg transposes the operator: the explicit transposes are needed."""
+        A = ShardedQGTOperator(self.jac, "identity", 0.0, 1e-2)
+        S = self.S0 + 1e-2 * jnp.eye(self.n)
+        b = jax.random.normal(jax.random.PRNGKey(7), (self.n,)) + 0j
+        x, _ = jax.scipy.sparse.linalg.cg(A, b, tol=1e-14, maxiter=200)
+        self.assertTrue(jnp.allclose(S @ x, b, atol=1e-8))
+        A = ShardedQGTOperator(self.jac, "real", 0.0, 1e-2)
+        x, _ = jax.scipy.sparse.linalg.cg(A, jnp.real(b), tol=1e-14, maxiter=200)
+        self.assertTrue(jnp.allclose((jnp.real(self.S0) + 1e-2 * jnp.eye(self.n)) @ x, jnp.real(b), atol=1e-8))
+        # the CG solver of the library on the sharded operator
+        x, _ = jVMC_exp.solver.CG(tol=1e-14, maxiter=200)(A, jnp.real(b))
+        self.assertTrue(jnp.allclose((jnp.real(self.S0) + 1e-2 * jnp.eye(self.n)) @ x, jnp.real(b), atol=1e-8))
+
+    def test_gradient_through_vector_product(self):
+        """The L-BFGS loss differentiates through the product (transpose of linear_call)."""
+        for mode in ("identity", "real", "imag"):
+            with self.subTest(mode=mode):
+                A = ShardedQGTOperator(self.jac, mode, 0.0, 0.0)
+                B = QGTOperator(self.jac, mode, 0.0, 0.0)
+                b = jax.random.normal(jax.random.PRNGKey(8), (self.n,))
+                x = jax.random.normal(jax.random.PRNGKey(9), (self.n,))
+                grad_A = jax.grad(lambda x: jnp.linalg.norm(A(x) - b))(x)
+                grad_B = jax.grad(lambda x: jnp.linalg.norm(B(x) - b))(x)
+                self.assertTrue(jnp.allclose(grad_A, grad_B, atol=1e-10))
+
+    def test_rejects_bad_mesh_shapes(self):
+        for shape in ((MESH.size + 1, 1), (0, MESH.size), (1, 1, MESH.size)):
+            with self.subTest(shape=shape), self.assertRaises(ValueError):
+                ShardedQGTOperator(self.jac, "real", mesh_shape=shape)
+        with self.assertRaises(ValueError):
+            ShardedQGTOperator(self.jac, "conj")
+
+
+class TestCholeskyQR(unittest.TestCase):
+    def _rows(self, Y, layout):
+        return jax.device_put(jnp.pad(Y, ((0, layout.pad), (0, 0))), layout.sharding())
+
+    def _check(self, Y, layout, tol):
+        from jVMC_exp.solver import rsvd
+        n, r = Y.shape
+        Q = rsvd._cholesky_qr(self._rows(Y, layout), layout)
+        _assert_sharded(self, Q, layout.sharding())
+        Q = np.asarray(Q)
+        self.assertFalse(np.any(Q[n:]))
+        Q = Q[:n]
+        Y = np.asarray(Y)
+        self.assertLess(np.linalg.norm(np.conj(Q).T @ Q - np.eye(r)), tol)
+        # same column space: Y = Q (Q^H Y)
+        self.assertLess(np.linalg.norm(Q @ (np.conj(Q).T @ Y) - Y), tol * np.linalg.norm(Y))
+
+    def test_ill_conditioned_block(self):
+        """Singular values spanning 1 ... 1e-8: CholeskyQR2 alone would lose orthogonality."""
+        n, r = 4 * MESH.size + 37, 12
+        U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(1), (n, r)))
+        W, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(2), (r, r)))
+        Y = (U * jnp.logspace(0, -8, r)) @ W.T
+        Yc = Y * jnp.exp(1j * jax.random.uniform(jax.random.PRNGKey(3), (n, 1), maxval=2 * np.pi))
+        for shape in _mesh_shapes():
+            layout = ParameterLayout(parameter_mesh(shape), n)
+            for Y_ in (Y, Yc):
+                with self.subTest(mesh_shape=shape, dtype=str(Y_.dtype)):
+                    self._check(Y_, layout, tol=1e-12)
+
+    def test_rank_deficient_block(self):
+        """
+        A numerically rank deficient block (rank 6 of 9 columns) needs more than one
+        shifted pass; the result is still an orthonormal basis containing range(Y).
+        """
+        n = 4 * MESH.size + 13
+        U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(4), (n, 6)))
+        Y = U @ jax.random.normal(jax.random.PRNGKey(5), (6, 9))
+        layout = ParameterLayout(parameter_mesh(None), n)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self._check(Y, layout, tol=1e-12)
+
+
+class TestRandomizedEighParameterLayout(unittest.TestCase):
+    def setUp(self):
+        self.N = 16 * MESH.size
+        self.n = 4 * MESH.size + 9
+        self.jac = _random_jacobian(jax.random.PRNGKey(10), self.N, self.n, decay=0.6)
+        self.S0 = jnp.conj(self.jac).T @ self.jac
+
+    def _check(self, A, S, k, n_oversamples, n_iter, which="LM", tol=1e-8, mode="device"):
+        ev, V = randomized_eigh(
+            A, k, jax.random.PRNGKey(5), n_oversamples=n_oversamples, n_iter=n_iter,
+            which=which, diagonalization_mode=mode
+        )
+        ev_ref, V_ref = jnp.linalg.eigh(S)
+        idx = jnp.argsort(jnp.abs(ev_ref) if which == "LM" else ev_ref)[::-1][:k]
+        idx = idx[jnp.argsort(ev_ref[idx])]
+
+        self.assertEqual(ev.shape, (k,))
+        self.assertEqual(V.shape, (A.padded_num_params, k))
+        _assert_sharded(self, V, A.layout.sharding())
+        V = np.asarray(V)
+        self.assertFalse(np.any(V[self.n:]))
+        V = jnp.asarray(V[:self.n])
+        self.assertTrue(bool(jnp.all(jnp.diff(ev) >= 0)))
+        self.assertTrue(jnp.allclose(ev, ev_ref[idx], atol=tol, rtol=tol), msg=f"{ev} vs {ev_ref[idx]}")
+        self.assertLess(_projector_distance(V, V_ref[:, idx]), 1e2 * tol)
+        self.assertTrue(jnp.allclose(A(V), V * ev, atol=1e2 * tol))
+
+    def test_full_rank_is_exact(self):
+        for shape in _mesh_shapes():
+            for mode, tr in _TRANSFORMS.items():
+                with self.subTest(mesh_shape=shape, mode=mode):
+                    A = ShardedQGTOperator(self.jac, mode, 0.0, 0.0, mesh_shape=shape)
+                    self._check(A, tr(self.S0), k=self.n, n_oversamples=0, n_iter=1, tol=1e-9)
+
+    def test_low_rank_captures_dominant_eigenpairs(self):
+        for shape in _mesh_shapes():
+            with self.subTest(mesh_shape=shape):
+                A = ShardedQGTOperator(self.jac, "identity", 0.0, 0.0, mesh_shape=shape)
+                self._check(A, self.S0, k=4, n_oversamples=4, n_iter=4, tol=1e-6)
+                A = ShardedQGTOperator(self.jac, "real", 0.0, 0.0, mesh_shape=shape)
+                self._check(A, jnp.real(self.S0), k=4, n_oversamples=4, n_iter=4, tol=1e-6)
+                self._check(A, jnp.real(self.S0), k=4, n_oversamples=4, n_iter=4, which="LA", tol=1e-6)
+                A = ShardedQGTOperator(self.jac, "imag", 0.0, 0.0, mesh_shape=shape)
+                self._check(A, 1j * jnp.imag(self.S0), k=6, n_oversamples=4, n_iter=4, tol=1e-6)
+
+    def test_diagonal_terms(self):
+        S = jnp.real(self.S0)
+        for shape in _mesh_shapes():
+            with self.subTest(mesh_shape=shape):
+                A = ShardedQGTOperator(self.jac, "real", 0.2, 0.01, mesh_shape=shape)
+                M = S + 0.2 * jnp.diag(jnp.diag(S)) + 0.01 * jnp.eye(self.n)
+                self._check(A, M, k=self.n, n_oversamples=0, n_iter=1, tol=1e-9)
+                # i Im with a shift: complex probe (imag_cpx)
+                A = ShardedQGTOperator(self.jac, "imag", 0.0, 0.05, mesh_shape=shape)
+                M = 1j * jnp.imag(self.S0) + 0.05 * jnp.eye(self.n)
+                self._check(A, M, k=self.n, n_oversamples=0, n_iter=1, tol=1e-9)
+
+    def test_distributed_mode_pads_the_small_matrix(self):
+        A = ShardedQGTOperator(self.jac, "identity", 0.0, 0.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self._check(A, self.S0, k=5, n_oversamples=2, n_iter=3, tol=1e-6, mode="distributed")
+
+    def test_matches_sample_layout(self):
+        """Same probes up to the layout, same subspace: the eigenvalues agree with the replicated layout."""
+        ev_s, _ = randomized_eigh(QGTOperator(self.jac, "real"), 5, jax.random.PRNGKey(1), n_oversamples=3, n_iter=3)
+        ev_p, _ = randomized_eigh(ShardedQGTOperator(self.jac, "real"), 5, jax.random.PRNGKey(1), n_oversamples=3, n_iter=3)
+        self.assertTrue(jnp.allclose(ev_s, ev_p, rtol=1e-6))
+
+
+class TestRandomizedPinvSNRParameterLayout(unittest.TestCase):
+    """RandomizedPinvSNR(layout="parameters") on the reference TDVP problems."""
+
+    @staticmethod
+    def _non_holomorphic(bias):
+        L = 4
+        model = nets.TwoNets((nets.RBM(numHidden=3, bias=bias), nets.RBM(numHidden=3, bias=bias)))
+        psi = NQS(model, L, 2 ** L, seed=1234)
+        hamiltonian = 0
+        for l in range(L):
+            hamiltonian += -1.0 * op.SigmaZ(l) * op.SigmaZ((l + 1) % L) - 0.3 * op.SigmaX(l)
+
+        return psi, sampler.ExactSampler(psi), jVMC_exp.objective_function.Observable(hamiltonian)
+
+    def test_arguments(self):
+        self.assertEqual(RandomizedPinvSNR(n_components=4).layout, "samples")
+        solver = RandomizedPinvSNR(n_components=4, layout="parameters")
+        self.assertEqual(solver.mesh_shape, (1, MESH.size))
+        self.assertEqual(RandomizedPinvSNR(n_components=4, layout="parameters", mesh_shape=(MESH.size, 1)).mesh_shape, (MESH.size, 1))
+        with self.assertRaises(ValueError):
+            RandomizedPinvSNR(n_components=4, layout="rows")
+        with self.assertRaises(ValueError):
+            RandomizedPinvSNR(n_components=4, layout="parameters", mesh_shape=(MESH.size + 1, 1))
+        with self.assertRaises(ValueError):
+            RandomizedPinvSNR(n_components=4, mesh_shape=(1, MESH.size))
+
+    def test_full_rank_matches_pinv_snr_holomorphic(self):
+        """Step for step equal to the dense PinvSNR, as for the sample layout."""
+        def run(solver):
+            psi, exactSampler, hamiltonian, _ = _reference_problem()
+            loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+            opt = jVMC_exp.optimizer.TDVP(exactSampler, psi, make_real=False, diagonalShift=0, solver=solver)
+            out = opt.time_evolution(1e-2, loss_function, jVMC_exp.stepper.Euler(timeStep=1e-3))
+            return np.array(out['energy']['mean'])
+
+        n_params = _reference_problem()[0].numParameters
+        energy_dense = run(jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-10))
+        for shape in _mesh_shapes():
+            with self.subTest(mesh_shape=shape):
+                energy = run(RandomizedPinvSNR(
+                    n_components=n_params, n_iter=1, pinv_tol=0.0, pinv_cutoff=1e-10,
+                    layout="parameters", mesh_shape=shape
+                ))
+                self.assertTrue(np.allclose(energy_dense, energy, atol=1e-8))
+
+    def test_low_rank_solve_is_close_to_dense(self):
+        """As for the sample layout: a rank that reaches the pinv cutoff reproduces the dense solve."""
+        psi, exactSampler, hamiltonian, _ = _reference_problem()
+        loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+        objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+
+        def update_with(solver):
+            opt = jVMC_exp.optimizer.TDVP(exactSampler, psi, make_real=False, diagonalShift=0, solver=solver)
+            return np.asarray(opt.get_update(objective_fn_out)), opt._additional_info
+
+        dense, info_d = update_with(jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-6))
+        spectrum = np.asarray(info_d["spectrum"])
+        n_above = int(np.sum(np.abs(spectrum / spectrum[-1]) > 1e-8))
+        self.assertLess(n_above, spectrum.size)
+        for shape in _mesh_shapes():
+            with self.subTest(mesh_shape=shape):
+                update, info = update_with(RandomizedPinvSNR(
+                    n_components=n_above, n_oversamples=2, n_iter=4, pinv_tol=0.0, pinv_cutoff=1e-6,
+                    layout="parameters", mesh_shape=shape
+                ))
+                self.assertEqual(update.shape, dense.shape)
+                self.assertTrue(np.allclose(update, dense, atol=1e-5), msg=f"{update}\n{dense}")
+                self.assertTrue(np.allclose(info["spectrum"], spectrum[-n_above:], rtol=1e-6))
+                self.assertLess(info["true_residual"], 1e-5)
+
+    def test_full_rank_matches_dense_non_holomorphic(self):
+        """
+        Both reductions; with biases the 30 parameters are not divisible by 4 devices,
+        so the parameter padding is exercised inside the optimizer as well.
+        """
+        for bias in (False, True):
+            psi, exactSampler, loss_function = self._non_holomorphic(bias)
+            n_params = psi.parameters_flat.size
+            objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+            for make_real in (True, False):
+                def update_with(solver):
+                    opt = jVMC_exp.optimizer.TDVP(
+                        exactSampler, psi, make_real=make_real, diagonalShift=1e-3, solver=solver
+                    )
+                    return np.asarray(opt.get_update(objective_fn_out))
+
+                dense = update_with(jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-8))
+                for shape in _mesh_shapes():
+                    with self.subTest(bias=bias, make_real=make_real, mesh_shape=shape):
+                        update = update_with(RandomizedPinvSNR(
+                            n_components=n_params, n_iter=1, pinv_tol=0.0, pinv_cutoff=1e-8,
+                            layout="parameters", mesh_shape=shape
+                        ))
+                        self.assertFalse(np.iscomplexobj(update))
+                        self.assertEqual(update.shape, psi.parameters_flat.shape)
+                        self.assertTrue(np.allclose(dense, update, atol=1e-6))
+
+    def test_s_norm_and_tdvp_error_unchanged(self):
+        """
+        The optimizer keeps the sample-sharded operator for opt.qgt, and the sharded
+        operator's vector product gives the same S-norm and TDVP error.
+        """
+        from jVMC_exp.util.util import s_norm_fn
+        psi, exactSampler, loss_function = self._non_holomorphic(True)
+        objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+        results = {}
+        for layout in ("samples", "parameters"):
+            # full rank: both layouts give the exact update
+            opt = jVMC_exp.optimizer.TDVP(
+                exactSampler, psi, make_real=True, diagonalShift=1e-3, store_qgt=True, compute_tdvp_error=True,
+                solver=RandomizedPinvSNR(n_components=psi.parameters_flat.size, n_iter=1, pinv_tol=0.0, layout=layout)
+            )
+            update = opt.get_update(objective_fn_out)
+            norm = s_norm_fn(opt)
+            results[layout] = (np.asarray(update), opt._additional_info["tdvp_error"], float(norm(update)))
+            if layout == "parameters":
+                # the same quantities from the parameter-sharded operator
+                lhs = opt._get_lhs(objective_fn_out.grad_log_psi)
+                opt._qgt = ShardedQGTOperator.from_operator(lhs).raw
+                results["sharded qgt"] = (
+                    results[layout][0],
+                    opt._get_tdvp_error(update, objective_fn_out.grad, objective_fn_out.o_loc.var).item(),
+                    float(norm(update)),
+                )
+        ref = results["samples"]
+        for name in ("parameters", "sharded qgt"):
+            with self.subTest(name=name):
+                update, tdvp_error, s_norm = results[name]
+                self.assertTrue(np.allclose(update, ref[0], atol=1e-6))
+                self.assertAlmostEqual(tdvp_error, ref[1], places=6)
+                self.assertAlmostEqual(s_norm, ref[2], places=6)
+
+    def test_lbfgs_refinement(self):
+        psi, exactSampler, hamiltonian, _ = _reference_problem()
+        loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+        objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+        dense = jVMC_exp.optimizer.TDVP(
+            exactSampler, psi, make_real=False, diagonalShift=0,
+            solver=jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-6)
+        ).get_update(objective_fn_out)
+        opt = jVMC_exp.optimizer.TDVP(
+            exactSampler, psi, make_real=False, diagonalShift=0,
+            solver=RandomizedPinvSNR(
+                n_components=2, n_oversamples=1, n_iter=2, pinv_tol=0.0, pinv_cutoff=1e-6,
+                lbfgs=True, lbfgs_tol=1e-6, lbfgs_maxiter=500, layout="parameters"
+            )
+        )
+        refined = opt.get_update(objective_fn_out)
+        info = opt._additional_info
+        self.assertGreater(info["residual_rsvd"], 1e-3)
+        self.assertGreaterEqual(info["n_lbfgs"], 1)
+        self.assertLess(info["true_residual"], 1e-5)
+        self.assertLess(np.linalg.norm(np.asarray(refined) - np.asarray(dense)), 1e-3 * np.linalg.norm(np.asarray(dense)))
+
+    def test_snr_modes(self):
+        psi, _, hamiltonian, _ = _reference_problem(batch_size=2 ** 10)
+        mc_sampler = jVMC_exp.sampler.MCSampler(psi, jVMC_exp.propose.SpinFlip(), 123, 2 ** 6, 2 ** 10, mu=1)
+        loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+        stepper = jVMC_exp.stepper.Euler(timeStep=1e-3)
+        solver = RandomizedPinvSNR(n_components=6, n_oversamples=2, n_iter=2, snr_tol=1, snr_mode="gaussian", layout="parameters")
+        opt = jVMC_exp.optimizer.TDVP(mc_sampler, psi, make_real=False, solver=solver)
+        opt.time_evolution(2e-3, loss_function, stepper)
+        self.assertEqual(np.asarray(opt.meta_data["snr"]).shape, (6,))
+        self.assertEqual(np.asarray(opt.meta_data["spectrum"]).shape, (6,))
+
+        solver = RandomizedPinvSNR(n_components=6, snr_tol=1, snr_mode="empiric", layout="parameters")
+        opt = jVMC_exp.optimizer.TDVP(mc_sampler, psi, make_real=False, solver=solver)
+        with self.assertRaises(NotImplementedError):
+            opt.time_evolution(1e-3, loss_function, stepper)
 
 
 if __name__ == "__main__":
