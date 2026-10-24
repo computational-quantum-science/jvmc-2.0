@@ -55,18 +55,47 @@ def _pin(x):
 # of process 0 afterwards, so that an out-of-memory error is reported at the stage that
 # caused it instead of at the next host synchronization
 _DEBUG = os.environ.get("JVMC_RSVD_DEBUG", "").lower() in ("1", "true", "yes")
-_debug_clock = [None]
+
+# Stage timings of the current randomized_eigh call: switched on by JVMC_RSVD_DEBUG or by
+# RandomizedPinvSNR(stage_timings=True); every stage then synchronizes with the devices.
+_STAGES = {"enabled": _DEBUG, "clock": None, "timings": {}}
+
+# Stage name prefix -> key of the accumulated timing
+_STAGE_KEYS = (
+    ("application", "apply"), ("QR", "qr"), ("probe", "probe"),
+    ("Rayleigh-Ritz matrix", "ritz_matrix"), ("Rayleigh-Ritz diagonalization", "eigh"),
+    ("Ritz vectors", "ritz_vectors"), ("selection", "select"),
+)
+
+
+def _begin_stages(enabled):
+    _STAGES["enabled"] = bool(enabled) or _DEBUG
+    _STAGES["clock"] = time.perf_counter()
+    _STAGES["timings"] = {}
+
+
+def _stage_timings():
+    """The timings accumulated since `_begin_stages`, by stage kind, in seconds."""
+    return dict(_STAGES["timings"])
 
 
 def _debug_stage(name, *arrays):
-    """With JVMC_RSVD_DEBUG: wait for ``arrays`` and print the time since the previous stage and the device memory."""
-    if not _DEBUG:
+    """
+    End of a stage of `randomized_eigh`: with stage timings enabled, wait for ``arrays``
+    and add the time since the previous stage to its kind; with JVMC_RSVD_DEBUG also
+    print it together with the device memory of process 0.
+    """
+    if not _STAGES["enabled"]:
         return
     jax.block_until_ready(arrays)
     now = time.perf_counter()
-    elapsed = 0.0 if _debug_clock[0] is None else now - _debug_clock[0]
-    _debug_clock[0] = now
-    if jax.process_index() == 0:
+    elapsed = 0.0 if _STAGES["clock"] is None else now - _STAGES["clock"]
+    _STAGES["clock"] = now
+    for prefix, key in _STAGE_KEYS:
+        if name.startswith(prefix):
+            _STAGES["timings"][key] = _STAGES["timings"].get(key, 0.0) + elapsed
+            break
+    if _DEBUG and jax.process_index() == 0:
         stats = jax.local_devices()[0].memory_stats() or {}
         in_use = stats.get("bytes_in_use", 0) / 2 ** 30
         peak = stats.get("peak_bytes_in_use", 0) / 2 ** 30
@@ -507,6 +536,8 @@ def _cholesky_qr(Y, layout: ParameterLayout, name="QR"):
     if _DEBUG:
         error = float(_orthogonality_error(_inner_rows(Q, Q, layout=layout)))
         _debug_stage(f"{name} ({n_passes} CholeskyQR passes, ||Q^H Q - I||_F = {error:.2e})", Q)
+    else:
+        _debug_stage(name, Q)
 
     return Q
 
@@ -743,6 +774,14 @@ class RandomizedPinvSNR(PinvSNR):
     lbfgs_max_restarts : int, default=10
         Upper bound on the number of L-BFGS runs per solve.
 
+    stage_timings : bool, default=False
+        Synchronize after every stage of the randomized decomposition and report the
+        accumulated wall times in the info dictionary: ``t_redistribute`` (parameters
+        layout: the all-to-all of the Jacobian), ``t_probe``, ``t_apply`` (all
+        applications of the operator), ``t_qr``, ``t_ritz_matrix``, ``t_eigh``,
+        ``t_ritz_vectors``, ``t_select`` and their sum ``t_rsvd``. Also on with
+        ``JVMC_RSVD_DEBUG=1``.
+
     With ``lbfgs`` the info dictionary additionally holds ``residual_rsvd`` (the true
     residual before the refinement), ``n_lbfgs`` (runs), ``lbfgs_iterations``
     (iterations summed over the runs), ``t_lbfgs`` (wall time in seconds) and
@@ -758,7 +797,8 @@ class RandomizedPinvSNR(PinvSNR):
             T_A: int | None = None, compute_true_residual: bool = True,
             lbfgs: bool = False, lbfgs_tol: float = 1e-7, lbfgs_maxiter: int = 1000,
             lbfgs_rtol: float = 1e-3, lbfgs_max_restarts: int = 10,
-            layout: Literal["samples", "parameters"] = "samples", mesh_shape=None
+            layout: Literal["samples", "parameters"] = "samples", mesh_shape=None,
+            stage_timings: bool = False
         ):
         super().__init__(
             snr_tol=snr_tol, pinv_tol=pinv_tol, pinv_cutoff=pinv_cutoff, snr_mode=snr_mode,
@@ -774,6 +814,8 @@ class RandomizedPinvSNR(PinvSNR):
         self._n_iter = int(n_iter)
         self._which = which
         self._compute_true_residual = bool(compute_true_residual) or bool(lbfgs)
+        self._stage_timings = bool(stage_timings)
+        self._last_stage_timings = {}
         self._key = seed if isinstance(seed, jax.Array) else random.PRNGKey(seed)
 
         if int(lbfgs_maxiter) <= 0 or int(lbfgs_max_restarts) <= 0:
@@ -903,11 +945,13 @@ class RandomizedPinvSNR(PinvSNR):
     def _diagonalize(self, A: QGTOperator | ShardedQGTOperator, b, pad_size):
         self._check_operator(A)
 
+        _begin_stages(self._stage_timings)
         ev, V = randomized_eigh(
             A, self.n_components, self._next_key(),
             n_oversamples=self.n_oversamples, n_iter=self.n_iter, which=self.which,
             diagonalization_mode=self._diagonalization_mode, T_A=self._T_A
         )
+        self._last_stage_timings.update(_stage_timings())
         if jnp.max(jnp.abs(ev)) < 1e-14:
             raise RuntimeError(
                 f"Largest eigenvalue of the matrix A to invert is {jnp.max(jnp.abs(ev))}. "
@@ -938,10 +982,18 @@ class RandomizedPinvSNR(PinvSNR):
                 'layout="parameters"; use snr_mode="gaussian", snr_tol=0 or '
                 'layout="samples".'
             )
+        self._last_stage_timings = {}
         if isinstance(A, QGTOperator) and self._layout == "parameters":
+            tic = time.perf_counter()
             A = ShardedQGTOperator.from_operator(A, self._mesh_shape)
+            if self._stage_timings or _DEBUG:
+                jax.block_until_ready(A.jacobian)
+                self._last_stage_timings["redistribute"] = time.perf_counter() - tic
 
         x, info = super().__call__(A, b, pad_size=0, **kwargs)
+        if self._stage_timings or _DEBUG:
+            info.update({f"t_{key}": value for key, value in self._last_stage_timings.items()})
+            info["t_rsvd"] = sum(self._last_stage_timings.values())
         if isinstance(A, ShardedQGTOperator):
             # PinvSNR's V (pinvEv * V^H b) is row-sharded and padded like V
             x = _gather_rows(x, layout=A.layout)

@@ -359,6 +359,38 @@ class TestTimeEvolutionRandomizedPinvSNR(unittest.TestCase):
                 self.assertEqual(np.asarray(opt.meta_data["spectrum"]).shape, (6,))
 
 
+class TestStageTimings(unittest.TestCase):
+    """RandomizedPinvSNR(stage_timings=True) reports the wall time of every stage."""
+
+    def test_stage_timings_in_info(self):
+        for layout in ("samples", "parameters"):
+            with self.subTest(layout=layout):
+                psi, exactSampler, hamiltonian, _ = _reference_problem()
+                loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+                objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+                opt = jVMC_exp.optimizer.TDVP(
+                    exactSampler, psi, make_real=False, diagonalShift=0,
+                    solver=RandomizedPinvSNR(n_components=6, n_oversamples=2, n_iter=1, layout=layout, stage_timings=True)
+                )
+                opt.get_update(objective_fn_out)
+                info = opt._additional_info
+                for key in ("t_probe", "t_apply", "t_qr", "t_ritz_matrix", "t_eigh", "t_ritz_vectors", "t_rsvd"):
+                    self.assertIn(key, info)
+                    self.assertGreaterEqual(info[key], 0.0)
+                self.assertAlmostEqual(
+                    info["t_rsvd"], sum(v for k, v in info.items() if k.startswith("t_") and k != "t_rsvd"), places=9
+                )
+                if layout == "parameters":
+                    self.assertIn("t_redistribute", info)
+                # off by default
+                opt = jVMC_exp.optimizer.TDVP(
+                    exactSampler, psi, make_real=False, diagonalShift=0,
+                    solver=RandomizedPinvSNR(n_components=6, n_oversamples=2, n_iter=1, layout=layout)
+                )
+                opt.get_update(objective_fn_out)
+                self.assertNotIn("t_rsvd", opt._additional_info)
+
+
 class TestLBFGSRefinement(unittest.TestCase):
     """The optional L-BFGS refinement recovers the force discarded by the truncation."""
 

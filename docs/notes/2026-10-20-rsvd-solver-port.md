@@ -261,6 +261,18 @@ and column-blocking entries in section 2 for the fixes.
 * A batched Jacobian (`Observable(..., batched_jacobian=True)`) is rejected, as
   for every matrix-free solver.
 
+### 4.1 Stage timings (2026-10-24)
+
+`RandomizedPinvSNR(stage_timings=True)` synchronizes after every stage of the
+randomized decomposition and reports the accumulated wall times in the info
+dictionary (hence in the optimizer's `meta_data`): `t_redistribute` (parameters
+layout: the all-to-all of the Jacobian), `t_probe`, `t_apply` (all operator
+applications), `t_qr`, `t_ritz_matrix`, `t_eigh`, `t_ritz_vectors`, `t_select`
+and their sum `t_rsvd`. `JVMC_RSVD_DEBUG=1` switches the same timers on and
+additionally prints each stage with the device memory. The limits scan
+(`scripts/0encap_folder/rsvd/limits_scan`) writes them into its
+`limits_results.jsonl`.
+
 ## 5. Parameter-sharded layout (2026-10-23)
 
 Motivation: in the `"samples"` layout above the `(num_params, r)` blocks are
