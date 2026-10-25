@@ -329,12 +329,19 @@ unchanged (the conversion happens inside the solver). The library default stays
   `JVMC_RSVD_DEBUG=1` prints the number of passes and `||Q^H Q - I||_F` after every QR.
   Tests: `||Q^H Q - I||_F < 1e-12` for singular values spanning 1 ... 1e-8 (real and
   complex) and for a rank-6 block with 9 columns.
-* **Rayleigh-Ritz**: `B = psum_p(Q_p^H (A Q)_p)`, replicated, diagonalized through
-  `solver.util.diagonalize` (default `"device"`; for `"distributed"` `B` is padded
-  and the padded eigenpairs are cut from the small eigenvector matrix, which is
-  block diagonal). Ritz vectors `V_p = Q_p V_small` locally, row-sharded; the
-  selection of `_select` is done row by row. `randomized_eigh` returns `V` padded,
-  `(padded_num_params, k)`, row-sharded (stripping it would gather it).
+* **Rayleigh-Ritz** (block-sharded since 2026-10-25, see 5.5): the final `Q` is
+  padded with zero columns to `r_b`, a multiple of the device count; `B = Q^H (A Q)`
+  is formed directly in blocks (`BLOCK_SPEC = P("params", "samples")`: device
+  `(s, p)` holds rows `p`, columns `s`, `r_b / P_p x r_b / P_s`) by a ring
+  reduce-scatter over the parameter groups (`_ritz_matrix_blocks`); the padding is
+  decoupled by `2 ||B||_F + 1` on its diagonal. `"distributed"` hands the blocks to
+  `jaxmg.syevd`, whose eigenvectors `W` come back in the same blocks;
+  `"device"`/`"host"` gather `B` (symmetrized) and diagonalize it replicated, then
+  slice `W` into the blocks. Ritz vectors `V_p = Q_p W` by a ring over the row blocks
+  of `W` (`_ritz_vectors_blocks`, one `ppermute` per step), row-sharded; the
+  selection of `_select` (which also drops the padded eigenpairs) is done row by
+  row. `randomized_eigh` returns `V` padded, `(padded_num_params, k)`, row-sharded
+  (stripping it would gather it).
 * **Solver** (`RandomizedPinvSNR`): `V^H b` is a `psum` of local `k`-vectors
   (`_project_rows`); `PinvSNR.__call__` is reused unchanged: its
   `jnp.dot(V, pinvEv * V^H b)` partitions as a local GEMV with a row-sharded result
@@ -357,8 +364,9 @@ Production case: 94640 real parameters (complex Jacobian, `q = Re`, real blocks)
 | one block (`Q`, `Y`, `A Q`, `V`; float64) | 11830 x 16000 | 1.5 GB |
 | streamed `Z` chunk (`(A Q, B Q)`, float64) | 2 x 4194 x 16000 | 1.07 GB (+ the same for the all-reduce) |
 | Jacobian chunk + its real/imag parts | 4194 x 11830 complex + 2 real | 0.8 + 0.8 GB |
-| Gram matrix / Cholesky factor (during a QR) | 16000 x 16000 float64 | 2 GB each |
-| Rayleigh-Ritz `B`, small eigenvectors `V_small` | 16000 x 16000 float64 | 2 GB each (+ eigh workspace) |
+| Gram matrix / Cholesky factor (during a QR, `qr_mode="cholesky"`) | 16000 x 16000 float64 | 2 GB each |
+| Rayleigh-Ritz `B`, eigenvectors `W`, `"distributed"` (5.5) | 2000 x 16000 float64 blocks | 0.26 GB each (+ jaxmg workspace outside the pool) |
+| the same, `"device"` | 16000 x 16000 float64, replicated | 2 GB each (+ eigh workspace) |
 
 The chunk has `min(2^30 / (11830 * 16), 2^30 / (2 * 16000 * 8)) = 4194` rows. At
 most two blocks are alive at once (input and output of an application; the QR
@@ -367,7 +375,8 @@ donates its input), so an application peaks at about 7.6 + 7.6 + 2 x 1.5 + 2.1 +
 eigh workspace. The `"samples"` layout needed 7.6 GB plus four 12 GB blocks. In
 general, per device: Jacobian copies `2 x 16 N n / P` bytes, blocks `8 n r / P_p`
 each, `Z` bounded by the chunk budget, and the `r x r` matrices `8 r^2` each
-(replicated, independent of the GPU count). The redistribution itself briefly
+when replicated (CholeskyQR's Gram matrix and factor, `B` and `W` with the
+`"device"` diagonalization) or `8 r^2 / P` when block-sharded (5.5). The redistribution itself briefly
 needs the output copy next to the input (plus a padded copy of the local shard
 if `num_params` is not divisible by `P_p`). For `P_s > 1` the blocks are
 `n / P_p` rows (larger) and the Jacobian copy `N / P_s x n / P_p`.
@@ -380,7 +389,8 @@ if `num_params` is not divisible by `P_p`). For `P_s > 1` the blocks are
 | `psum` of `Y` over the sample group | none | `n / P_p x r` |
 | redistribution (once per solve) | all-to-all of the Jacobian shard (7.6 GB, 7/8 of it leaves the device) | within each sample group |
 | CholeskyQR (per pass, 3 per QR) | all-reduce of the `r x r` Gram matrix, 2 GB | over `P_p` |
-| Rayleigh-Ritz | all-reduce of `r x r` | over `P_p` |
+| Rayleigh-Ritz matrix (ring reduce-scatter) | `P - 1` steps of one `r / P x r` block, `r^2 / P` in total per device | `P_p - 1` steps of `r / P_p x r / P_s` |
+| Ritz vectors (ring) | `P - 1` steps of one `r / P x r` block of `W` | the same, plus a gather of the `V` columns over the sample group |
 | vector product (`A(x)`, L-BFGS) | `N` values + all-gather of `n` | |
 
 The all-reduced volume per application (10.2 GB of `Z`) is comparable to the
@@ -419,3 +429,62 @@ the numerics, not the physics), so a run with another layout resumes the same
 checkpoint.
 
 Not done yet: a run on GPUs (timings and the measured peak memory at r = 16000).
+
+### 5.5 Block-sharded Rayleigh-Ritz step (2026-10-25)
+
+The limits scans (`scripts/0encap_folder/rsvd/limits_scan`, `limits_scan_16gpu`)
+showed that with 5.1-5.4 the `(n, r)` blocks and the Jacobian scale with the GPU
+count but the `r x r` objects did not: `B`, `V_small` (replicated before
+`Q_p V_small`), CholeskyQR's Gram matrix and factor, and the eigensolver
+workspace, 8 GB each per GPU at r = 32000. Now:
+
+* **`B`** is formed block-sharded by a ring reduce-scatter (`_ritz_matrix_blocks`):
+  in step `k` each device adds `Q_p[:, t]^H (A Q)_p[:, s]` for the block
+  `t = p - k - 1` it received and passes it on; at most two blocks of
+  `r_b / P_p x r_b / P_s` are alive, no `r x r` partial sum is formed. No psum over
+  the sample groups is needed (`Q`, `A Q` are replicated over them). Not
+  symmetrized on this path: `B` is Hermitian up to round-off and the eigensolvers
+  read one triangle.
+* **Block layout `P("params", "samples")`**: jaxmg (checked in its source,
+  `_cusolvermp_layout.py`) shards each matrix dimension over a single mesh axis and
+  needs its process grid to cover the whole mesh. Rows over the parameter groups and
+  columns over the sample groups satisfies both on any `(P_s, P_p)` mesh, and every
+  device's block is a local slice of the row-sharded `B`; for the default `(1, P)`
+  it is the plain row sharding over all devices.
+* **`syevd`**: `diagonalization_mode="distributed"` calls
+  `jaxmg.syevd(B, T_A, mesh, matrix_specs=P("params", "samples"))` on the blocks
+  (`B` donated); eigenvalues replicated, `W` in the same blocks, never replicated.
+  `T_A` defaults to the gcd of the local block sizes (256 with jaxmg's padding if
+  that is below 128). Falls back to `"device"` with a warning where jaxmg cannot be
+  used (not installed, no GPU, one device, `JVMC_USE_DISTRIBUTED` unset).
+  `"device"`/`"host"` gather `B`, symmetrize and diagonalize replicated as before,
+  then slice `W` into the blocks: both paths feed the same ring.
+* **Ritz vectors**: `V_p[:, s] = sum_k Q_p[:, k] W[k, s]` with the row blocks of `W`
+  travelling around the ring of parameter groups (`_ritz_vectors_blocks`); for
+  `P_s > 1` the column blocks of `V` are gathered over the sample group at the end
+  (`V` is replicated there anyway). Compiled HLO: only `collective-permute`, plus a
+  scalar all-reduce for the padding norm and that gather.
+* **`qr_mode`** (`RandomizedPinvSNR(qr_mode=...)`, `randomized_eigh(qr_mode=...)`):
+  `"cholesky"` (default) is the shifted CholeskyQR3 of 5.1 with its replicated Gram
+  matrix and Cholesky factor; `"distributed"` is `jaxmg.qr` on the row-sharded block
+  (`P("params", None)`, `T_A` passed through; the triangular factor comes back
+  row-sharded and is dropped; padding rows re-zeroed). It needs a `(1, P)` mesh
+  (jaxmg's grid must cover the mesh and the block's columns are not divisible by
+  `P_s` in general) and falls back to `"cholesky"` with a warning otherwise, or where
+  jaxmg cannot be used. The debug line of every QR names the method used.
+
+Still replicated, by design: the eigenvalues (`r`), the `k`-vectors of the solve
+(`V^H b`, the regularized inverse eigenvalues, the SNR), the update `x` (`n`) and
+everything the optimizer holds as before; with `qr_mode="cholesky"` the Gram
+matrix and Cholesky factor of every QR pass; with `"device"` diagonalization `B`
+and `W` while they are diagonalized.
+
+Per device at r = 32000 on 8 GPUs, `(1, 8)`: `B` and `W` blocks 4000 x 32000 x 8 B =
+1.0 GB each instead of 8.2 GB replicated; with both options distributed no
+`r x r` object is replicated.
+
+**jaxmg memory.** cuSOLVERMp's workspace (for `syevd` and `qr`) is a `cudaMalloc`
+outside the JAX memory pool: on 16 GPUs the points (377k, r >= 24000) and (493k,
+r >= 24000) died in `syevd` once the pool had grown past ~55 GiB. Runs that use
+`"distributed"` diagonalization or QR should set `XLA_PYTHON_CLIENT_MEM_FRACTION`
+to about 0.8 rather than 0.95, so that the workspace fits next to the pool.

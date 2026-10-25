@@ -19,11 +19,15 @@ Two layouts of the ``(num_params, r)`` blocks:
   ``jnp.linalg.qr``.
 * ``"parameters"`` (a :class:`ShardedQGTOperator`): the blocks are sharded over the
   parameter rows of a 2D mesh, orthonormalization by shifted CholeskyQR3
-  (:func:`_cholesky_qr`); every array whose size grows with the number of parameters
-  is divided by the number of parameter groups.
+  (:func:`_cholesky_qr`) or jaxmg's distributed QR; every array whose size grows with
+  the number of parameters is divided by the number of parameter groups. The
+  ``r x r`` Rayleigh-Ritz matrix and its eigenvectors are sharded in blocks as well
+  (:func:`_ritz_matrix_blocks`, :func:`_ritz_vectors_blocks`); with the
+  ``"distributed"`` diagonalization no ``r x r`` object is replicated.
 """
 from functools import partial
 from typing import Literal
+import math
 import os
 import time
 import warnings
@@ -32,19 +36,22 @@ import jax
 import jax.numpy as jnp
 import jax.random as random
 import numpy as np
+from jax.sharding import PartitionSpec as P
 
 from jVMC_exp import global_defs
 from jVMC_exp.sharding_config import MESH, REPLICATED_SHARDING, REPLICATED_SPEC, broadcast_split_key
+from jVMC_exp.solver import util as solver_util
 from jVMC_exp.solver.pinv import PinvSNR
 from jVMC_exp.solver.qgt_operator import (
     QGTOperator, ShardedQGTOperator, ParameterLayout, parameter_mesh,
-    PARAMS_AXIS, JACOBIAN_SPEC, ROWS_SPEC,
+    PARAMS_AXIS, SAMPLES_AXIS, JACOBIAN_SPEC, ROWS_SPEC,
     _column_block_product, _qgt_product_im, transformed_product, _apply
 )
 from jVMC_exp.solver.util import diagonalize
 
 WHICH = ("LM", "LA")
 LAYOUTS = ("samples", "parameters")
+QR_MODES = ("cholesky", "distributed")
 
 
 def _pin(x):
@@ -285,7 +292,7 @@ def randomized_eigh(
         operator: QGTOperator, k: int, key, n_oversamples: int = 0, n_iter: int = 4,
         which: Literal["LM", "LA"] = "LM",
         diagonalization_mode: Literal["device", "distributed", "host"] = "device",
-        T_A: int | None = None
+        T_A: int | None = None, qr_mode: Literal["cholesky", "distributed"] = "cholesky"
     ):
     """
     The ``k`` dominant eigenpairs of a :class:`QGTOperator` by randomized subspace
@@ -317,9 +324,21 @@ def randomized_eigh(
         Backend for the diagonalization of the ``r x r`` Rayleigh-Ritz matrix,
         forwarded to :func:`jVMC_exp.solver.util.diagonalize`. For
         ``"distributed"`` the matrix is padded to a multiple of the number of
-        devices (the padded eigenvalues are dropped again).
+        devices (the padded eigenvalues are dropped again). For a
+        :class:`ShardedQGTOperator` the matrix is always formed block-sharded (padded
+        the same way); ``"distributed"`` hands the blocks to jaxmg's ``syevd`` and the
+        eigenvectors stay block-sharded, the other modes gather it and diagonalize
+        it replicated (:func:`_diagonalize_blocks`).
     T_A : int, optional
-        Tile size for ``diagonalization_mode="distributed"``.
+        Tile size for ``diagonalization_mode="distributed"`` (and for
+        ``qr_mode="distributed"``).
+    qr_mode : {"cholesky", "distributed"}, default="cholesky"
+        Orthonormalization of the blocks of a :class:`ShardedQGTOperator`: shifted
+        CholeskyQR3 (:func:`_cholesky_qr`, its ``r x r`` Gram matrix and Cholesky
+        factor replicated) or jaxmg's distributed QR (:func:`_distributed_qr`, falls
+        back to ``"cholesky"`` with a warning without jaxmg, a GPU backend, one
+        process per GPU, or for a mesh with more than one sample group). Ignored for
+        a :class:`QGTOperator`.
 
     Returns
     -------
@@ -339,12 +358,14 @@ def randomized_eigh(
         raise ValueError(f"which has to be one of {WHICH}, got {which!r}.")
     if int(n_oversamples) < 0 or int(n_iter) < 0:
         raise ValueError("n_oversamples and n_iter have to be non-negative.")
+    if qr_mode not in QR_MODES:
+        raise ValueError(f"qr_mode has to be one of {QR_MODES}, got {qr_mode!r}.")
 
     total_rank = min(k + int(n_oversamples), n)
     if isinstance(operator, ShardedQGTOperator):
         return _randomized_eigh_rows(
             operator, k, key, total_rank=total_rank, n_iter=int(n_iter), which=which,
-            diagonalization_mode=diagonalization_mode, T_A=T_A
+            diagonalization_mode=diagonalization_mode, T_A=T_A, qr_mode=qr_mode
         )
 
     Q, B = _subspace_iteration(
@@ -542,21 +563,235 @@ def _cholesky_qr(Y, layout: ParameterLayout, name="QR"):
     return Q
 
 
-@partial(jax.jit, static_argnames=("restore_i",))
-def _symmetrize(B, *, restore_i):
-    if restore_i:
-        B = 1j * B
+def _jaxmg_fallback_reason():
+    """Why jaxmg cannot be used in this run (``None`` if it can), as in :func:`jVMC_exp.solver.util.diagonalize`."""
+    if solver_util.jaxmg is None:
+        return "the 'jaxmg' package is not installed"
+    if jax.default_backend() != "gpu":
+        return f"it needs a GPU backend, got {jax.default_backend()!r}"
+    if MESH.size == 1:
+        return "there is only one device"
+    if not global_defs.USE_DISTRIBUTED:
+        return "it needs JVMC_USE_DISTRIBUTED=true and one process per GPU"
 
-    return 0.5 * (B + jnp.conj(B).T)
+    return None
+
+
+def _warn_fallback(what, reason, fallback):
+    if jax.process_index() == 0:
+        warnings.warn(f"{what} is not available: {reason}. Falling back to {fallback}.")
+
+
+def _resolve_qr_mode(qr_mode, layout: ParameterLayout):
+    if qr_mode != "distributed":
+        return qr_mode
+    reason = _jaxmg_fallback_reason()
+    if reason is None and layout.sample_groups > 1:
+        reason = "jaxmg's process grid has to cover the whole mesh, so it needs a (1, P) mesh"
+    if reason is not None:
+        _warn_fallback('qr_mode="distributed" (jaxmg QR)', reason, 'qr_mode="cholesky"')
+        return "cholesky"
+
+    return qr_mode
+
+
+def _default_tile(*local_sizes):
+    """A cuSOLVERMp tile that divides the local sizes, or 256 (jaxmg pads) if their gcd is too small to be efficient."""
+    tile = math.gcd(*local_sizes)
+
+    return tile if tile >= 128 else 256
 
 
 @partial(jax.jit, static_argnames=("layout",))
-def _rows_times(Q, M, *, layout: ParameterLayout):
-    """``Q @ M`` for a row-sharded ``Q`` and a replicated (small) ``M``: local; row-sharded."""
+def _zero_padding_rows(Q, *, layout: ParameterLayout):
+    def local(q):
+        rows = jax.lax.axis_index(PARAMS_AXIS) * layout.local + jnp.arange(layout.local)
+        return jnp.where((rows < layout.num_params)[:, None], q, jnp.zeros((), q.dtype))
+
+    return jax.shard_map(local, mesh=layout.mesh, in_specs=(ROWS_SPEC,), out_specs=ROWS_SPEC)(Q)
+
+
+def _distributed_qr(Y, layout: ParameterLayout, T_A, name="QR"):
+    """
+    ``Q`` of the reduced QR of the row-sharded ``Y`` (donated) by jaxmg's distributed
+    (cuSOLVERMp) QR, which keeps the row sharding: nothing ``r x r`` is replicated (the
+    triangular factor comes back row-sharded and is dropped). Needs a ``(1, P)`` mesh
+    (see :func:`_resolve_qr_mode`). Householder QR may put round-off into the padding
+    rows of a rank-deficient block; they are zeroed again.
+    """
+    tile = T_A or _default_tile(layout.local, Y.shape[1])
+    Q, R = solver_util.jaxmg.qr(Y, tile, layout.mesh, matrix_specs=P(PARAMS_AXIS, None))
+    del R
+    if layout.pad:
+        Q = _zero_padding_rows(Q, layout=layout)
+    if _DEBUG:
+        error = float(_orthogonality_error(_inner_rows(Q, Q, layout=layout)))
+        _debug_stage(f"{name} (jaxmg QR, T_A = {tile}, ||Q^H Q - I||_F = {error:.2e})", Q)
+    else:
+        _debug_stage(name, Q)
+
+    return Q
+
+
+def _orthonormalize_rows(Y, layout: ParameterLayout, *, qr_mode, T_A, name):
+    if qr_mode == "distributed":
+        return _distributed_qr(Y, layout, T_A, name=name)
+
+    return _cholesky_qr(Y, layout, name=name)
+
+
+# The r x r objects of the parameters layout (Rayleigh-Ritz matrix B, its eigenvectors
+# W) are split in blocks: rows over the parameter groups, columns over the sample
+# groups, so that device (s, p) holds the block (p, s) of r / P_p x r / P_s entries.
+# This is the layout jaxmg takes (one mesh axis per matrix dimension, covering the
+# whole mesh); for a (1, P) mesh it is the plain row sharding over all devices.
+BLOCK_SPEC = P(PARAMS_AXIS, SAMPLES_AXIS)
+
+
+def _block_rank(total_rank, layout: ParameterLayout):
+    """The rank padded to a multiple of the number of devices (hence of P_p and P_s) for the block layout."""
+    n_devices = layout.mesh.size
+
+    return -(-total_rank // n_devices) * n_devices
+
+
+@partial(jax.jit, static_argnames=("layout", "width"), donate_argnums=0)
+def _pad_columns(Q, *, layout: ParameterLayout, width):
     return jax.shard_map(
-        lambda q, m: q @ m, mesh=layout.mesh,
-        in_specs=(ROWS_SPEC, REPLICATED_SPEC), out_specs=ROWS_SPEC
-    )(Q, M)
+        lambda q: jnp.pad(q, ((0, 0), (0, width - q.shape[1]))), mesh=layout.mesh,
+        in_specs=(ROWS_SPEC,), out_specs=ROWS_SPEC
+    )(Q)
+
+
+def _ring_permutation(n):
+    return [(i, (i + 1) % n) for i in range(n)]
+
+
+@partial(jax.jit, static_argnames=("layout", "rank", "restore_i"))
+def _ritz_matrix_blocks(Q, SQ, *, layout: ParameterLayout, rank, restore_i):
+    """
+    The Rayleigh-Ritz matrix ``B = Q^H (A Q)`` of the row-sharded ``Q`` and ``A Q``
+    (``r_b`` columns, ``r_b`` a multiple of the device count, the columns from ``rank``
+    on zero), in the block layout ``BLOCK_SPEC``: device ``(s, p)`` ends up with
+    ``B[rows p, columns s]``. A ring reduce-scatter over the parameter groups: in step
+    ``k`` every device adds its local contribution ``Q_p[:, t]^H (A Q)_p[:, s]`` to the
+    block ``t = p - k - 1`` it received from its neighbour and passes it on, so that
+    at most two blocks of ``r_b / P_p x r_b / P_s`` live at once and no ``r x r``
+    partial sum is formed. No psum over the sample groups is needed: ``Q`` and ``A Q``
+    are the same in all of them.
+
+    ``B`` is Hermitian up to round-off and is not symmetrized here (the eigensolvers
+    read one triangle; the gathered path symmetrizes). With ``restore_i`` the factor
+    ``i`` of the ``"imag_real"`` iteration is restored. The padding is decoupled as in
+    :func:`jVMC_exp.solver.util.diagonalize`: ``2 ||B||_F + 1``, more than the spectral
+    radius, on its diagonal, so that its eigenpairs come last in the ascending spectrum.
+    """
+    r_b = Q.shape[1]
+    n_groups = layout.groups
+    rows, cols = r_b // n_groups, r_b // layout.sample_groups
+    perm = _ring_permutation(n_groups)
+
+    def local(q, sq):
+        p = jax.lax.axis_index(PARAMS_AXIS)
+        s = jax.lax.axis_index(SAMPLES_AXIS)
+        sq_cols = jax.lax.dynamic_slice_in_dim(sq, s * cols, cols, axis=1)
+
+        def contribution(t):
+            q_rows = jax.lax.dynamic_slice_in_dim(q, t * rows, rows, axis=1)
+            return jnp.conj(q_rows).T @ sq_cols
+
+        def step(k, acc):
+            return jax.lax.ppermute(acc, PARAMS_AXIS, perm) + contribution((p - k - 1) % n_groups)
+
+        acc = jax.lax.fori_loop(1, n_groups, step, contribution((p - 1) % n_groups))
+        if restore_i:
+            acc = 1j * acc
+        if r_b > rank:
+            norm = jnp.sqrt(jax.lax.psum(jnp.sum(jnp.abs(acc) ** 2), (PARAMS_AXIS, SAMPLES_AXIS)))
+            i = p * rows + jnp.arange(rows)[:, None]
+            j = s * cols + jnp.arange(cols)[None, :]
+            acc = acc + jnp.where((i == j) & (i >= rank), 2 * norm + 1, 0.).astype(acc.dtype)
+
+        return acc
+
+    return jax.shard_map(
+        local, mesh=layout.mesh, in_specs=(ROWS_SPEC, ROWS_SPEC), out_specs=BLOCK_SPEC
+    )(Q, SQ)
+
+
+@partial(jax.jit, static_argnames=("layout",))
+def _gathered_ritz_matrix(B, *, layout: ParameterLayout):
+    """The block-sharded ``B`` replicated and symmetrized, for the replicated eigensolvers."""
+    B = jax.lax.with_sharding_constraint(B, layout.sharding(REPLICATED_SPEC))
+
+    return jax.lax.with_sharding_constraint(0.5 * (B + jnp.conj(B).T), layout.sharding(REPLICATED_SPEC))
+
+
+def _diagonalize_blocks(B, layout: ParameterLayout, *, mode, T_A):
+    """
+    Eigenvalues (ascending, replicated) and eigenvectors ``W`` (``BLOCK_SPEC``) of the
+    block-sharded ``B``, and the backend used. ``"distributed"``: jaxmg's ``syevd``
+    directly on the blocks (``B`` is donated), ``W`` comes back in the same blocks,
+    nothing ``r x r`` is replicated; falls back to ``"device"`` with a warning where
+    jaxmg cannot be used. ``"device"`` / ``"host"``: ``B`` gathered and diagonalized
+    replicated by :func:`jVMC_exp.solver.util.diagonalize`, ``W`` re-sharded into the
+    blocks (a local slice).
+    """
+    if mode == "distributed":
+        reason = _jaxmg_fallback_reason()
+        if reason is not None:
+            _warn_fallback('diagonalization_mode="distributed" (jaxmg syevd)', reason, '"device"')
+            mode = "device"
+    if mode == "distributed":
+        r_b = B.shape[0]
+        tile = T_A or _default_tile(r_b // layout.groups, r_b // layout.sample_groups)
+        ev, W = solver_util.jaxmg.syevd(B, tile, layout.mesh, matrix_specs=BLOCK_SPEC)
+        return ev, W, f"distributed, T_A = {tile}"
+
+    B = _gathered_ritz_matrix(B, layout=layout)
+    ev, W = diagonalize(B, pad_size=0, mode=mode)
+    del B
+    W = jax.device_put(W, layout.sharding(BLOCK_SPEC))
+
+    return ev, W, mode
+
+
+@partial(jax.jit, static_argnames=("layout",))
+def _ritz_vectors_blocks(Q, W, *, layout: ParameterLayout):
+    """
+    The Ritz vectors ``V = Q W`` for the row-sharded ``Q`` and the block-sharded ``W``,
+    row-sharded like ``Q``, without replicating ``W``: on device ``(s, p)``,
+    ``V_p[:, s] = sum_k Q_p[:, k] W[k, s]`` over the row blocks ``k`` of ``W``, which
+    travel around the ring of parameter groups (one ``ppermute`` per step, at most two
+    blocks alive). With several sample groups the column blocks of ``V`` are gathered
+    at the end.
+    """
+    r_b = Q.shape[1]
+    n_groups = layout.groups
+    rows = r_b // n_groups
+    perm = _ring_permutation(n_groups)
+
+    def local(q, w):
+        p = jax.lax.axis_index(PARAMS_AXIS)
+
+        def contribution(k, w):
+            # after k steps this device holds the block of group p - k
+            q_cols = jax.lax.dynamic_slice_in_dim(q, ((p - k) % n_groups) * rows, rows, axis=1)
+            return q_cols @ w
+
+        def step(k, carry):
+            acc, w = carry
+            w = jax.lax.ppermute(w, PARAMS_AXIS, perm)
+            return acc + contribution(k, w), w
+
+        acc, _ = jax.lax.fori_loop(1, n_groups, step, (contribution(0, w), w))
+        return acc
+
+    V = jax.shard_map(
+        local, mesh=layout.mesh, in_specs=(ROWS_SPEC, BLOCK_SPEC), out_specs=BLOCK_SPEC
+    )(Q, W)
+
+    return jax.lax.with_sharding_constraint(V, layout.sharding(ROWS_SPEC))
 
 
 @partial(jax.jit, static_argnames=("layout",))
@@ -587,17 +822,21 @@ def _gather_rows(x, *, layout: ParameterLayout):
     return x[:layout.num_params]
 
 
-def _subspace_iteration_rows(operator: ShardedQGTOperator, key, *, total_rank, n_iter, apply_mode):
+def _subspace_iteration_rows(operator: ShardedQGTOperator, key, *, total_rank, n_iter, apply_mode,
+                             qr_mode, T_A):
     """
     :func:`_subspace_iteration` with the blocks sharded over the parameter rows of the
     operator's 2D mesh: ``(padded_num_params / P_p, r)`` per device. Probe, iterates
-    and ``Q`` never leave this layout; orthonormalization by :func:`_cholesky_qr`;
-    the Rayleigh-Ritz matrix ``B = Q^H A Q`` is a ``psum`` of the local ``r x r``
-    products, replicated.
+    and ``Q`` never leave this layout; orthonormalization by :func:`_cholesky_qr` or
+    :func:`_distributed_qr` (``qr_mode``, already resolved). The final ``Q`` is padded
+    with zero columns to a multiple of the device count (:func:`_block_rank`, a few
+    columns) and the Rayleigh-Ritz matrix ``B = Q^H A Q`` is formed block-sharded by
+    :func:`_ritz_matrix_blocks`.
     """
     layout = operator.layout
     jac, diag, shift = operator.jacobian, operator._diag_rows, operator._shift
     kwargs = dict(layout=layout, apply_mode=apply_mode, has_diag=operator.has_diagonal_terms)
+    orthonormalize = partial(_orthonormalize_rows, layout=layout, qr_mode=qr_mode, T_A=T_A)
 
     _debug_stage("start of the subspace iteration")
     Omega = _probe_rows(
@@ -609,49 +848,51 @@ def _subspace_iteration_rows(operator: ShardedQGTOperator, key, *, total_rank, n
     del Omega
     _debug_stage("application 1", Y)
     for it in range(2 * n_iter):
-        Q = _cholesky_qr(Y, layout, name=f"QR {it + 1}")
+        Q = orthonormalize(Y, name=f"QR {it + 1}")
         Y = _apply_rows(jac, Q, diag, shift, **kwargs)
         del Q
         _debug_stage(f"application {it + 2}", Y)
-    Q = _cholesky_qr(Y, layout, name=f"QR {2 * n_iter + 1}")
+    Q = orthonormalize(Y, name=f"QR {2 * n_iter + 1}")
     del Y
+    r_b = _block_rank(total_rank, layout)
+    if r_b > total_rank:
+        Q = _pad_columns(Q, layout=layout, width=r_b)
     SQ = _apply_rows(jac, Q, diag, shift, **kwargs)
     _debug_stage(f"application {2 * n_iter + 2}", SQ)
-    B = _symmetrize(_inner_rows(Q, SQ, layout=layout), restore_i=apply_mode == "imag_real")
+    B = _ritz_matrix_blocks(Q, SQ, layout=layout, rank=total_rank, restore_i=apply_mode == "imag_real")
     del SQ
-    _debug_stage("Rayleigh-Ritz matrix", B)
+    _debug_stage("Rayleigh-Ritz matrix (block-sharded)", B)
 
     return Q, B
 
 
 def _randomized_eigh_rows(operator: ShardedQGTOperator, k, key, *, total_rank, n_iter, which,
-                          diagonalization_mode, T_A):
-    """:func:`randomized_eigh` for a :class:`ShardedQGTOperator`; ``V`` is row-sharded and padded."""
+                          diagonalization_mode, T_A, qr_mode="cholesky"):
+    """
+    :func:`randomized_eigh` for a :class:`ShardedQGTOperator`. ``V`` is row-sharded and
+    padded; the Rayleigh-Ritz matrix and its eigenvectors stay block-sharded
+    (:func:`_diagonalize_blocks`, :func:`_ritz_vectors_blocks`).
+    """
     layout = operator.layout
     Q, B = _subspace_iteration_rows(
-        operator, key, total_rank=total_rank, n_iter=n_iter, apply_mode=_apply_mode(operator)
+        operator, key, total_rank=total_rank, n_iter=n_iter, apply_mode=_apply_mode(operator),
+        qr_mode=_resolve_qr_mode(qr_mode, layout), T_A=T_A
     )
 
-    # As in randomized_eigh; the padded block of B is decoupled, so the padded
-    # eigenpairs are simply cut off the small eigenvector matrix
-    pad = (-total_rank) % MESH.shape["devices"] if diagonalization_mode == "distributed" else 0
-    if pad:
-        B = jnp.pad(B, ((0, pad), (0, pad)))
-    ev, V_small = diagonalize(B, pad_size=pad, mode=diagonalization_mode, T_A=T_A)
+    ev, W, backend = _diagonalize_blocks(B, layout, mode=diagonalization_mode, T_A=T_A)
     del B
-    if pad:
-        ev, V_small = ev[:total_rank], V_small[:total_rank, :total_rank]
-    _debug_stage("Rayleigh-Ritz diagonalization", ev, V_small)
+    _debug_stage(f"Rayleigh-Ritz diagonalization ({backend})", ev, W)
 
-    V_small = jax.device_put(V_small, layout.sharding(REPLICATED_SPEC))
-    V = _rows_times(Q, V_small, layout=layout)
-    del Q, V_small
+    V = _ritz_vectors_blocks(Q, W, layout=layout)
+    del Q, W
     _debug_stage("Ritz vectors", V)
 
-    ev_host = np.asarray(ev)
+    # The padded eigenpairs are the last ones of the ascending spectrum
+    r_b = ev.shape[0]
+    ev_host = np.asarray(ev)[:total_rank]
     idx = np.argsort(np.abs(ev_host))[::-1][:k] if which == "LM" else np.argsort(ev_host)[::-1][:k]
     idx = idx[np.argsort(ev_host[idx])]
-    if k == total_rank and np.array_equal(idx, np.arange(total_rank)):
+    if r_b == total_rank and k == total_rank and np.array_equal(idx, np.arange(total_rank)):
         return ev, V
 
     ev, V = _select_rows(ev, V, jnp.asarray(idx), layout=layout)
@@ -711,7 +952,9 @@ class RandomizedPinvSNR(PinvSNR):
     Ritz vectors included, sharded over the parameter rows of a ``(P_s, P_p)`` mesh,
     so that their memory per device is divided by ``P_p``. ``V^H b`` is a ``psum`` of
     a ``k``-vector and the update ``V (pinvEv * V^H b)`` is all-gathered into the
-    replicated vector the optimizer expects. The true residual and the L-BFGS
+    replicated vector the optimizer expects. The ``r x r`` Rayleigh-Ritz matrix and
+    its eigenvectors are block-sharded; with ``diagonalization_mode="distributed"``
+    and ``qr_mode="distributed"`` no ``r x r`` object is replicated. The true residual and the L-BFGS
     refinement use the sharded operator's vector products.
 
     Only the top ``n_components`` eigenvalues are resolved. Choose ``n_components``
@@ -753,6 +996,13 @@ class RandomizedPinvSNR(PinvSNR):
         with ``P_s * P_p`` the number of devices; default ``(1, number of devices)``,
         pure parameter sharding. See
         :func:`jVMC_exp.solver.qgt_operator.parameter_mesh`.
+    qr_mode : {"cholesky", "distributed"}, default="cholesky"
+        Orthonormalization in the ``"parameters"`` layout: shifted CholeskyQR3 (its
+        ``r x r`` Gram matrix and Cholesky factor are replicated) or jaxmg's
+        distributed QR (nothing ``r x r`` replicated; needs jaxmg, a GPU backend, one
+        process per GPU and a ``(1, P)`` mesh, otherwise it falls back to
+        ``"cholesky"`` with a warning). ``T_A`` is its tile size. See
+        :func:`randomized_eigh`.
     compute_true_residual : bool, default=True
         Report ``true_residual`` in the info dictionary, at the cost of one more
         operator application per solve. Always on when ``lbfgs`` is set.
@@ -798,7 +1048,7 @@ class RandomizedPinvSNR(PinvSNR):
             lbfgs: bool = False, lbfgs_tol: float = 1e-7, lbfgs_maxiter: int = 1000,
             lbfgs_rtol: float = 1e-3, lbfgs_max_restarts: int = 10,
             layout: Literal["samples", "parameters"] = "samples", mesh_shape=None,
-            stage_timings: bool = False
+            stage_timings: bool = False, qr_mode: Literal["cholesky", "distributed"] = "cholesky"
         ):
         super().__init__(
             snr_tol=snr_tol, pinv_tol=pinv_tol, pinv_cutoff=pinv_cutoff, snr_mode=snr_mode,
@@ -829,6 +1079,9 @@ class RandomizedPinvSNR(PinvSNR):
 
         if layout not in LAYOUTS:
             raise ValueError(f"layout has to be one of {LAYOUTS}, got {layout!r}.")
+        if qr_mode not in QR_MODES:
+            raise ValueError(f"qr_mode has to be one of {QR_MODES}, got {qr_mode!r}.")
+        self._qr_mode = qr_mode
         self._layout = layout
         self._mesh_shape = None
         if layout == "parameters":
@@ -863,6 +1116,10 @@ class RandomizedPinvSNR(PinvSNR):
     @property
     def layout(self):
         return self._layout
+
+    @property
+    def qr_mode(self):
+        return self._qr_mode
 
     @property
     def mesh_shape(self):
@@ -949,7 +1206,8 @@ class RandomizedPinvSNR(PinvSNR):
         ev, V = randomized_eigh(
             A, self.n_components, self._next_key(),
             n_oversamples=self.n_oversamples, n_iter=self.n_iter, which=self.which,
-            diagonalization_mode=self._diagonalization_mode, T_A=self._T_A
+            diagonalization_mode=self._diagonalization_mode, T_A=self._T_A,
+            qr_mode=self._qr_mode
         )
         self._last_stage_timings.update(_stage_timings())
         if jnp.max(jnp.abs(ev)) < 1e-14:

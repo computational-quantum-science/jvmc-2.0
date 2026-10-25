@@ -10,7 +10,7 @@ import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
 import jVMC_exp.operator.discrete as op
 import jVMC_exp.sampler as sampler
-from jax.sharding import PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 from jVMC_exp.sharding_config import MESH, DEVICE_SHARDING
 from jVMC_exp.solver.qgt_operator import (
     QGTOperator, ShardedQGTOperator, ParameterLayout, parameter_mesh, SAMPLES_AXIS, PARAMS_AXIS
@@ -989,6 +989,157 @@ class TestRandomizedPinvSNRParameterLayout(unittest.TestCase):
         opt = jVMC_exp.optimizer.TDVP(mc_sampler, psi, make_real=False, solver=solver)
         with self.assertRaises(NotImplementedError):
             opt.time_evolution(1e-3, loss_function, stepper)
+
+
+class _FakeJaxmg:
+    """
+    Stands in for jaxmg on CPU: same call signatures, computed with jnp, results in the
+    input's sharding (as jaxmg returns them). Records the shardings it was given.
+    """
+    def __init__(self):
+        self.calls = []
+
+    def syevd(self, a, T_A, mesh, matrix_specs):
+        self.calls.append(("syevd", a.sharding, T_A, mesh, matrix_specs))
+        ev, W = jnp.linalg.eigh(a)
+        return ev, jax.device_put(W, NamedSharding(mesh, matrix_specs))
+
+    def qr(self, a, T_A, mesh, matrix_specs):
+        self.calls.append(("qr", a.sharding, T_A, mesh, matrix_specs))
+        Q, R = jnp.linalg.qr(a)
+        return jax.device_put(Q, NamedSharding(mesh, matrix_specs)), R
+
+
+class TestBlockShardedRayleighRitz(unittest.TestCase):
+    """The r x r objects of the parameters layout are block-sharded, never replicated."""
+
+    def _rows(self, X, layout):
+        return jax.device_put(jnp.pad(X, ((0, layout.pad), (0, 0))), layout.sharding())
+
+    def test_ritz_matrix_blocks_match_replicated(self):
+        from jVMC_exp.solver import rsvd
+        n, r = 4 * MESH.size + 3, 2 * MESH.size + 3
+        k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+        Q = jax.random.normal(k1, (n, r))
+        SQ = jax.random.normal(k2, (n, r))
+        for shape in _mesh_shapes():
+            layout = ParameterLayout(parameter_mesh(shape), n)
+            r_b = rsvd._block_rank(r, layout)
+            self.assertEqual(r_b % MESH.size, 0)
+            Qb = rsvd._pad_columns(self._rows(Q, layout), layout=layout, width=r_b)
+            SQb = rsvd._pad_columns(self._rows(SQ, layout), layout=layout, width=r_b)
+            for restore_i in (False, True):
+                with self.subTest(mesh_shape=shape, restore_i=restore_i):
+                    B = rsvd._ritz_matrix_blocks(Qb, SQb, layout=layout, rank=r, restore_i=restore_i)
+                    _assert_sharded(self, B, layout.sharding(rsvd.BLOCK_SPEC))
+                    for shard in B.addressable_shards:
+                        self.assertEqual(shard.data.shape, (r_b // shape[1], r_b // shape[0]))
+                    B = np.asarray(B)
+                    ref = np.asarray(Q.T @ SQ) * (1j if restore_i else 1)
+                    self.assertTrue(np.allclose(B[:r, :r], ref, atol=1e-12))
+                    if r_b > r:
+                        self.assertFalse(np.any(B[:r, r:]) or np.any(B[r:, :r]))
+                        c = 2 * np.linalg.norm(ref) + 1
+                        self.assertTrue(np.allclose(B[r:, r:], c * np.eye(r_b - r)))
+
+    def test_ring_product_equals_dense(self):
+        from jVMC_exp.solver import rsvd
+        n, r_b = 4 * MESH.size + 3, 3 * MESH.size
+        k1, k2, k3 = jax.random.split(jax.random.PRNGKey(1), 3)
+        Q = jax.random.normal(k1, (n, r_b))
+        W = jax.random.normal(k2, (r_b, r_b)) + 1j * jax.random.normal(k3, (r_b, r_b))
+        for shape in _mesh_shapes():
+            with self.subTest(mesh_shape=shape):
+                layout = ParameterLayout(parameter_mesh(shape), n)
+                Wb = jax.device_put(W, layout.sharding(rsvd.BLOCK_SPEC))
+                V = rsvd._ritz_vectors_blocks(self._rows(Q, layout), Wb, layout=layout)
+                _assert_sharded(self, V, layout.sharding())
+                V = np.asarray(V)
+                self.assertTrue(np.allclose(V[:n], np.asarray(Q @ W), atol=1e-12))
+                self.assertFalse(np.any(V[n:]))
+
+    def _eigh(self, A, **kwargs):
+        return randomized_eigh(A, self.n, jax.random.PRNGKey(5), n_iter=1, **kwargs)
+
+    def setUp(self):
+        self.N = 16 * MESH.size
+        self.n = 4 * MESH.size + 9
+        self.jac = _random_jacobian(jax.random.PRNGKey(10), self.N, self.n, decay=0.6)
+        self.S0 = jnp.conj(self.jac).T @ self.jac
+
+    def test_distributed_modes_fall_back_on_cpu(self):
+        """Without jaxmg (CPU) both distributed options warn and give the result of the default path."""
+        A = ShardedQGTOperator(self.jac, "real")
+        ev_ref, V_ref = self._eigh(A)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ev, V = self._eigh(A, qr_mode="distributed", diagonalization_mode="distributed")
+        messages = " ".join(str(w.message) for w in caught)
+        self.assertIn('qr_mode="distributed"', messages)
+        self.assertIn('diagonalization_mode="distributed"', messages)
+        self.assertTrue(np.array_equal(np.asarray(ev), np.asarray(ev_ref)))
+        self.assertTrue(np.array_equal(np.asarray(V), np.asarray(V_ref)))
+        with self.assertRaises(ValueError):
+            self._eigh(A, qr_mode="householder")
+
+    def test_distributed_paths_with_jaxmg_stand_in(self):
+        """
+        The jaxmg calls get the block-sharded Ritz matrix (syevd) and the row-sharded
+        block (qr, (1, P) meshes only), and the eigenpairs are exact at full rank.
+        """
+        from jVMC_exp.solver import rsvd, util
+        fake = _FakeJaxmg()
+        old_jaxmg, old_reason = util.jaxmg, rsvd._jaxmg_fallback_reason
+        try:
+            util.jaxmg = fake
+            rsvd._jaxmg_fallback_reason = lambda: None
+            for shape in _mesh_shapes():
+                for mode, tr in _TRANSFORMS.items():
+                    with self.subTest(mesh_shape=shape, mode=mode), warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        fake.calls.clear()
+                        A = ShardedQGTOperator(self.jac, mode, 0.0, 0.0, mesh_shape=shape)
+                        ev, V = self._eigh(A, qr_mode="distributed", diagonalization_mode="distributed", T_A=2)
+                        ev_ref = jnp.linalg.eigh(tr(self.S0))[0]
+                        self.assertTrue(jnp.allclose(ev, ev_ref, atol=1e-9))
+                        V = jnp.asarray(np.asarray(V)[:self.n])
+                        self.assertTrue(jnp.allclose(tr(self.S0) @ V, V * ev, atol=1e-8))
+
+                        syevd = [c for c in fake.calls if c[0] == "syevd"]
+                        self.assertEqual(len(syevd), 1)
+                        _, sharding, T_A, mesh, specs = syevd[0]
+                        self.assertEqual(specs, rsvd.BLOCK_SPEC)
+                        self.assertIs(mesh, A.mesh)
+                        self.assertEqual(T_A, 2)
+                        if MESH.size > 1:
+                            self.assertFalse(sharding.is_fully_replicated)
+                        qr = [c for c in fake.calls if c[0] == "qr"]
+                        self.assertEqual(len(qr), 3 if shape[0] == 1 else 0)
+        finally:
+            util.jaxmg, rsvd._jaxmg_fallback_reason = old_jaxmg, old_reason
+
+    def test_solver_with_distributed_options(self):
+        psi, exactSampler, hamiltonian, _ = _reference_problem()
+        loss_function = jVMC_exp.objective_function.Observable(hamiltonian)
+        objective_fn_out = loss_function.value_and_grad(exactSampler, compute_grad=True, t=0)
+        n_params = psi.numParameters
+
+        def update_with(solver):
+            opt = jVMC_exp.optimizer.TDVP(exactSampler, psi, make_real=False, diagonalShift=0, solver=solver)
+            return np.asarray(opt.get_update(objective_fn_out))
+
+        dense = update_with(jVMC_exp.solver.PinvSNR(pinv_tol=0.0, pinv_cutoff=1e-10))
+        solver = RandomizedPinvSNR(
+            n_components=n_params, n_iter=1, pinv_tol=0.0, pinv_cutoff=1e-10, layout="parameters",
+            qr_mode="distributed", diagonalization_mode="distributed"
+        )
+        self.assertEqual(solver.qr_mode, "distributed")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            update = update_with(solver)
+        self.assertTrue(np.allclose(update, dense, atol=1e-8))
+        with self.assertRaises(ValueError):
+            RandomizedPinvSNR(n_components=4, qr_mode="householder")
 
 
 if __name__ == "__main__":
