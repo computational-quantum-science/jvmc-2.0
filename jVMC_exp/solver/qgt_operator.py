@@ -481,19 +481,60 @@ class ParameterLayout:
         return NamedSharding(self.mesh, spec)
 
 
-@partial(jax.jit, static_argnames=("layout",))
+def _redistribution_chunk(jac, layout: ParameterLayout):
+    """
+    Rows of the local Jacobian shard per ``all_to_all`` of :func:`_column_sharded_jacobian`,
+    at most ``global_defs.MATMUL_CHUNK_BYTES`` of (padded) rows (0: the whole shard at once).
+    """
+    n_local_rows = jac.shape[0] // layout.mesh.size
+    row_bytes = layout.padded * jac.dtype.itemsize
+    budget = global_defs.MATMUL_CHUNK_BYTES or n_local_rows * row_bytes
+
+    return max(1, min(n_local_rows, budget // row_bytes))
+
+
 def _column_sharded_jacobian(jac, *, layout: ParameterLayout):
     """
     The sample-sharded Jacobian redistributed to the 2D mesh: device ``(s, p)`` gets
     the rows of sample group ``s`` and the columns of parameter group ``p``, the
-    columns zero padded to ``layout.padded``. One ``all_to_all`` within every sample
+    columns zero padded to ``layout.padded``. An ``all_to_all`` within every sample
     group: each device splits its rows into the column blocks of the group and
     concatenates the row blocks it receives.
+
+    The exchange is done for chunks of the local rows of at most
+    ``global_defs.MATMUL_CHUNK_BYTES``, each written into the preallocated output. A
+    single ``all_to_all`` of the whole shard needs a rearranged copy of its input next
+    to the input and the output (three Jacobians per device, the out-of-memory error of
+    the limits scans at 31 GB per Jacobian); in chunks the redistribution needs the
+    input and the output plus a few chunks.
     """
+    return _column_sharded_jacobian_impl(jac, layout=layout, chunk=_redistribution_chunk(jac, layout))
+
+
+@partial(jax.jit, static_argnames=("layout", "chunk"))
+def _column_sharded_jacobian_impl(jac, *, layout: ParameterLayout, chunk: int):
+    groups = layout.groups
+
     def local(j):
-        if layout.pad:
-            j = jnp.pad(j, ((0, 0), (0, layout.pad)))
-        return jax.lax.all_to_all(j, PARAMS_AXIS, 1, 0, tiled=True)
+        n_rows = j.shape[0]
+        # Rows received from group member q go to rows q * n_rows + (rows of the chunk)
+        out = _varying_zeros((groups, n_rows, layout.local), j.dtype, like=j, axes=_MESH_AXES)
+
+        def exchange(k, out):
+            # The last chunk is shifted back to end at the last row (and repeats a few
+            # rows): a remainder chunk outside the loop would copy the output
+            start = jnp.minimum(k * chunk, n_rows - chunk)
+            rows = jax.lax.dynamic_slice_in_dim(j, start, chunk)
+            if layout.pad:
+                rows = jnp.pad(rows, ((0, 0), (0, layout.pad)))
+            received = jax.lax.all_to_all(rows, PARAMS_AXIS, 1, 0, tiled=True)
+            return jax.lax.dynamic_update_slice_in_dim(
+                out, received.reshape(groups, chunk, layout.local), start, axis=1
+            )
+
+        out = jax.lax.fori_loop(0, -(-n_rows // chunk), exchange, out)
+
+        return out.reshape(groups * n_rows, layout.local)
 
     return jax.shard_map(
         local, mesh=layout.mesh, in_specs=(P(_MESH_AXES),), out_specs=JACOBIAN_SPEC

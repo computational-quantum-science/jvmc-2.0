@@ -377,8 +377,9 @@ general, per device: Jacobian copies `2 x 16 N n / P` bytes, blocks `8 n r / P_p
 each, `Z` bounded by the chunk budget, and the `r x r` matrices `8 r^2` each
 when replicated (CholeskyQR's Gram matrix and factor, `B` and `W` with the
 `"device"` diagonalization) or `8 r^2 / P` when block-sharded (5.5). The redistribution itself briefly
-needs the output copy next to the input (plus a padded copy of the local shard
-if `num_params` is not divisible by `P_p`). For `P_s > 1` the blocks are
+needs the output copy next to the input; since 2026-10-26 it is done in chunks of
+rows (6), before that a single all-to-all also needed a rearranged copy of the input
+(three Jacobians per device). For `P_s > 1` the blocks are
 `n / P_p` rows (larger) and the Jacobian copy `N / P_s x n / P_p`.
 
 ### 5.3 Communication per application
@@ -488,3 +489,63 @@ outside the JAX memory pool: on 16 GPUs the points (377k, r >= 24000) and (493k,
 r >= 24000) died in `syevd` once the pool had grown past ~55 GiB. Runs that use
 `"distributed"` diagonalization or QR should set `XLA_PYTHON_CLIENT_MEM_FRACTION`
 to about 0.8 rather than 0.95, so that the workspace fits next to the pool.
+
+## 6. Fewer Jacobian copies (2026-10-26)
+
+The limits scans (`limits_scan`, `limits_scan_16gpu`) end in the Jacobian, not in the
+solver: nc 112 on 8 GPUs and nc 160 on 16 GPUs (about 30 GB per Jacobian shard) died in
+`_column_sharded_jacobian`, whose executable needed 86.01 GiB = 3 x 30.78 GB (input, the
+rearranged send buffer of the all-to-all, output); nc 160 on 8 and nc 192 on 16 GPUs died
+earlier in `_get_weighted_covar` (the force), which allocated a full copy of the Jacobian
+(41.27 GiB = one shard at 1.1M parameters). Per device and stage, with `J` one Jacobian
+shard, the copies alive were:
+
+| stage | before | now |
+|---|---|---|
+| `psi.gradients` | J | J |
+| force `F = cov(O_k, E_loc)` (`_get_weighted_covar`) | 2 J (XLA operand copy) | J + one chunk |
+| normalization for the operator (`_normalized_obs`) | 2 J (not donated) | J (in place) |
+| redistribution to the 2D mesh | 3 J | 2 J + two chunks |
+| rsvd solve | 2 J + blocks | 2 J + blocks (unchanged) |
+| next gradient with `store_qgt=True` | + J of the previous solve | released first |
+
+Changes:
+
+* **Redistribution in chunks** (`qgt_operator._column_sharded_jacobian`): the all-to-all is
+  done for chunks of the local rows of at most `MATMUL_CHUNK_BYTES` (padded) and written into
+  the preallocated output in a `fori_loop`; the last chunk is shifted back to end at the last
+  row (it repeats a few rows) because a remainder chunk outside the loop made XLA copy the
+  output. Compiled temporaries on 4 CPU devices, 33 MB shard: 65.5 MB before, 2 chunks now.
+  `MATMUL_CHUNK_BYTES = 0` keeps the single all-to-all.
+* **Force in chunks** (`stats._get_weighted_covar`): a `shard_map` over the samples, summed
+  over chunks of at most `MATMUL_CHUNK_BYTES` of rows with the `optimization_barrier` of the
+  QGT products, then a `psum`. Sample counts not divisible by the device count (only possible
+  outside `SampledObs`, which pads) use the former single product. The chunk size is a static
+  argument computed outside the jit, so changing `MATMUL_CHUNK_BYTES` takes effect.
+* **In-place conversions** (`SampledObs`): `_normalize` / `_inv_normalize` have donating
+  variants. `SampledObs(..., donate=True)` (used by `Observable` and `Infidelity` for the
+  freshly computed Jacobian) lets the conversions between raw, centered and normalized
+  overwrite the buffer. A buffer that was given without `donate` or that was handed out by
+  `observations`, `_centered_obs` or `_normalized_obs` is never overwritten (the
+  `QGTOperator` holds the normalized one, the empiric SNR then converts to centered); the
+  internal uses (`var`, `get_covar`, `transform`) convert without handing out. Donation is
+  skipped when the conversion changes the dtype.
+* **Previous QGT released** (`AbstractOptimizer._release_previous_solve`, `Evolution`: `_qgt =
+  None`): called right before the gradient of every solve. `opt.qgt` is still the QGT of the
+  last solve between solves (stepper norm, TDVP error, user callbacks).
+
+Expected limit: 2 J + blocks instead of 3 J, i.e. about 36 GB per shard on 96 GB cards at
+r = 16000 (n about 900k on 16 GPUs instead of about 750k). The next steps are dropping the
+sample-sharded copy for the solve (donate it into the redistribution, `opt.qgt` from the
+sharded operator: 2 J only while redistributing) and building the column-sharded Jacobian
+directly from the gradient batches (1 J).
+
+Tests: `stats_test.TestSampledObsMemory` (chunked force for real/complex data and
+observable, budgets 0 / default / one row, padded sample count; donated buffer deleted and
+reused without JAX's "donated buffers were not usable" warning; given and handed-out buffers
+kept; no copy left behind through the TDVP conversions; covariance with itself; identity
+transform), `rsvd_test`: `test_redistribution_in_chunks` (chunk sizes 1, 3, whole shard and a
+chunk not dividing the rows, all mesh shapes, padded columns),
+`test_redistribution_needs_no_copy_of_the_jacobian` (compiled temporaries), and
+`test_previous_qgt_released_before_the_next_gradient` (AdaptiveHeun with the S-norm and the
+TDVP error).

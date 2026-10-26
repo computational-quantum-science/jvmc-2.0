@@ -1,9 +1,13 @@
+import gc
 import unittest
+import warnings
 import jax
 import jax.numpy as jnp
 
+import jVMC_exp
+
 from jVMC_exp.stats import SampledObs, LazySampledObs
-from jVMC_exp.sharding_config import SizedIterable, BatchLayout, pad_to_devices
+from jVMC_exp.sharding_config import DEVICE_SHARDING, SizedIterable, BatchLayout, pad_to_devices
 
 # 3 samples per device and batch: over 20 samples the last batch is never full
 BATCH_SIZE = 3 * jax.device_count()
@@ -380,6 +384,120 @@ class TestLazySampledObs(unittest.TestCase):
         lazy = _make_lazy(index[:, None], index + 1, batch_size=BATCH_SIZE)
         for batch, weights in zip(lazy.observations, lazy._weights):
             self.assertTrue(jnp.allclose(batch[:, 0] + 1, weights * jnp.sum(index + 1)))
+
+def _num_live_arrays(shape):
+    return sum(1 for x in jax.live_arrays() if x.shape == shape and not x.is_deleted())
+
+class TestSampledObsMemory(unittest.TestCase):
+    """
+    The Jacobian is the largest array of a TDVP step: the covariance with the local
+    energy is summed over chunks of samples, and a freshly computed Jacobian is converted
+    between its raw, centered and normalized forms in place.
+    """
+    def setUp(self):
+        # Not a multiple of small chunk sizes, and a shape no other array of the tests has
+        self.N, self.n = 6 * jax.device_count(), 7
+        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(11), 4)
+        self.data = jax.random.normal(k1, (self.N, self.n)) + 1j * jax.random.normal(k2, (self.N, self.n))
+        self.other = jax.random.normal(k3, (self.N,)) + 0.5j * jax.random.normal(k4, (self.N,))
+        weights = jax.random.uniform(jax.random.PRNGKey(12), (self.N,)) + 0.1
+        self.weights = weights / jnp.sum(weights)
+
+    def _reference_covar(self, data, other):
+        """sum_i w_i conj(data_i - <data>) (other_i - <other>)"""
+        d = data - jnp.tensordot(self.weights, data, axes=(0, 0))
+        o = other - jnp.tensordot(self.weights, other, axes=(0, 0))
+        return jnp.einsum("i,ij,i->j", self.weights, jnp.conj(d), o)
+
+    def test_weighted_covar_in_chunks(self):
+        """
+        Real and complex data and other observable, with the whole shard at once, the
+        default budget and one sample per chunk; also when the number of samples is not
+        divisible by the number of devices (padded by SampledObs).
+        """
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            for budget in (0, old, 1):
+                jVMC_exp.global_defs.update(matmul_chunk_bytes=budget)
+                for data in (self.data, self.data.real):
+                    for other in (self.other, self.other.real):
+                        for N in (self.N, self.N - 1):
+                            with self.subTest(budget=budget, data=str(data.dtype), other=str(other.dtype), N=N):
+                                w = self.weights[:N] / jnp.sum(self.weights[:N])
+                                obs = SampledObs(data[:N], w)
+                                covar = obs.get_covar(SampledObs(other[:N], w))
+                                d = data[:N] - jnp.tensordot(w, data[:N], axes=(0, 0))
+                                o = other[:N] - jnp.tensordot(w, other[:N], axes=(0, 0))
+                                ref = jnp.einsum("i,ij,i->j", w, jnp.conj(d), o)
+                                self.assertEqual(covar.shape, (self.n,))
+                                self.assertTrue(jnp.allclose(covar, ref, atol=1e-12))
+                                if not jnp.iscomplexobj(data) and not jnp.iscomplexobj(other):
+                                    self.assertFalse(jnp.iscomplexobj(covar))
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_donated_observations_are_converted_in_place(self):
+        # a copy that the test gives away, sharded over the samples like a computed Jacobian
+        data = jax.device_put(self.data + 0, DEVICE_SHARDING)
+        obs = SampledObs(data, self.weights, donate=True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            normalized = obs._normalized_obs
+        self.assertTrue(data.is_deleted())
+        # the conversion reused the buffer (JAX warns about donated buffers it could not use)
+        self.assertFalse([w for w in caught if "donated" in str(w.message)])
+        mean = jnp.tensordot(self.weights, self.data, axes=(0, 0))
+        ref = jnp.sqrt(self.weights)[:, None] * (self.data - mean)
+        self.assertTrue(jnp.allclose(normalized, ref, atol=1e-12))
+
+    def test_given_and_handed_out_observations_are_kept(self):
+        """Without donate, and for every buffer handed out, a conversion makes a new buffer."""
+        obs = SampledObs(self.data, self.weights)
+        normalized = obs._normalized_obs
+        self.assertFalse(self.data.is_deleted())
+        centered = obs._centered_obs
+        raw = obs.observations
+        _ = obs.var  # back to normalized, internally
+        for x in (normalized, centered, raw):
+            self.assertFalse(x.is_deleted())
+        self.assertTrue(jnp.allclose(raw, self.data, atol=1e-12))
+        mean = jnp.tensordot(self.weights, self.data, axes=(0, 0))
+        self.assertTrue(jnp.allclose(centered, self.data - mean, atol=1e-12))
+
+    def test_one_copy_through_the_tdvp_conversions(self):
+        """
+        Covariance with the local energy (raw), variance and normalized Jacobian as the
+        optimizer uses them: no copy of the Jacobian is left behind.
+        """
+        shape = (self.N, self.n)
+        gc.collect()
+        before = _num_live_arrays(shape)
+        obs = SampledObs(jax.device_put(self.data + 0, DEVICE_SHARDING), self.weights, donate=True)
+        self.assertEqual(_num_live_arrays(shape), before + 1)
+        o_loc = SampledObs(self.other, self.weights)
+        covar = obs.get_covar(o_loc)
+        _ = obs.var
+        _ = obs.get_covar(o_loc)
+        normalized = obs._normalized_obs
+        self.assertEqual(_num_live_arrays(shape), before + 1)
+        self.assertTrue(jnp.allclose(covar, self._reference_covar(self.data, self.other), atol=1e-12))
+        mean = jnp.tensordot(self.weights, self.data, axes=(0, 0))
+        self.assertTrue(jnp.allclose(normalized, jnp.sqrt(self.weights)[:, None] * (self.data - mean), atol=1e-12))
+
+    def test_covariance_with_itself(self):
+        """`other` is converted first: converting it must not overwrite the data of the product."""
+        obs = SampledObs(jax.device_put(self.data[:, :1], DEVICE_SHARDING), self.weights, donate=True)
+        covar = obs.get_covar(obs)
+        ref = self._reference_covar(self.data[:, :1], self.data[:, 0])
+        self.assertTrue(jnp.allclose(covar, ref, atol=1e-12))
+
+    def test_transform_keeps_handed_out_buffer(self):
+        """An element-wise identity gives back the same buffer: it stays protected."""
+        obs = SampledObs(jax.device_put(self.data + 0, DEVICE_SHARDING), self.weights, donate=True)
+        raw = obs.observations
+        obs.transform(lambda x: x)
+        _ = obs._normalized_obs
+        self.assertFalse(raw.is_deleted())
 
 if __name__ == "__main__":
     unittest.main()

@@ -604,6 +604,50 @@ class TestShardedQGTOperator(unittest.TestCase):
                 for shard in A.jacobian.addressable_shards:
                     self.assertEqual(shard.data.shape, (self.N // shape[0], n_pad // p))
 
+    def test_redistribution_in_chunks(self):
+        """
+        The all-to-all is done for chunks of the local rows: the copy is the same for the
+        whole shard at once, for one row per chunk, and for a chunk that does not divide
+        the rows (the last chunk overlaps the previous one).
+        """
+        from jVMC_exp.solver import qgt_operator
+        jac = _random_jacobian(jax.random.PRNGKey(1), 7 * MESH.size, self.n)
+        n_local_rows = 7
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            for shape in _mesh_shapes():
+                layout = ParameterLayout(parameter_mesh(shape), self.n)
+                row_bytes = layout.padded * jac.dtype.itemsize
+                expected = np.pad(np.asarray(jac), ((0, 0), (0, layout.pad)))
+                for budget, chunk in ((0, n_local_rows), (1, 1), (3 * row_bytes, 3), (row_bytes // 2, 1)):
+                    with self.subTest(mesh_shape=shape, chunk=chunk):
+                        jVMC_exp.global_defs.update(matmul_chunk_bytes=budget)
+                        self.assertEqual(qgt_operator._redistribution_chunk(jac, layout), chunk)
+                        out = qgt_operator._column_sharded_jacobian(jac, layout=layout)
+                        _assert_sharded(self, out, layout.sharding(P(SAMPLES_AXIS, PARAMS_AXIS)))
+                        self.assertTrue(np.array_equal(np.asarray(out), expected))
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_redistribution_needs_no_copy_of_the_jacobian(self):
+        """
+        Compiled temporaries of the redistribution in chunks: a few chunks, where a single
+        all-to-all of the whole shard needs more than a shard (the out-of-memory error of the
+        limits scans).
+        """
+        from jVMC_exp.solver import qgt_operator
+        jac = _random_jacobian(jax.random.PRNGKey(2), 64 * MESH.size, 16 * MESH.size)
+        shard_bytes = jac.nbytes // MESH.size
+        for shape in _mesh_shapes():
+            layout = ParameterLayout(parameter_mesh(shape), jac.shape[1])
+            row_bytes = layout.padded * jac.dtype.itemsize
+            with self.subTest(mesh_shape=shape):
+                memory = qgt_operator._column_sharded_jacobian_impl.lower(
+                    jac, layout=layout, chunk=4
+                ).compile().memory_analysis()
+                self.assertLessEqual(memory.temp_size_in_bytes, 4 * 4 * row_bytes)
+                self.assertLess(memory.temp_size_in_bytes, shard_bytes / 4)
+
     def test_products_match_dense(self):
         """
         Vectors and blocks, real and complex, all three reductions, with and without
@@ -951,6 +995,34 @@ class TestRandomizedPinvSNRParameterLayout(unittest.TestCase):
                 self.assertTrue(np.allclose(update, ref[0], atol=1e-6))
                 self.assertAlmostEqual(tdvp_error, ref[1], places=6)
                 self.assertAlmostEqual(s_norm, ref[2], places=6)
+
+    def test_previous_qgt_released_before_the_next_gradient(self):
+        """
+        With store_qgt the optimizer keeps the QGT (and with it the Jacobian) of the last
+        solve for the S-norm of the stepper and the TDVP error; it is dropped before the
+        next Jacobian is computed, so that the two never coexist, and set again by the solve.
+        """
+        from jVMC_exp.util.util import s_norm_fn
+        psi, exactSampler, hamiltonian = self._non_holomorphic(True)
+        qgt_at_gradient = []
+
+        class Recording(jVMC_exp.objective_function.Observable):
+            def value_and_grad(self, sampler, compute_grad=True, **kwargs):
+                qgt_at_gradient.append(opt.qgt)
+                return super().value_and_grad(sampler, compute_grad, **kwargs)
+
+        opt = jVMC_exp.optimizer.TDVP(
+            exactSampler, psi, make_real=True, diagonalShift=1e-3, store_qgt=True, compute_tdvp_error=True,
+            solver=RandomizedPinvSNR(n_components=8, n_iter=1, layout="parameters")
+        )
+        stepper = jVMC_exp.stepper.AdaptiveHeun(timeStep=1e-3, rtol=0, atol=1e-4)
+        opt.time_evolution(
+            2e-3, Recording(hamiltonian.operator), stepper, save_meta_data=True, normFunction=s_norm_fn(opt)
+        )
+        self.assertGreaterEqual(len(qgt_at_gradient), 5)
+        self.assertTrue(all(qgt is None for qgt in qgt_at_gradient))
+        self.assertTrue(callable(opt.qgt))
+        self.assertTrue(np.isfinite(opt.meta_data["tdvp_error"]))
 
     def test_lbfgs_refinement(self):
         psi, exactSampler, hamiltonian, _ = _reference_problem()

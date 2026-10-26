@@ -43,8 +43,9 @@ class Observable(AbstractObjectiveFunction):
                 sampler.psi.lazy_gradients(sampler.samples), sampler.weights
             )
         else:
+            # A fresh array: SampledObs may normalize it in place
             grad_log_psi = SampledObs(
-                sampler.psi.gradients(sampler.samples), sampler.weights
+                sampler.psi.gradients(sampler.samples), sampler.weights, donate=True
             )
 
         if compute_grad:

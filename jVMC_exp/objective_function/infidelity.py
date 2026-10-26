@@ -178,7 +178,7 @@ class Infidelity(AbstractObjectiveFunction):
         if self._batched_jacobian:
             grad_log_psi = LazySampledObs(sampler.psi.lazy_gradients(sampler.samples), sampler.weights)
         else:
-            grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
+            grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights, donate=True)
 
         if compute_grad:
             f_loc = SampledObs(-2.0 * self._ref_f_loc * self._psi_f_loc, sampler.weights)

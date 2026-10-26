@@ -3,7 +3,8 @@ import jax
 import jax.numpy as jnp
 from functools import partial, cached_property
 
-from jVMC_exp.sharding_config import DEVICE_SHARDING, MESH, SizedIterable, pad_to_devices
+from jVMC_exp import global_defs
+from jVMC_exp.sharding_config import DEVICE_SHARDING, DEVICE_SPEC, MESH, REPLICATED_SPEC, SizedIterable, pad_to_devices
 
 @jax.jit
 def _get_mean(data, weights):
@@ -21,31 +22,96 @@ def _get_error_of_mean(var, weights):
 def _center(data, mean):
     return data - mean
 
-@jax.jit
-def _normalize(data, weights, mean):
+def _normalize_fn(data, weights, mean):
     return jnp.einsum("i, i... -> i...", jnp.sqrt(weights), data - mean)
 
-@jax.jit
-def _inv_normalize(data, inv_weights, mean, mask):
+def _inv_normalize_fn(data, inv_weights, mean, mask):
     raw = jnp.einsum("i, i... -> i...", jnp.sqrt(inv_weights), data) + mean
     return jnp.einsum("i, i... -> i...", mask, raw)
 
-@jax.jit
+_normalize = jax.jit(_normalize_fn)
+_inv_normalize = jax.jit(_inv_normalize_fn)
+# The same, overwriting ``data`` (donated): no second copy of the observations
+_normalize_in_place = jax.jit(_normalize_fn, donate_argnums=0)
+_inv_normalize_in_place = jax.jit(_inv_normalize_fn, donate_argnums=0)
+
 def _get_weighted_covar(data, weights, other_normalized):
     """
     Covariance of ``data`` with the normalized observations of another observable, without
     copies of ``data``: the weights and the complex conjugate are applied to the other
     observable, and a real ``data`` is never converted to complex.
+
+    The samples are sharded over the devices; each device sums over chunks of at most
+    ``global_defs.MATMUL_CHUNK_BYTES`` of its rows of ``data`` and the partial sums are
+    reduced with a ``psum``. A single product over all samples had XLA allocate a copy of
+    ``data`` (41 GiB for the Jacobian of 1.1M parameters on 16 GPUs).
+    """
+    n_samples = data.shape[0]
+    n_devices = MESH.size
+    if n_samples % n_devices:
+        return _weighted_covar_unsharded(data, weights, other_normalized)
+
+    n_local = n_samples // n_devices
+    row_bytes = max(1, data.size // max(1, n_samples)) * data.dtype.itemsize
+    budget = global_defs.MATMUL_CHUNK_BYTES or n_local * row_bytes
+    chunk = max(1, min(n_local, budget // row_bytes))
+
+    return _weighted_covar_chunked(data, weights, other_normalized, chunk=chunk)
+
+def _weighted_covar_operand(data, weights, other_normalized):
+    """
+    The operand ``w`` of the product ``data^T w`` that :func:`_weighted_covar_finish` turns
+    into the covariance, with ``v = sqrt(weights) * other_normalized``: ``conj(v)`` for a
+    complex ``data``, ``[Re v, Im v]`` for a real ``data`` and a complex ``v``, else ``v``.
     """
     v = jnp.einsum("i, i... -> i...", jnp.sqrt(weights), other_normalized)
     if jnp.iscomplexobj(data):
-        return jnp.conj(jnp.tensordot(data, jnp.conj(v), axes=(0, 0))).squeeze()
+        return jnp.conj(v)
     if jnp.iscomplexobj(v):
-        k = v.shape[-1]
-        covar = jnp.tensordot(data, jnp.concatenate([v.real, v.imag], axis=-1), axes=(0, 0))
-        return (covar[..., :k] + 1j * covar[..., k:]).squeeze()
+        return jnp.concatenate([v.real, v.imag], axis=-1)
 
-    return jnp.tensordot(data, v, axes=(0, 0)).squeeze()
+    return v
+
+def _weighted_covar_finish(product, data, weights, other_normalized):
+    """The covariance from ``data^T w``, see :func:`_weighted_covar_operand`."""
+    if jnp.iscomplexobj(data):
+        return jnp.conj(product).squeeze()
+    if jnp.issubdtype(jnp.result_type(weights, other_normalized), jnp.complexfloating):
+        k = other_normalized.shape[-1]
+        return (product[..., :k] + 1j * product[..., k:]).squeeze()
+
+    return product.squeeze()
+
+@jax.jit
+def _weighted_covar_unsharded(data, weights, other_normalized):
+    w = _weighted_covar_operand(data, weights, other_normalized)
+
+    return _weighted_covar_finish(jnp.tensordot(data, w, axes=(0, 0)), data, weights, other_normalized)
+
+@partial(jax.jit, static_argnames=("chunk",))
+def _weighted_covar_chunked(data, weights, other_normalized, *, chunk):
+    def local(data, weights, other):
+        w = _weighted_covar_operand(data, weights, other)
+        n_local = data.shape[0]
+
+        def add_chunk(k, acc, size=chunk):
+            rows, w_rows = (jax.lax.dynamic_slice_in_dim(x, k * chunk, size) for x in (data, w))
+            # Materialized: XLA would otherwise fuse the slices
+            # into the product and autotune it on whole operands
+            rows, w_rows = jax.lax.optimization_barrier((rows, w_rows))
+            return acc + jnp.tensordot(rows, w_rows, axes=(0, 0))
+
+        acc = jax.lax.fori_loop(1, n_local // chunk, add_chunk, add_chunk(0, 0))
+        if n_local % chunk:
+            acc = add_chunk(n_local // chunk, acc, n_local % chunk)
+
+        return jax.lax.psum(acc, "devices")
+
+    product = jax.shard_map(
+        local, mesh=MESH, in_specs=(DEVICE_SPEC,) * 3, out_specs=REPLICATED_SPEC
+    )(data, weights, other_normalized)
+
+    return _weighted_covar_finish(product, data, weights, other_normalized)
 
 @jax.jit
 def _mean_and_weighted_no_center(data, weights):
@@ -85,7 +151,7 @@ def _get_autocorrelation_time(x, c, dim):
     return tau[window]
 
 class SampledObs():
-    def __init__(self, observations, weights=None):
+    def __init__(self, observations, weights=None, donate=False):
         """
         Initializes SampledObs class.
 
@@ -93,6 +159,11 @@ class SampledObs():
             * ``observations``: Observations :math:`O_n` in the sample. This can be the value of an observable `O(s_n)`. \
                 The array must have a leading batch dimension.
             * ``weights``: Weights :math:`w_n` associated with observation :math:`O_n`.
+            * ``donate``: Whether ``observations`` may be overwritten. The observations are kept in a
+                single buffer that is converted between raw, centered and normalized on access; with
+                ``donate=True`` the first conversion overwrites the given array (it is deleted)
+                instead of making a second copy of it. For arrays nobody else holds, such as a
+                freshly computed Jacobian.
         """
         if len(observations.shape) == 1:
             self._num_obs = 1
@@ -123,6 +194,10 @@ class SampledObs():
         self._observations = jax.device_put(observations, DEVICE_SHARDING)
 
         self._state = "o"
+        # Whether the buffer may be held outside of this object, in which case it must not be
+        # overwritten: true for an array that was given (unless donated) and for one handed out
+        # by `observations`, `_centered_obs` or `_normalized_obs`; a conversion makes a new one
+        self._exported = not (donate or remainder != 0)
         self._mean = _get_mean(self._observations, self.weights)
 
     def __repr__(self):
@@ -134,37 +209,61 @@ class SampledObs():
         else:
             return f"SampledObs with {self._num_obs} features"
 
-    @property
-    def observations(self):
-        if self._state == "c":
-            self._observations = _normalize(self._observations, self._zero_mask, -self.mean)
-        elif self._state == "n":
-            self._observations = _inv_normalize(
-                self._observations, self._inv_weights, self.mean, self._zero_mask
-            )
-        self._state = "o"
+    def _convert(self, state):
+        """
+        The buffer converted to ``state`` (``"o"``: raw, ``"c"``: centered, ``"n"``: normalized),
+        overwriting it unless it may be held outside (`_exported`). Not handed out: the caller
+        passes it on to a computation and keeps no reference.
+        """
+        if state == self._state:
+            return self._observations
+
+        if state == "o":
+            if self._state == "c":
+                fn, args = _normalize_fn, (self._zero_mask, -self.mean)
+            else:
+                fn, args = _inv_normalize_fn, (self._inv_weights, self.mean, self._zero_mask)
+        elif state == "c":
+            if self._state == "o":
+                fn, args = _normalize_fn, (self._zero_mask, self.mean)
+            else:
+                fn, args = _normalize_fn, (self._inv_weights, 0)
+        else:
+            fn, args = _normalize_fn, (self.weights, self.mean if self._state == "o" else 0)
+
+        # In place only if the result has the same type as the buffer (otherwise it cannot be reused)
+        in_place = (
+            not self._exported
+            and jax.eval_shape(fn, self._observations, *args).dtype == self._observations.dtype
+        )
+        if fn is _normalize_fn:
+            convert = _normalize_in_place if in_place else _normalize
+        else:
+            convert = _inv_normalize_in_place if in_place else _inv_normalize
+
+        self._observations = convert(self._observations, *args)
+        self._state = state
+        self._exported = False
 
         return self._observations
+
+    def _export(self, state):
+        observations = self._convert(state)
+        self._exported = True
+
+        return observations
+
+    @property
+    def observations(self):
+        return self._export("o")
 
     @property
     def _centered_obs(self):
-        if self._state == "o":
-            self._observations = _normalize(self._observations, self._zero_mask, self.mean)
-        elif self._state == "n":
-            self._observations = _normalize(self._observations, self._inv_weights, 0)
-        self._state = "c"
-
-        return self._observations
+        return self._export("c")
     
     @property
     def _normalized_obs(self):
-        if self._state == "o":
-            self._observations = _normalize(self._observations, self.weights, self.mean)
-        elif self._state == "c":
-            self._observations = _normalize(self._observations, self.weights, 0)
-        self._state = "n"
-
-        return self._observations
+        return self._export("n")
     
     @property
     def weights(self):
@@ -187,7 +286,7 @@ class SampledObs():
     
     @property
     def var(self):
-        return _get_var(self._normalized_obs)
+        return _get_var(self._convert("n"))
     
     @property
     def error_of_mean(self):
@@ -201,9 +300,12 @@ class SampledObs():
             * ``other`` [optional]: Another instance of `SampledObs`.
         """
         if other is None:
-            return _get_self_covar(self._normalized_obs)
-        
-        return _get_weighted_covar(self.observations, self.weights, other._normalized_obs)
+            return _get_self_covar(self._convert("n"))
+
+        # `other` first: if it is this object, its conversion would otherwise overwrite `data`
+        other_normalized = other._normalized_obs
+
+        return _get_weighted_covar(self._convert("o"), self.weights, other_normalized)
 
     def get_covar_obs(self, other: SampledObs | None = None) -> SampledObs:
         """
@@ -271,10 +373,13 @@ class SampledObs():
             element_wise_fun: Function applied element-wise to each observation.
             linear_map: Optional linear transformation matrix applied after element_wise_fun.
         """
+        observations = self._convert("o")
         if linear_map is not None:
-            self._observations = _apply_and_project(self.observations, element_wise_fn, linear_map)
+            self._observations = _apply_and_project(observations, element_wise_fn, linear_map)
         else:
-            self._observations = jax.jit(element_wise_fn)(self.observations)
+            self._observations = jax.jit(element_wise_fn)(observations)
+        # A function that returns its input unchanged gives back the same buffer
+        self._exported = self._exported and self._observations is observations
         self._mean = _get_mean(self._observations, self.weights)
 
     def select(self, idx):

@@ -102,6 +102,7 @@ class AbstractOptimizer(ABC):
             )
 
         # Evaluate local observables and their gradient
+        self._release_previous_solve()
         self.output_manager.start_timing("compute objective function and gradient")
         objective_fn_out = objective_function.value_and_grad(
             self.sampler,
@@ -231,6 +232,13 @@ class AbstractOptimizer(ABC):
     def update_hyperparams(self, step):
         pass
 
+    def _release_previous_solve(self):
+        '''
+        Drop what is kept of the previous solve before the next Jacobian is computed,
+        so that the two never coexist in memory.
+        '''
+        pass
+
     @abstractmethod
     def get_update(self, objective_function_output: ObjectiveFunctionOutput):
         '''
@@ -351,7 +359,15 @@ class Evolution(AbstractOptimizer):
 
     @property
     def qgt(self):
+        '''
+        The quantum geometric tensor of the last solve (``store_qgt=True``): the dense matrix,
+        or the product with it for a matrix-free solver. It holds the Jacobian of that solve
+        and is released when the next solve starts.
+        '''
         return self._qgt
+
+    def _release_previous_solve(self):
+        self._qgt = None
 
     @property
     def solver(self):
