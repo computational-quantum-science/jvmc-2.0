@@ -42,11 +42,14 @@ print(f"Running benchmark with batch_size={batch_size}, mc_chains={mc_chains}")
 
 # Initialize net
 if net_name == "CpxCNN":
-    net = nets.CpxCNN(F=[20,], channels=[10, 8, 6, 4], bias=True, firstLayerBias=True) # same as in figure 3d of the old paper
+    net_params = {"F": [20,], "channels": [10, 8, 6, 4], "bias": True, "firstLayerBias": True}
+    net = nets.CpxCNN(F=net_params["F"], channels=net_params["channels"], bias=net_params["bias"], firstLayerBias=net_params["firstLayerBias"]) # same as in figure 3d of the old paper
 elif net_name == "RWKV":
-    net = nets.RWKVCPM(L=L, LHilDim=2, patch_size=1, embedding_size=16, num_heads=3, num_layers=3, hidden_size=8)
+    net_params = {"L": L, "LHilDim": 2, "patch_size": 1, "embedding_size": 16, "num_heads": 3, "num_layers": 3, "hidden_size": 8}
+    net = nets.RWKVCPM(L=net_params["L"], LHilDim=net_params["LHilDim"], patch_size=net_params["patch_size"], embedding_size=net_params["embedding_size"], num_heads=net_params["num_heads"], num_layers=net_params["num_layers"], hidden_size=net_params["hidden_size"])
 elif net_name == "RNN":
-    net = nets.RNN1DGeneral(L=L, hiddenSize=40, depth=2, cell="RNN")
+    net_params = {"L": L, "hiddenSize": 40, "depth": 2, "cell": "RNN"}
+    net = nets.RNN1DGeneral(L=net_params["L"], hiddenSize=net_params["hiddenSize"], depth=net_params["depth"], cell=net_params["cell"])
 else:
     raise ValueError(f"Unknown net {net_name}. Please define it")
 
@@ -118,6 +121,19 @@ for _ in range(3):
 
 tdvp.output_manager.flush_timings()
 tdvp.output_manager.flush_memory_info()
+
+metadata = {
+    "net_name": net_name,
+    "L": L,
+    "g": g,
+    "num_samples": num_samples,
+    "batch_size": batch_size,
+    "mc_chains": mc_chains,
+    "mode": mode,
+    "net_params": net_params,
+    "num_params": psi.numParameters,
+}
+tdvp.output_manager.write_metadata(**metadata)
 
 # Print memory info
 for i, device in enumerate(jax.devices()):

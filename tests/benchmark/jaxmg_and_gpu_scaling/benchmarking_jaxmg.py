@@ -20,10 +20,12 @@ parser.add_argument("-mc_chains", default=50, type=int)
 parser.add_argument("-net", default="CpxCNN", type=str)
 parser.add_argument("-nb_gpus", default=1, type=int)
 parser.add_argument("-jaxmg", default=0, type=int)
+parser.add_argument("-RNN_hiddenSize", default=100, type=int)
+parser.add_argument("-L", default=50, type=int)
 parser.add_argument("-info", default="", type=str)
 args = parser.parse_args()
 
-L = 100
+L = args.L
 g = -0.7
 num_samples = args.num_samples
 batch_size = args.batch_size
@@ -35,11 +37,14 @@ print(f"Running {net_name} benchmark with Ns={num_samples}, batch_size={batch_si
 
 # Initialize net
 if args.net == "CpxCNN":
-    net = nets.CpxCNN(F=[20,], channels=[10, 8, 6, 4], bias=True, firstLayerBias=True) # same as in figure 3d of the old paper
+    net_params = {"F": [20,], "channels": [10, 8, 6, 4], "bias": True, "firstLayerBias": True}
+    net = nets.CpxCNN(F=net_params["F"], channels=net_params["channels"], bias=net_params["bias"], firstLayerBias=net_params["firstLayerBias"]) # same as in figure 3d of the old paper
 elif net_name == "RWKV":
-    net = nets.RWKVCPM(L=L, LHilDim=2, patch_size=1, embedding_size=16, num_heads=3, num_layers=3, hidden_size=8)
+    net_params = {"L": L, "LHilDim": 2, "patch_size": 1, "embedding_size": 16, "num_heads": 3, "num_layers": 3, "hidden_size": 8}
+    net = nets.RWKVCPM(L=net_params["L"], LHilDim=net_params["LHilDim"], patch_size=net_params["patch_size"], embedding_size=net_params["embedding_size"], num_heads=net_params["num_heads"], num_layers=net_params["num_layers"], hidden_size=net_params["hidden_size"])
 elif net_name == "RNN":
-    net = nets.RNN1DGeneral(L=L, hiddenSize=100, depth=5, cell="RNN")
+    net_params = {"L": L, "hiddenSize": args.RNN_hiddenSize, "depth": 5, "cell": "RNN"}
+    net = nets.RNN1DGeneral(L=net_params["L"], hiddenSize=net_params["hiddenSize"], depth=net_params["depth"], cell=net_params["cell"])
 else:
     raise ValueError(f"Unknown net {args.net}. Please define it")
 
@@ -88,7 +93,7 @@ def print_timings(outp: OutputManager):
 
 # Set up solver
 if args.jaxmg:
-    solver = jVMC_exp.solver.PinvSNR(diagonalization_mode="distributed")
+    solver = jVMC_exp.solver.PinvSNR(diagonalization_mode="distributed", T_A=256)
 else:
     solver = jVMC_exp.solver.PinvSNR(diagonalization_mode="device")
 
@@ -115,6 +120,19 @@ for _ in range(3):
 
 tdvp.output_manager.flush_timings()
 tdvp.output_manager.flush_memory_info()
+
+metadata = {
+    "net_name": net_name,
+    "L": L,
+    "g": g,
+    "num_samples": num_samples,
+    "batch_size": batch_size,
+    "mc_chains": mc_chains,
+    "mode": "jaxmg" if args.jaxmg else "no_jaxmg",
+    "net_params": net_params,
+    "num_params": psi.numParameters,
+}
+tdvp.output_manager.write_metadata(**metadata)
 
 # Print memory info
 for i, device in enumerate(jax.devices()):

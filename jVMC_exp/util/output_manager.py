@@ -249,11 +249,10 @@ class OutputManager:
                     self._append_h5(group, "times", step)
                     self._append_nested_h5(group, metadata)
                 else:
-                    for key, value in metadata.items():
-                        arr = _as_h5_array(value)
+                    for key in metadata:
                         if key in group:
                             del group[key]
-                        group.create_dataset(str(key), data=arr)
+                    self._write_param_tree(group, metadata)
 
     def write_network_checkpoint(self, time: float, weights) -> None:
         if check_network_parameter_shape(weights):

@@ -4,7 +4,11 @@ import matplotlib.pyplot as plt
 MODE = "mc_chains"  # "batch_size" or "mc_chains"
 
 BATCH_SIZE_SCAN_FILE = "data/batch_size_scan_RWKV_Ns=32768_mc_chains=100_10097+memory.hdf5"
-MC_CHAIN_SCAN_FILE = "data/mc_chain_scan_batch_size=1000.hdf5"
+# MC_CHAIN_SCAN_FILE = "data/mc_chain_scan_batch_size=1000.hdf5"
+MC_CHAIN_SCAN_FILE = ["data/mc_chain_scan_CpxCNN_Ns=4096_batch_size=4096_gpu=1.hdf5",
+                      "data/mc_chain_scan_CpxCNN_Ns=4096_batch_size=4096_gpu=2.hdf5",
+                      "data/mc_chain_scan_CpxCNN_Ns=4096_batch_size=4096_gpu=4.hdf5",
+                      "data/mc_chain_scan_CpxCNN_Ns=4096_batch_size=4096_gpu=8.hdf5"]
 
 CATEGORIES = [
     ("compute objective function and gradient", "Compute Objective Function and Gradient"),
@@ -55,11 +59,12 @@ def main():
         print(f"Saved figure to {bc_output_path}")
 
     if MODE == "mc_chains":
-        x_mc, data_mc = load_scan(MC_CHAIN_SCAN_FILE)
-
         fig_mc, ax_mc = plt.subplots(figsize=(5, 4))
-        plot_speedup(ax_mc, x_mc, data_mc, [CATEGORIES[2]], "# MC-chains")
-        ax_mc.legend()
+        for mc_chain_file in MC_CHAIN_SCAN_FILE:
+            x_mc, data_mc = load_scan(mc_chain_file)
+            
+            plot_speedup(ax_mc, x_mc, data_mc, [CATEGORIES[2]], "# MC-chains")
+        ax_mc.legend(["1 GPU", "2 GPUs", "4 GPUs", "8 GPUs"])
         fig_mc.tight_layout()
         mc_output_path = "mc_chains.png"
         fig_mc.savefig(mc_output_path, dpi=200)
