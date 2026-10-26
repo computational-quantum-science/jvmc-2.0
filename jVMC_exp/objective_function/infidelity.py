@@ -2,10 +2,12 @@ import jax
 import jax.numpy as jnp
 import warnings
 
+from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler.base import AbstractSampler
-from jVMC_exp.operator.discrete.base import AbstractOperator
+from jVMC_exp.operator.discrete.branch_free import Operator
 from jVMC_exp.operator.discrete.branch_free import IdentityOperator
 from jVMC_exp.stats import SampledObs, LazySampledObs
+from jVMC_exp.sharding_config import sharded, MESH
 from .base import AbstractObjectiveFunction, ObjectiveFunctionOutput
 
 class MovingAverage:
@@ -38,8 +40,8 @@ class Infidelity(AbstractObjectiveFunction):
     def __init__(
         self,
         reference_sampler: AbstractSampler,
-        operator: AbstractOperator | None=None,
-        conjugated_operator: AbstractOperator | None=None,
+        operator: Operator | None=None,
+        conjugated_operator: Operator | None=None,
         control_variate: str | None = None,
         moving_average_width: int=1,
         l_dim: int=2,
@@ -133,8 +135,9 @@ class Infidelity(AbstractObjectiveFunction):
         if sample_ref_state:
             self.reference_sampler.sample()
 
-        o_loc = self.conjugated_operator.get_O_loc(
-            self.reference_sampler.samples, sampler.psi, logPsiS=self.reference_sampler.logPsi
+        o_loc = self._get_f_loc(
+            self.conjugated_operator, self.reference_sampler.samples,
+            self.reference_sampler.logPsi, sampler.psi
         )
 
         if self.control_variate is not None:
@@ -144,8 +147,9 @@ class Infidelity(AbstractObjectiveFunction):
         else:
             self._ref_f_loc = _weighted_mean(o_loc, self.reference_sampler.weights)
 
-        o_loc = self.operator.get_O_loc(
-            sampler.samples, self.reference_sampler.psi, logPsiS=sampler.logPsi
+        o_loc = self._get_f_loc(
+            self.operator, sampler.samples, 
+            sampler.logPsi, self.reference_sampler.psi
         )
 
         if self.control_variate is not None:
@@ -181,7 +185,7 @@ class Infidelity(AbstractObjectiveFunction):
             grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
 
         if compute_grad:
-            f_loc = SampledObs(-2.0 * self._ref_f_loc * self._psi_f_loc, sampler.weights)
+            f_loc = SampledObs(-self._ref_f_loc * self._psi_f_loc, sampler.weights)
             grad = grad_log_psi.get_covar(f_loc)
 
             return ObjectiveFunctionOutput(
@@ -189,7 +193,40 @@ class Infidelity(AbstractObjectiveFunction):
             )
         
         return ObjectiveFunctionOutput(o_loc=value, grad_log_psi=grad_log_psi)
-    
+
+    def _get_f_loc(self, operator: Operator, s, log_phi_s, psi: NQS):
+        r"""
+        Returns the local estimator :math:`\sum_{s'} O_{s,s'} \psi(s') / \phi(s)` of
+        :math:`\langle\phi|O|\psi\rangle / \langle\phi|\phi\rangle`, where ``s`` is sampled
+        from :math:`|\phi|^2` and ``log_phi_s`` is :math:`\log\phi(s)`.
+        """
+        evals_per_device = psi.batchSize // MESH.size
+        chunk_size = max(1, min(operator.n_conn + 1, evals_per_device))
+
+        return self._get_f_loc_sh(
+            s, log_phi_s,
+            parameters=psi.eval_parameters,
+            operator=operator,
+            psi=psi,
+            chunk_size=chunk_size,
+            batch_size=MESH.size * (evals_per_device // chunk_size)
+        )
+
+    @sharded(static_kwarg_names=("operator", "psi", "chunk_size"))
+    def _get_f_loc_sh(
+        self, s, log_phi_s, *, 
+        parameters, operator: Operator, psi: NQS, chunk_size, batch_size
+    ):
+        s_p, mat_els, mat_el_diag = operator._get_conn_elements(s, {})
+        s_p = jnp.concatenate([s[None], s_p], axis=0)
+        mat_els = jnp.concatenate([mat_el_diag[None], mat_els], axis=0)
+
+        log_psi_s_p = jax.lax.map(
+            lambda x: psi.apply_fun(parameters, x), s_p, batch_size=chunk_size
+        ).astype(psi.out_dtype)
+
+        return jnp.sum(mat_els * jnp.exp(log_psi_s_p - log_phi_s))
+
     def _reset_cached_observables(self):
         self._ref_f_loc = None
         self._ref_f_loc_cv = None
