@@ -6,9 +6,14 @@ from jVMC_exp.vqs import NQS
 from jVMC_exp.sampler.base import AbstractSampler
 from jVMC_exp.operator.discrete.branch_free import Operator
 from jVMC_exp.operator.discrete.branch_free import IdentityOperator
-from jVMC_exp.stats import SampledObs, LazySampledObs
+from jVMC_exp.stats import SampledObs
 from jVMC_exp.sharding_config import sharded, MESH
 from .base import AbstractObjectiveFunction, ObjectiveFunctionOutput
+
+@jax.jit
+def _moving_average_update(values, x):
+    values = jnp.roll(values, -1).at[-1].set(x)
+    return values, jnp.mean(values)
 
 class MovingAverage:
     """Simple moving average used for the adaptive control-variate coefficient."""
@@ -16,12 +21,9 @@ class MovingAverage:
     def __init__(self, width=10, init=0.0):
         self.values = jnp.full((width,), init)
 
-    @jax.jit(static_argnums=(0,))
     def update(self, x):
-        self.values = jnp.roll(self.values, -1)
-        self.values = self.values.at[-1].set(x)
-
-        return jnp.mean(self.values)
+        self.values, mean = _moving_average_update(self.values, x)
+        return mean
 
 def _weighted_mean(values, weights):
     """Return the weighted sample mean as a scalar when possible."""
@@ -37,16 +39,42 @@ def _get_control_variate(x):
     return x, jnp.abs(x)**2, None, None
 
 class Infidelity(AbstractObjectiveFunction):
+    r"""
+    Infidelity between the trial state :math:`|\psi_\theta\rangle` (primary sampler)
+    and a reference state :math:`|\chi\rangle` (``reference_sampler``),
+
+    .. math::
+        \mathcal I = 1 - \frac{\langle\psi_\theta|\hat O|\chi\rangle\langle\chi|\hat O^\dagger|\psi_\theta\rangle}
+                              {\langle\psi_\theta|\psi_\theta\rangle\langle\chi|\chi\rangle}.
+
+    The local loss is :math:`\ell(s) = 1 - R^\psi_{\rm loc}(s)\langle R^\chi_{\rm loc}\rangle_\chi` with
+    :math:`R^\psi_{\rm loc}(s) = (\hat O\chi)(s)/\psi_\theta(s)`, :math:`s\sim|\psi_\theta|^2`, and
+    :math:`R^\chi_{\rm loc}(s) = (\hat O^\dagger\psi_\theta)(s)/\chi(s)`, :math:`s\sim|\chi|^2`.
+    This is the local estimator of the theta-independent Hermitian operator
+    :math:`1 - \hat O|\chi\rangle\langle\chi|\hat O^\dagger/\langle\chi|\chi\rangle`, hence :math:`R_k=0` and
+
+    .. math::
+        F_k = -\,\mathrm{Cov}_p(\Gamma_k^*, R^\psi_{\rm loc})\,\langle R^\chi_{\rm loc}\rangle_\chi .
+
+    Control variates only modify the estimate of :math:`\mathcal I`, not the force.
+    """
     def __init__(
         self,
         reference_sampler: AbstractSampler,
-        operator: Operator | None=None,
-        conjugated_operator: Operator | None=None,
+        operator: Operator | None = None,
+        conjugated_operator: Operator | None = None,
         control_variate: str | None = None,
-        moving_average_width: int=1,
-        l_dim: int=2,
+        moving_average_width: int = 1,
+        l_dim: int = 2,
         batched_jacobian: bool = False
     ):
+        super().__init__(batched_jacobian)
+
+        if operator is None and conjugated_operator is not None:
+            raise ValueError(
+                "A ConjugatedOperator was provided without an Operator."
+            )
+
         self.control_variate = control_variate
         self.moving_average_width = moving_average_width
         self._reference_sampler = reference_sampler
@@ -68,12 +96,10 @@ class Infidelity(AbstractObjectiveFunction):
 
         self._reset_cached_observables()
 
-        self._batched_jacobian = batched_jacobian
-
     @property
     def reference_sampler(self):
         return self._reference_sampler
-    
+
     @property
     def operator(self):
         return self._operator
@@ -81,56 +107,53 @@ class Infidelity(AbstractObjectiveFunction):
     @property
     def conjugated_operator(self):
         return self._conjugated_operator
-    
+
     @property
     def control_variate(self):
         return self._control_variate
-    
+
     @control_variate.setter
     def control_variate(self, value: str | None):
-        if value is not None: 
+        if value is not None:
             value = value.lower()
             if value not in ['simple', 'adaptive']:
                 raise ValueError(f'Control variate can be either None, "Simple" or "Adaptive", got {value}')
-            
+
             self._control_variate_fn = _get_control_variate if value == 'simple' else _get_adapt_control_variate
-        
+
         self._control_variate = value
 
     @property
     def moving_average_width(self):
         return self._moving_average_width
-    
+
     @moving_average_width.setter
     def moving_average_width(self, value):
         self._moving_average = MovingAverage(value)
         self._moving_average_width = value
 
     def __call__(
-            self, sampler: AbstractSampler, 
-            sample_ref_state: bool=True, 
-            *, 
-            control_variate_coeff=None, 
+            self,
+            sampler: AbstractSampler,
+            sample_ref_state: bool = True,
+            *,
+            control_variate_coeff=None,
             **kwargs
         ) -> SampledObs:
         r"""
-        Compute the local infidelity estimator on ``samples``.
+        Compute the local infidelity estimator on the configurations held by ``sampler``.
 
         Args:
-            samples: Sampled computational-basis configurations.
-            psi: Trial variational state.
-            logPsiS: Optional logarithmic amplitudes :math:`\log \psi(s)`.
-                They are computed from ``psi`` when omitted.
-            psi_p: Born probabilities of ``samples``. Required when
-                ``adaptCV=True``.
-            sample_chi: Whether to resample the reference state before updating
-                the cached :math:`F^\chi` estimator.
-            **kwargs: Optional estimator parameters. Currently only ``CVc`` is
-                used to override the adaptive control-variate coefficient.
+            sampler: Sampler of the trial state :math:`|\psi_\theta\rangle`.
+            sample_ref_state: Whether to resample the reference state before
+                estimating :math:`\langle R^\chi_{\rm loc}\rangle_\chi`.
+            control_variate_coeff: Optional override of the adaptive
+                control-variate coefficient.
 
         Returns:
             The local infidelity estimator
-            :math:`1 - F^\psi_{\rm loc}(s) \langle F^\chi_{\rm loc} \rangle`.
+            :math:`1 - R^\psi_{\rm loc}(s)\langle R^\chi_{\rm loc}\rangle_\chi`,
+            minus the control-variate correction if enabled.
         """
         if sample_ref_state:
             self.reference_sampler.sample()
@@ -148,7 +171,7 @@ class Infidelity(AbstractObjectiveFunction):
             self._ref_f_loc = _weighted_mean(o_loc, self.reference_sampler.weights)
 
         o_loc = self._get_f_loc(
-            self.operator, sampler.samples, 
+            self.operator, sampler.samples,
             sampler.logPsi, self.reference_sampler.psi
         )
 
@@ -170,19 +193,17 @@ class Infidelity(AbstractObjectiveFunction):
         infidelity_loc = 1.0 - self._psi_f_loc * self._ref_f_loc
 
         return SampledObs(infidelity_loc - correction, sampler.weights)
-    
+
     def value_and_grad(
-            self, 
-            sampler: AbstractSampler, 
-            sample_ref_state: bool = True,
+            self,
+            sampler: AbstractSampler,
             compute_grad: bool = True,
+            *,
+            sample_ref_state: bool = True,
             **kwargs
         ) -> ObjectiveFunctionOutput:
         value = self(sampler, sample_ref_state=sample_ref_state, **kwargs)
-        if self._batched_jacobian:
-            grad_log_psi = LazySampledObs(sampler.psi.lazy_gradients(sampler.samples), sampler.weights)
-        else:
-            grad_log_psi = SampledObs(sampler.psi.gradients(sampler.samples), sampler.weights)
+        grad_log_psi = self._grad_log_psi(sampler)
 
         if compute_grad:
             f_loc = SampledObs(-self._ref_f_loc * self._psi_f_loc, sampler.weights)
@@ -191,7 +212,7 @@ class Infidelity(AbstractObjectiveFunction):
             return ObjectiveFunctionOutput(
                 o_loc=value, grad=grad, grad_log_psi=grad_log_psi
             )
-        
+
         return ObjectiveFunctionOutput(o_loc=value, grad_log_psi=grad_log_psi)
 
     def _get_f_loc(self, operator: Operator, s, log_phi_s, psi: NQS):
@@ -214,7 +235,7 @@ class Infidelity(AbstractObjectiveFunction):
 
     @sharded(static_kwarg_names=("operator", "psi", "chunk_size"))
     def _get_f_loc_sh(
-        self, s, log_phi_s, *, 
+        self, s, log_phi_s, *,
         parameters, operator: Operator, psi: NQS, chunk_size, batch_size
     ):
         s_p, mat_els, mat_el_diag = operator._get_conn_elements(s, {})
@@ -232,7 +253,7 @@ class Infidelity(AbstractObjectiveFunction):
         self._ref_f_loc_cv = None
         self._ref_f2_loc_cv = None
         self._ref_f_loc_f2_loc_cv = None
-        
+
         self._psi_f_loc = None
         self._psi_f_loc_cv = None
         self._psi_f2_loc_cv = None
@@ -241,11 +262,10 @@ class Infidelity(AbstractObjectiveFunction):
 
     def _get_control_variate_coeff(self, psi_p):
         r"""
-        Update the adaptive control-variate coefficient.
-
-        The coefficient is estimated from the covariance of the fidelity and its
-        squared magnitude according to the control-variate construction used in
-        infidelity minimization.
+        Update the adaptive control-variate coefficient
+        :math:`c = -|\mathrm{Re}\,\mathrm{Cov}(A, |A|^2)| / \mathrm{Var}(|A|^2)`, with
+        :math:`A = R^\psi_{\rm loc}(x) R^\chi_{\rm loc}(y)` for independent :math:`x, y`,
+        smoothed by a moving average.
         """
         ref_f_loc_f2_loc_cv = _weighted_mean(self._ref_f_loc_f2_loc_cv, self.reference_sampler.weights)
         psi_f_loc_f2_loc_cv = _weighted_mean(self._psi_f_loc_f2_loc_cv, psi_p)
@@ -256,5 +276,5 @@ class Infidelity(AbstractObjectiveFunction):
 
         covar_ff2 = ref_f_loc_f2_loc_cv * psi_f_loc_f2_loc_cv - self._ref_f_loc_cv * self._ref_f_loc * psi_f_loc_cv * psi_f_loc
         self._var_f2 = ref_f2_loc_cv * psi_f2_loc_cv - (self._ref_f_loc_cv * psi_f_loc_cv) ** 2
-        
+
         return self._moving_average.update(-jnp.abs(jnp.real(covar_ff2) / jnp.real(self._var_f2)))

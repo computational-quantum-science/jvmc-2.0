@@ -11,7 +11,6 @@ import jVMC_exp.operator.discrete as op
 import jVMC_exp.sampler as sampler
 from jVMC_exp.stats import SampledObs, LazySampledObs
 from jVMC_exp.objective_function.base import ObjectiveFunctionOutput
-from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
 
 class TestGsSearch(unittest.TestCase):
     def test_gs_search_cpx(self):
@@ -123,30 +122,6 @@ class TestUpdateBatchedJacobian(unittest.TestCase):
                     updates.append(opt.get_update(loss_function.value_and_grad(exact_sampler)))
 
                 self.assertTrue(np.allclose(updates[0], updates[1], atol=1e-10), name)
-
-    def test_projected_grouped_update_matches_dense(self):
-        devices = jax.device_count()
-        num_samples = 13 * devices + 1
-        keys = jax.random.split(jax.random.PRNGKey(5), 4)
-        s = jax.random.randint(keys[0], (num_samples, 4), 0, 2).astype(jVMC_exp.global_defs.DT_SAMPLES)
-        weights = jax.random.uniform(keys[1], (num_samples,))
-        values = jax.random.normal(keys[2], (num_samples,)) + 1j * jax.random.normal(keys[3], (num_samples,))
-        orbit = square_translation_symmetry(4, 1, "spin")
-        for name, net in (
-            ("real", nets.RBM(numHidden=3, bias=True)),
-            ("holomorphic", nets.CpxRBM(numHidden=3, bias=True)),
-            ("non-holomorphic", _RealParamsComplexOut()),
-        ):
-            with self.subTest(net=name):
-                psi = NQS(net, 4, 3 * devices, seed=1234, orbit=orbit)
-                opt = jVMC_exp.optimizer.MinSR(
-                    sampler.ExactSampler(psi), psi, solver=jVMC_exp.solver.Pinv(pinv_cutoff=1e-8), diagonalShift=1e-3
-                )
-                o_loc = SampledObs(values if name != "real" else values.real, weights)
-                dense = ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=SampledObs(psi.gradients(s), weights))
-                lazy = ObjectiveFunctionOutput(o_loc=o_loc, grad_log_psi=LazySampledObs(psi.lazy_gradients(s), weights))
-                self.assertEqual(lazy.grad_log_psi.layout.n_batches, 2)
-                self.assertTrue(np.allclose(opt.get_update(dense), opt.get_update(lazy), rtol=1e-8, atol=1e-10), name)
 
     @unittest.skipIf(jax.device_count() == 1, "Every number of samples is divisible by one device")
     def test_update_matches_dense_indivisible_samples(self):

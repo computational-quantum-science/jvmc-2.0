@@ -1,4 +1,6 @@
 import unittest
+from functools import reduce
+from itertools import product
 import jax.random as random
 import jax.numpy as jnp
 import flax.linen as nn
@@ -67,6 +69,14 @@ def _spinful_state_from_config(config):
         state |= (int(local_state) & 1) << _spinful_orbital(site, "up", L_chain)
         state |= ((int(local_state) >> 1) & 1) << _spinful_orbital(site, "down", L_chain)
     return state
+
+def _site_matrix(L_chain, site, A, right=None):
+    """
+    ``A`` on ``site`` of a chain of two-level sites, site 0 being the leftmost factor of the
+    Kronecker product, and ``right`` on all sites to its right (identities if None).
+    """
+    right = np.eye(2) if right is None else right
+    return reduce(np.kron, [np.eye(2)] * site + [A] + [right] * (L_chain - site - 1))
 
 def _dense_matrix_from_operator(operator, configs, state_from_config):
     configs = np.asarray(configs, dtype=np.int32)
@@ -289,6 +299,76 @@ class TestOperator(unittest.TestCase):
             O_loc = H.get_O_loc(s, psi)
             O_loc_ref = make_H().get_O_loc(s, psi)
             self.assertTrue(np.allclose(O_loc, O_loc_ref))
+
+    def test_callable_prefactors(self):
+        t = 0.3
+        f = lambda t, **kwargs: jnp.cos(t)
+        g = lambda t, **kwargs: 1 + t ** 2
+        cos_t = float(np.cos(t))
+        s = jnp.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=global_defs.DT_SAMPLES)
+
+        # f multiplies several strings, twice in one of them
+        h = (
+            f * op.SigmaX(0) + g * (f * op.SigmaZ(0) * op.SigmaZ(1))
+            + f * (f * op.SigmaY(1)) + 0.5 * op.SigmaZ(1)
+        )
+        h_ref = (
+            cos_t * op.SigmaX(0) + (1 + t ** 2) * cos_t * op.SigmaZ(0) * op.SigmaZ(1)
+            + cos_t ** 2 * op.SigmaY(1) + 0.5 * op.SigmaZ(1)
+        )
+
+        sp, matEls = h.get_conn_elements(s, distribute(s.shape[0]), t=t)
+        sp_ref, matEls_ref = h_ref.get_conn_elements(s, distribute(s.shape[0]))
+        self.assertTrue(np.array_equal(sp, sp_ref))
+        self.assertTrue(np.allclose(matEls, matEls_ref))
+
+    def test_repeated_sites_dense_matrix(self):
+        L_chain = 3
+        X = np.array([[0, 1], [1, 0]])
+        Y = np.array([[0, -1j], [1j, 0]])
+        Z = np.diag([1, -1])
+        P = np.array([[0, 0], [1, 0]])
+        on = lambda site, A: _site_matrix(L_chain, site, A)
+
+        # Strings acting more than once on the same site
+        h = (
+            op.SigmaX(0) * op.SigmaX(0)
+            + 0.5 * op.SigmaPlus(1) * op.SigmaX(1) * op.SigmaMinus(1)
+            + op.SigmaX(2) * op.SigmaZ(2) * op.SigmaX(0) * op.SigmaY(2)
+            + 0.3 * op.SigmaZ(1) * op.SigmaZ(1)
+        )
+        H_ref = (
+            on(0, X) @ on(0, X)
+            + 0.5 * on(1, P) @ on(1, X) @ on(1, P.T)
+            + on(2, X) @ on(2, Z) @ on(0, X) @ on(2, Y)
+            + 0.3 * on(1, Z) @ on(1, Z)
+        )
+
+        basis = jnp.asarray(list(product((0, 1), repeat=L_chain)), dtype=global_defs.DT_SAMPLES)
+        self.assertTrue(np.allclose(h.to_dense(basis), H_ref))
+
+    def test_spinless_fermionic_strings_dense_matrix(self):
+        L_chain = 4
+        # Jordan-Wigner: the sign counts the occupied sites to the right
+        c = lambda site: _site_matrix(L_chain, site, np.array([[0, 1], [0, 0]]), np.diag([1, -1]))
+        cd = lambda site: c(site).T
+
+        # Strings acting more than once on the same site, between and around other sites
+        h = (
+            op.Creation(0) * op.Annihilation(2) * op.Creation(2) * op.Annihilation(1)
+            + 0.5 * op.Creation(1) * op.Annihilation(1) * op.Creation(3) * op.Annihilation(0)
+            + 0.7 * op.Annihilation(3) * op.Creation(0) * op.Annihilation(0) * op.Creation(2)
+            + 1.3 * op.Creation(2) * op.Number(1) * op.Annihilation(3)
+        )
+        H_ref = (
+            cd(0) @ c(2) @ cd(2) @ c(1)
+            + 0.5 * cd(1) @ c(1) @ cd(3) @ c(0)
+            + 0.7 * c(3) @ cd(0) @ c(0) @ cd(2)
+            + 1.3 * cd(2) @ cd(1) @ c(1) @ c(3)
+        )
+
+        basis = jnp.asarray(list(product((0, 1), repeat=L_chain)), dtype=global_defs.DT_SAMPLES)
+        self.assertTrue(np.allclose(h.to_dense(basis), H_ref))
 
 if __name__ == "__main__":
     unittest.main()

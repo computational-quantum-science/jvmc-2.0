@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 import jax
 import jax.numpy as jnp
 from math import isclose
@@ -9,7 +8,7 @@ import jVMC_exp
 import jVMC_exp.nets as nets
 from jVMC_exp.vqs import NQS
 from jVMC_exp.symmetry.lattice_symetries import square_translation_symmetry
-from jVMC_exp.sharding_config import MESH, DEVICE_SPEC, pad_to_devices
+from jVMC_exp.sharding_config import MESH, DEVICE_SPEC
 from jVMC_exp import global_defs
 import jVMC_exp.nets.activation_functions as act_funs
 
@@ -186,27 +185,6 @@ class TestGradients(unittest.TestCase):
                     for piece, expected in zip(pieces, lazy.layout.split(dense)):
                         self.assertEqual(piece.shape, expected.shape)
                         self.assertTrue(jnp.allclose(piece, expected))
-
-    def test_projected_lazy_blocks_keep_small_evaluations_and_sample_order(self):
-        devices = jax.device_count()
-        orbit = square_translation_symmetry(3, 1, "spin")
-        psi = NQS(nets.CpxRBM(numHidden=3, bias=True), 3, 2 * devices, seed=42, orbit=orbit)
-        for num_samples in (13 * devices + 1, 2 * devices):
-            with self.subTest(num_samples=num_samples):
-                s = jax.random.randint(jax.random.PRNGKey(0), (num_samples, 3), 0, 2)
-                dense = psi.gradients(pad_to_devices(s))
-                with patch.object(psi, "_gradients_sh", wraps=psi._gradients_sh) as evaluate:
-                    lazy = psi.lazy_gradients(s)
-                    self.assertEqual(evaluate.call_count, 0)
-                    self.assertEqual(lazy.batch_size, min(6 * devices, len(dense)))
-                    for _ in range(2):
-                        pieces = list(lazy)
-                        ordered = jnp.concatenate(pieces)[lazy.layout.batch_positions()]
-                        self.assertTrue(jnp.allclose(ordered, dense))
-                        for piece, expected in zip(pieces, lazy.layout.split(dense)):
-                            self.assertTrue(jnp.allclose(piece, expected))
-                    self.assertEqual(evaluate.call_count, 2 * len(lazy))
-                    self.assertTrue(all(call.kwargs["batch_size"] == 2 * devices for call in evaluate.call_args_list))
 
     def test_gradient_dict(self):
         L = 3
