@@ -549,3 +549,43 @@ chunk not dividing the rows, all mesh shapes, padded columns),
 `test_redistribution_needs_no_copy_of_the_jacobian` (compiled temporaries), and
 `test_previous_qgt_released_before_the_next_gradient` (AdaptiveHeun with the S-norm and the
 TDVP error).
+
+### 6.1 Correction: the redistribution on GPU (2026-10-27)
+
+`limits_scan_16gpu_ritz_shard` (commit 5019475, 16 GPUs) showed that the chunked
+redistribution of 6 still needed three Jacobian shards on GPU: every out-of-memory
+allocation was exactly one shard plus two chunks (nc 160: 30.784 GB + 2 x 87 rows x
+12.31 MB = 32,926,566,912 B; the nc128_k16000 run: 19.712 GB + 2 x 136 rows x 7.88 MB),
+and the peaks of the points that passed were 3 J + 2 chunks (nc 128, r = 16000: 57.1 GiB
+= 3 x 18.36 + 2). XLA:GPU kept the loop buffer (zeros of its own, reshaped at the end)
+next to the output; XLA:CPU aliases them, so the CPU tests did not see it. In the
+nc128_k16000 run the error was reported by `jit__cholesky`, the first synchronization
+of the solve, not by the executable that failed.
+
+Now the output is allocated first (`_column_sharded_zeros`, already in the 2D-mesh
+sharding) and donated to the exchange (`_column_sharded_jacobian_impl(jac, out)`,
+`donate_argnums=1`), which writes the rows received from every group member with one
+`dynamic_update_slice` each into the 2D output (no reshape) and returns it. Compiled
+on CPU the output is aliased to the donated buffer and the temporaries are two chunks.
+Tests: `test_redistribution_needs_no_copy_of_the_jacobian` (alias = output size,
+temporaries bounded by chunks) and `test_redistribution_uses_the_donated_output` (no
+"donated buffers were not usable" warning at run time).
+
+GPU check without allocating anything: `tests/benchmark/jacobian_memory_check.py`
+compiles the redistribution (now and as in 5019475), the force, the in-place
+normalization and, with `--rank`, an operator application and the r x r Cholesky of
+CholeskyQR for abstract inputs and prints XLA's memory analysis per device, e.g. on one
+4-GPU node for the shard sizes of 16 GPUs:
+`python tests/benchmark/jacobian_memory_check.py --channels 128 160 192 --rank 16000 --devices 16`.
+
+Other findings of that scan and run:
+
+* every r = 8000 point stopped on jaxmg's tile check: since 5.5 `syevd` runs on a 16 x 1
+  process grid, and T_A = 1000 gives 8 tiles for r = 8000; T_A has to be at most
+  r / (number of GPUs) (500 here);
+* r = 32000 at nc >= 112 runs out of memory in the replicated r x r Cholesky of
+  CholeskyQR (`qr_mode="distributed"` avoids it);
+* the nc128_k16000 run had `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` commented out (JAX's
+  default 0.75, about 70 instead of 89 GiB per GPU), its initial ground-state search
+  (r = 2000) cannot use the distributed eigensolver on 16 GPUs (2000 / 16 = 125 rows per
+  GPU, below jaxmg's minimum tile), and `init.params_file` still names the nc 56 state.

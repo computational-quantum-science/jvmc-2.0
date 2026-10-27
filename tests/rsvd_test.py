@@ -631,9 +631,9 @@ class TestShardedQGTOperator(unittest.TestCase):
 
     def test_redistribution_needs_no_copy_of_the_jacobian(self):
         """
-        Compiled temporaries of the redistribution in chunks: a few chunks, where a single
-        all-to-all of the whole shard needs more than a shard (the out-of-memory error of the
-        limits scans).
+        Compiled memory of the redistribution in chunks: the output is the donated,
+        preallocated buffer (aliased, so no loop buffer next to it, which on GPU made it
+        three Jacobians), and the temporaries are a few chunks.
         """
         from jVMC_exp.solver import qgt_operator
         jac = _random_jacobian(jax.random.PRNGKey(2), 64 * MESH.size, 16 * MESH.size)
@@ -641,12 +641,34 @@ class TestShardedQGTOperator(unittest.TestCase):
         for shape in _mesh_shapes():
             layout = ParameterLayout(parameter_mesh(shape), jac.shape[1])
             row_bytes = layout.padded * jac.dtype.itemsize
+            out = jax.ShapeDtypeStruct(
+                (jac.shape[0], layout.padded), jac.dtype, sharding=layout.sharding(P(SAMPLES_AXIS, PARAMS_AXIS))
+            )
             with self.subTest(mesh_shape=shape):
                 memory = qgt_operator._column_sharded_jacobian_impl.lower(
-                    jac, layout=layout, chunk=4
+                    jac, out, layout=layout, chunk=4
                 ).compile().memory_analysis()
+                self.assertEqual(memory.alias_size_in_bytes, memory.output_size_in_bytes)
                 self.assertLessEqual(memory.temp_size_in_bytes, 4 * 4 * row_bytes)
                 self.assertLess(memory.temp_size_in_bytes, shard_bytes / 4)
+
+    def test_redistribution_uses_the_donated_output(self):
+        """At run time the preallocated output is consumed: JAX warns about donated buffers it cannot use."""
+        from jVMC_exp.solver import qgt_operator
+        jac = _random_jacobian(jax.random.PRNGKey(3), 8 * MESH.size, self.n)
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=1)
+            for shape in _mesh_shapes():
+                layout = ParameterLayout(parameter_mesh(shape), self.n)
+                with self.subTest(mesh_shape=shape), warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    out = qgt_operator._column_sharded_jacobian(jac, layout=layout)
+                    out.block_until_ready()
+                self.assertFalse([w for w in caught if "donated" in str(w.message)])
+                self.assertFalse(jac.is_deleted())
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
 
     def test_products_match_dense(self):
         """

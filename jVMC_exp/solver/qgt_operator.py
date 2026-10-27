@@ -502,23 +502,35 @@ def _column_sharded_jacobian(jac, *, layout: ParameterLayout):
     concatenates the row blocks it receives.
 
     The exchange is done for chunks of the local rows of at most
-    ``global_defs.MATMUL_CHUNK_BYTES``, each written into the preallocated output. A
-    single ``all_to_all`` of the whole shard needs a rearranged copy of its input next
-    to the input and the output (three Jacobians per device, the out-of-memory error of
-    the limits scans at 31 GB per Jacobian); in chunks the redistribution needs the
-    input and the output plus a few chunks.
+    ``global_defs.MATMUL_CHUNK_BYTES``, each written into the output in place: the
+    output is allocated first (:func:`_column_sharded_zeros`) and donated to the
+    exchange, which returns it. A single ``all_to_all`` of the whole shard needs a
+    rearranged copy of its input next to the input and the output, and on GPU a loop
+    that starts from zeros of its own kept the loop buffer next to the output: three
+    Jacobians per device either way (the out-of-memory errors of the limits scans).
+    With the donated output the redistribution needs the input and the output plus a
+    few chunks.
     """
-    return _column_sharded_jacobian_impl(jac, layout=layout, chunk=_redistribution_chunk(jac, layout))
+    out = _column_sharded_zeros(jac.shape[0], jac.dtype, layout=layout)
+
+    return _column_sharded_jacobian_impl(jac, out, layout=layout, chunk=_redistribution_chunk(jac, layout))
 
 
-@partial(jax.jit, static_argnames=("layout", "chunk"))
-def _column_sharded_jacobian_impl(jac, *, layout: ParameterLayout, chunk: int):
+@partial(jax.jit, static_argnums=(0, 1), static_argnames=("layout",))
+def _column_sharded_zeros(num_samples, dtype, *, layout: ParameterLayout):
+    """Zeros of the shape and 2D-mesh sharding of the column-sharded Jacobian."""
+    return jax.lax.with_sharding_constraint(
+        jnp.zeros((num_samples, layout.padded), dtype), layout.sharding(JACOBIAN_SPEC)
+    )
+
+
+@partial(jax.jit, static_argnames=("layout", "chunk"), donate_argnums=1)
+def _column_sharded_jacobian_impl(jac, out, *, layout: ParameterLayout, chunk: int):
+    """The exchange of :func:`_column_sharded_jacobian`, written into ``out`` (donated)."""
     groups = layout.groups
 
-    def local(j):
+    def local(j, out):
         n_rows = j.shape[0]
-        # Rows received from group member q go to rows q * n_rows + (rows of the chunk)
-        out = _varying_zeros((groups, n_rows, layout.local), j.dtype, like=j, axes=_MESH_AXES)
 
         def exchange(k, out):
             # The last chunk is shifted back to end at the last row (and repeats a few
@@ -528,17 +540,19 @@ def _column_sharded_jacobian_impl(jac, *, layout: ParameterLayout, chunk: int):
             if layout.pad:
                 rows = jnp.pad(rows, ((0, 0), (0, layout.pad)))
             received = jax.lax.all_to_all(rows, PARAMS_AXIS, 1, 0, tiled=True)
-            return jax.lax.dynamic_update_slice_in_dim(
-                out, received.reshape(groups, chunk, layout.local), start, axis=1
-            )
+            # Rows received from group member q go to rows q * n_rows + start, ...: one
+            # update per member, so that the output is never reshaped (a copy on GPU)
+            for q in range(groups):
+                out = jax.lax.dynamic_update_slice_in_dim(
+                    out, jax.lax.slice_in_dim(received, q * chunk, (q + 1) * chunk), q * n_rows + start, axis=0
+                )
+            return out
 
-        out = jax.lax.fori_loop(0, -(-n_rows // chunk), exchange, out)
-
-        return out.reshape(groups * n_rows, layout.local)
+        return jax.lax.fori_loop(0, -(-n_rows // chunk), exchange, out)
 
     return jax.shard_map(
-        local, mesh=layout.mesh, in_specs=(P(_MESH_AXES),), out_specs=JACOBIAN_SPEC
-    )(jac)
+        local, mesh=layout.mesh, in_specs=(P(_MESH_AXES), JACOBIAN_SPEC), out_specs=JACOBIAN_SPEC
+    )(jac, out)
 
 
 def _column_block_product(jac, q, part: Part):
