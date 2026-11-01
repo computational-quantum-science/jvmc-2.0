@@ -589,3 +589,39 @@ Other findings of that scan and run:
   default 0.75, about 70 instead of 89 GiB per GPU), its initial ground-state search
   (r = 2000) cannot use the distributed eigensolver on 16 GPUs (2000 / 16 = 125 rows per
   GPU, below jaxmg's minimum tile), and `init.params_file` still names the nc 56 state.
+
+### 6.2 CholeskyQR at r = 32000 (2026-10-31)
+
+`nc128_k32000_better_gs` (492800 parameters, r = 32000, 16 GPUs) died in the first QR of
+the first solve: the failing allocation, 23,961,600,000 B, is exactly two `(n / P) x r`
+blocks plus one `r x r` matrix (30800 x 32000 and 32000 x 32000 float64), as was the
+nc112 / r = 32000 point of `limits_scan_16gpu_ritz_shard` (2 blocks + r^2 again). That is
+the triangular solve `Q = Y L^{-H}` (`_solve_rows`): even with `Y` donated, XLA copies
+the whole block for a single solve (on CPU one block, on GPU apparently two plus a copy
+of `L`). At that point a device holds the two Jacobian copies (36.7 GiB), `Y` (7.3 GiB)
+and `L` (7.6 GiB), about 74 GiB with the solve, which fragmentation pushed over the
+~89 GiB limit. The error was again reported by `jit__cholesky`, the first
+synchronization (`bool(finite)` of the next pass).
+
+* **`_solve_rows` in row chunks**: the rows of a solve from the right are independent;
+  they are solved in chunks of at most `MATMUL_CHUNK_BYTES` written back into the donated
+  `Y` (`_solve_rows_impl`). The chunks must not overlap (a row solved twice is wrong), and
+  keeping the solved rows of an overlapping last chunk with a mask made XLA copy the block
+  again, so the rows that do not fill a chunk are solved after the loop. Compiled on CPU:
+  output aliased to `Y`, temporaries a copy of `L` plus chunks (before: one block).
+* **`_cholesky` donates the Gram matrix**: the shift and the factorization overwrite it
+  (output aliased). A failed plain pass forms the Gram matrix again for the shifted one.
+  On CPU XLA's own Cholesky still needs two `r x r` temporaries; on GPU it is cuSOLVER's
+  `potrf`, which the check script measures.
+* `tests/benchmark/jacobian_memory_check.py --rank r` now also compiles the Gram matrix,
+  the donated Cholesky and both solves (row chunks, and the whole block as in df51c63).
+
+Tests: `TestCholeskyQR.test_qr_with_chunked_solves`, `test_solve_rows_in_chunks`,
+`test_solve_rows_needs_no_copy_of_the_block`, `test_cholesky_overwrites_the_gram_matrix`.
+
+Expected at nc 128, r = 32000 on 16 GPUs: about 15 GiB less at the solve and one `r x r`
+matrix (7.6 GiB) less at the Cholesky factorization, i.e. a QR stage of roughly
+60 GiB. Still replicated per GPU: the Gram matrix and `L` (`qr_mode="distributed"` avoids
+them), and the sample-sharded Jacobian stays alive during the solve (18.4 GiB, the next
+saving). The distributed eigensolve at r = 32000 needs cuSOLVERMp workspace outside the
+JAX pool: `XLA_PYTHON_CLIENT_MEM_FRACTION` of about 0.85 for that run.

@@ -473,12 +473,13 @@ def _inner_rows(X, Y, *, layout: ParameterLayout):
     )(X, Y)
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=0)
 def _cholesky(G, rel_shift):
     """
     Lower Cholesky factor ``L`` of ``G + s I`` with ``s = rel_shift * ||G||_F`` (an
     upper bound of ``rel_shift * ||G||_2``), and whether it is finite (a failed
-    factorization is NaN).
+    factorization is NaN). ``G`` is donated: the shift and the factorization overwrite
+    it instead of a copy (an ``r x r`` matrix, 7.6 GiB at r = 32000).
     """
     shift = rel_shift * jnp.linalg.norm(G)
     idx = jnp.arange(G.shape[0])
@@ -487,13 +488,47 @@ def _cholesky(G, rel_shift):
     return L, jnp.all(jnp.isfinite(L))
 
 
-@partial(jax.jit, static_argnames=("layout",), donate_argnums=0)
 def _solve_rows(Y, L, *, layout: ParameterLayout):
-    """``Y L^{-H}``, i.e. ``Q`` of ``Y = Q R`` with ``R = L^H``, row by row; ``Y`` is donated."""
+    """
+    ``Y L^{-H}``, i.e. ``Q`` of ``Y = Q R`` with ``R = L^H``; ``Y`` is donated.
+
+    The rows of a solve from the right are independent: they are solved in chunks of at
+    most ``global_defs.MATMUL_CHUNK_BYTES`` written back into ``Y``. A single solve of
+    the whole local block had XLA allocate two copies of it next to it on GPU (with a
+    copy of ``L``: 22.3 GiB at 492800 parameters and r = 32000 on 16 GPUs, the
+    out-of-memory error of that run).
+    """
+    n_rows, r = layout.local, Y.shape[1]
+    budget = global_defs.MATMUL_CHUNK_BYTES or n_rows * r * Y.dtype.itemsize
+    chunk = max(1, min(n_rows, budget // (r * Y.dtype.itemsize)))
+
+    return _solve_rows_impl(Y, L, layout=layout, chunk=chunk)
+
+
+@partial(jax.jit, static_argnames=("layout", "chunk"), donate_argnums=0)
+def _solve_rows_impl(Y, L, *, layout: ParameterLayout, chunk: int):
+    def local(y, l):
+        n_rows = y.shape[0]
+
+        # Chunks must not overlap (a row solved twice is wrong), and keeping the solved
+        # rows of an overlapping chunk with a mask made XLA copy the whole block: the
+        # rows that do not fill a chunk are solved after the loop
+        def solve(k, y, size=chunk):
+            rows = jax.lax.dynamic_slice_in_dim(y, k * chunk, size)
+            solved = jax.lax.linalg.triangular_solve(
+                l, rows, left_side=False, lower=True, transpose_a=True, conjugate_a=True
+            )
+            return jax.lax.dynamic_update_slice_in_dim(y, solved, k * chunk, axis=0)
+
+        n_full = n_rows // chunk
+        y = jax.lax.fori_loop(0, n_full, solve, y)
+        if n_rows % chunk:
+            y = solve(n_full, y, n_rows % chunk)
+
+        return y
+
     return jax.shard_map(
-        lambda y, l: jax.lax.linalg.triangular_solve(
-            l, y, left_side=False, lower=True, transpose_a=True, conjugate_a=True
-        ),
+        local,
         mesh=layout.mesh,
         in_specs=(ROWS_SPEC, REPLICATED_SPEC),
         out_specs=ROWS_SPEC,
@@ -539,13 +574,13 @@ def _cholesky_qr(Y, layout: ParameterLayout, name="QR"):
     Q = _solve_rows(Y, L, layout=layout)
     n_passes, n_plain = 1, 0
     while n_plain < 2 and n_passes < _MAX_QR_PASSES:
-        G = _inner_rows(Q, Q, layout=layout)
-        L, finite = _cholesky(G, 0.0)
+        L, finite = _cholesky(_inner_rows(Q, Q, layout=layout), 0.0)
         if bool(finite):
             n_plain += 1
         else:
-            L, _ = _cholesky(G, rel_shift)
-        del G
+            # The Gram matrix was overwritten by the failed factorization: formed again
+            del L
+            L, _ = _cholesky(_inner_rows(Q, Q, layout=layout), rel_shift)
         Q = _solve_rows(Q, L, layout=layout)
         n_passes += 1
     if n_plain < 2 and jax.process_index() == 0:

@@ -815,6 +815,78 @@ class TestCholeskyQR(unittest.TestCase):
             warnings.simplefilter("error")
             self._check(Y, layout, tol=1e-12)
 
+    def test_qr_with_chunked_solves(self):
+        """The triangular solves in chunks of rows (one row, and chunks leaving a remainder)."""
+        n, r = 4 * MESH.size + 37, 12
+        U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(6), (n, r)))
+        Y = (U * jnp.logspace(0, -8, r)) @ jax.random.normal(jax.random.PRNGKey(7), (r, r))
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            for budget in (1, 5 * r * 8):
+                jVMC_exp.global_defs.update(matmul_chunk_bytes=budget)
+                for shape in _mesh_shapes():
+                    with self.subTest(budget=budget, mesh_shape=shape):
+                        self._check(Y, ParameterLayout(parameter_mesh(shape), n), tol=1e-12)
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_solve_rows_in_chunks(self):
+        """Y L^{-H} in place (Y donated), real and complex, whole block, one row and a remainder per chunk."""
+        from jVMC_exp.solver import rsvd
+        n, r = 4 * MESH.size + 37, 10
+        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(8), 4)
+        Y = jax.random.normal(k1, (n, r)) + 1j * jax.random.normal(k2, (n, r))
+        A = jax.random.normal(k3, (r, r)) + 1j * jax.random.normal(k4, (r, r))
+        L = jnp.linalg.cholesky(A @ jnp.conj(A).T + r * jnp.eye(r))
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            for budget in (0, 1, 3 * r * 16):
+                jVMC_exp.global_defs.update(matmul_chunk_bytes=budget)
+                for shape in _mesh_shapes():
+                    layout = ParameterLayout(parameter_mesh(shape), n)
+                    for Y_, L_ in ((Y.real, L.real), (Y, L)):
+                        with self.subTest(budget=budget, mesh_shape=shape, dtype=str(Y_.dtype)):
+                            rows = self._rows(Y_, layout)
+                            Q = rsvd._solve_rows(rows, L_, layout=layout)
+                            self.assertTrue(rows.is_deleted())
+                            _assert_sharded(self, Q, layout.sharding())
+                            expected = np.asarray(Y_) @ np.linalg.inv(np.asarray(L_)).conj().T
+                            self.assertTrue(np.allclose(np.asarray(Q)[:n], expected, atol=1e-12))
+                            self.assertFalse(np.any(np.asarray(Q)[n:]))
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_solve_rows_needs_no_copy_of_the_block(self):
+        """
+        Compiled memory of the chunked solve: the output is the donated block, the
+        temporaries are a few chunks and at most a copy of L (a single solve of the whole
+        block copies it: two blocks and L on GPU, the r = 32000 out-of-memory error).
+        """
+        from jVMC_exp.solver import rsvd
+        n, r = 64 * MESH.size, 8
+        layout = ParameterLayout(parameter_mesh(None), n)
+        Y = jax.ShapeDtypeStruct((layout.padded, r), jnp.float64, sharding=layout.sharding())
+        L = jax.ShapeDtypeStruct((r, r), jnp.float64, sharding=NamedSharding(MESH, P()))
+        block, chunk = layout.local * r * 8, 4
+        memory = rsvd._solve_rows_impl.lower(Y, L, layout=layout, chunk=chunk).compile().memory_analysis()
+        self.assertEqual(memory.alias_size_in_bytes, memory.output_size_in_bytes)
+        self.assertLessEqual(memory.temp_size_in_bytes, r * r * 8 + 4 * chunk * r * 8)
+        self.assertLess(memory.temp_size_in_bytes, block / 4)
+
+    def test_cholesky_overwrites_the_gram_matrix(self):
+        """The Gram matrix is donated to the factorization and the buffer is reused."""
+        from jVMC_exp.solver import rsvd
+        A = jax.random.normal(jax.random.PRNGKey(9), (12, 12))
+        G = A @ A.T + jnp.eye(12)
+        G_given = G + 0
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            L, finite = rsvd._cholesky(G_given, 0.0)
+        self.assertTrue(G_given.is_deleted())
+        self.assertFalse([w for w in caught if "donated" in str(w.message)])
+        self.assertTrue(bool(finite))
+        self.assertTrue(jnp.allclose(L @ L.T, G, atol=1e-12))
+
 
 class TestRandomizedEighParameterLayout(unittest.TestCase):
     def setUp(self):

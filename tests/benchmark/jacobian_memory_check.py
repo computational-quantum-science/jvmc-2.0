@@ -10,8 +10,11 @@ printed, per device:
   and donated) and as it was in 5019475 (loop buffer of its own; on GPU three
   Jacobians, the out-of-memory errors of limits_scan_16gpu_ritz_shard);
 * the force (_get_weighted_covar), the in-place normalization;
-* with --rank: one operator application on an (n, r) block and the r x r Cholesky
-  factorization of CholeskyQR.
+* with --rank: one operator application on an (n, r) block and the steps of
+  CholeskyQR: the r x r Gram matrix, its Cholesky factorization (donated) and the
+  triangular solve Q = Y L^{-H} in row chunks and as in df51c63 (the whole block at
+  once; two blocks and a copy of L on GPU, the out-of-memory error of the nc128,
+  r = 32000 run).
 
 "peak" is arguments + outputs - aliased + temporaries of one executable, the memory it
 needs while it runs (buffers alive outside it, e.g. the sample-sharded Jacobian during
@@ -20,6 +23,7 @@ the redistribution, are among its arguments here).
 Usage, on a node with 4 GPUs (JVMC_USE_DISTRIBUTED unset; one process sees all GPUs):
 
     python tests/benchmark/jacobian_memory_check.py --channels 112 128 160 192 --rank 16000
+    python tests/benchmark/jacobian_memory_check.py --channels 128 --rank 32000 --devices 16
     python tests/benchmark/jacobian_memory_check.py --params 492800 --devices 16   # 16-GPU shard sizes
 
 ``--devices P`` compiles for the Jacobian shard sizes of P GPUs on the GPUs at hand: the
@@ -89,6 +93,15 @@ def _redistribution_5019475(jac, *, layout, chunk):
     return jax.shard_map(local, mesh=layout.mesh, in_specs=(P(qo._MESH_AXES),), out_specs=qo.JACOBIAN_SPEC)(jac)
 
 
+@partial(jax.jit, static_argnames=("layout",), donate_argnums=0)
+def _solve_rows_df51c63(Y, L, *, layout):
+    """The triangular solve of CholeskyQR in df51c63: the whole local block at once."""
+    return jax.shard_map(
+        lambda y, l: jax.lax.linalg.triangular_solve(l, y, left_side=False, lower=True, transpose_a=True, conjugate_a=True),
+        mesh=layout.mesh, in_specs=(qo.ROWS_SPEC, REPLICATED_SPEC), out_specs=qo.ROWS_SPEC,
+    )(Y, L)
+
+
 def memory(fn, *fn_args, **fn_kwargs):
     m = fn.lower(*fn_args, **fn_kwargs).compile().memory_analysis()
     peak = m.argument_size_in_bytes + m.output_size_in_bytes - m.alias_size_in_bytes + m.temp_size_in_bytes
@@ -154,7 +167,13 @@ def main():
             row(f"operator application (r = {r})", memory(rsvd._apply_rows, col_jac, block, diag, shift, layout=layout,
                                                           apply_mode="real", has_diag=True), shard)
             gram = jax.ShapeDtypeStruct((r, r), jnp.float64, sharding=jax.sharding.NamedSharding(MESH, REPLICATED_SPEC))
-            row(f"CholeskyQR Cholesky (r = {r})", memory(rsvd._cholesky, gram, 1e-12), shard)
+            row(f"CholeskyQR Gram matrix (r = {r})", memory(rsvd._inner_rows, block, block, layout=layout), shard)
+            row(f"CholeskyQR Cholesky, donated", memory(rsvd._cholesky, gram, 1e-12), shard)
+            r_bytes = r * 8
+            solve_chunk = max(1, min(layout.local, (global_defs.MATMUL_CHUNK_BYTES or layout.local * r_bytes) // r_bytes))
+            row(f"CholeskyQR solve, row chunks", memory(rsvd._solve_rows_impl, block, gram, layout=layout,
+                                                        chunk=solve_chunk), shard)
+            row(f"CholeskyQR solve as in df51c63", memory(_solve_rows_df51c63, block, gram, layout=layout), shard)
 
 
 if __name__ == "__main__":
