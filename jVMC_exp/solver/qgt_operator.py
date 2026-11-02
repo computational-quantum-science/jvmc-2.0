@@ -502,18 +502,24 @@ def _column_sharded_jacobian(jac, *, layout: ParameterLayout):
     concatenates the row blocks it receives.
 
     The exchange is done for chunks of the local rows of at most
-    ``global_defs.MATMUL_CHUNK_BYTES``, each written into the output in place: the
-    output is allocated first (:func:`_column_sharded_zeros`) and donated to the
-    exchange, which returns it. A single ``all_to_all`` of the whole shard needs a
-    rearranged copy of its input next to the input and the output, and on GPU a loop
-    that starts from zeros of its own kept the loop buffer next to the output: three
-    Jacobians per device either way (the out-of-memory errors of the limits scans).
-    With the donated output the redistribution needs the input and the output plus a
-    few chunks.
+    ``global_defs.MATMUL_CHUNK_BYTES``, one dispatch per chunk
+    (:func:`_redistribution_step`), each writing its rows into the preallocated output
+    in place (donated). Earlier forms all kept a Jacobian-sized buffer next to the input
+    and the output on GPU: a single ``all_to_all`` of the whole shard its rearranged
+    input, and a loop over the chunks inside one kernel its loop buffer, also when it
+    started from the donated output (the out-of-memory errors of the 16-GPU runs at
+    nc 128 and above). Without a loop in the kernel the redistribution needs the input
+    and the output plus a few chunks. The last chunk is shifted back to end at the last
+    row (it repeats a few rows; the exchange writes the same values again).
     """
     out = _column_sharded_zeros(jac.shape[0], jac.dtype, layout=layout)
+    chunk = _redistribution_chunk(jac, layout)
+    n_rows = jac.shape[0] // layout.mesh.size
+    for k in range(-(-n_rows // chunk)):
+        start = jnp.asarray(min(k * chunk, n_rows - chunk), jnp.int32)
+        out = _redistribution_step(jac, out, start, layout=layout, chunk=chunk)
 
-    return _column_sharded_jacobian_impl(jac, out, layout=layout, chunk=_redistribution_chunk(jac, layout))
+    return out
 
 
 @partial(jax.jit, static_argnums=(0, 1), static_argnames=("layout",))
@@ -525,34 +531,31 @@ def _column_sharded_zeros(num_samples, dtype, *, layout: ParameterLayout):
 
 
 @partial(jax.jit, static_argnames=("layout", "chunk"), donate_argnums=1)
-def _column_sharded_jacobian_impl(jac, out, *, layout: ParameterLayout, chunk: int):
-    """The exchange of :func:`_column_sharded_jacobian`, written into ``out`` (donated)."""
+def _redistribution_step(jac, out, start, *, layout: ParameterLayout, chunk: int):
+    """
+    Rows ``start, ..., start + chunk - 1`` of every device's Jacobian shard exchanged
+    within the sample groups and written into ``out`` (donated, updated in place).
+    """
     groups = layout.groups
 
-    def local(j, out):
+    def local(j, out, start):
         n_rows = j.shape[0]
-
-        def exchange(k, out):
-            # The last chunk is shifted back to end at the last row (and repeats a few
-            # rows): a remainder chunk outside the loop would copy the output
-            start = jnp.minimum(k * chunk, n_rows - chunk)
-            rows = jax.lax.dynamic_slice_in_dim(j, start, chunk)
-            if layout.pad:
-                rows = jnp.pad(rows, ((0, 0), (0, layout.pad)))
-            received = jax.lax.all_to_all(rows, PARAMS_AXIS, 1, 0, tiled=True)
-            # Rows received from group member q go to rows q * n_rows + start, ...: one
-            # update per member, so that the output is never reshaped (a copy on GPU)
-            for q in range(groups):
-                out = jax.lax.dynamic_update_slice_in_dim(
-                    out, jax.lax.slice_in_dim(received, q * chunk, (q + 1) * chunk), q * n_rows + start, axis=0
-                )
-            return out
-
-        return jax.lax.fori_loop(0, -(-n_rows // chunk), exchange, out)
+        rows = jax.lax.dynamic_slice_in_dim(j, start, chunk)
+        if layout.pad:
+            rows = jnp.pad(rows, ((0, 0), (0, layout.pad)))
+        received = jax.lax.all_to_all(rows, PARAMS_AXIS, 1, 0, tiled=True)
+        # Rows received from group member q go to rows q * n_rows + start, ...: one
+        # update per member, on the local block (a global reshape of the output and
+        # an update outside the shard_map copied it)
+        for q in range(groups):
+            out = jax.lax.dynamic_update_slice_in_dim(
+                out, jax.lax.slice_in_dim(received, q * chunk, (q + 1) * chunk), q * n_rows + start, axis=0
+            )
+        return out
 
     return jax.shard_map(
-        local, mesh=layout.mesh, in_specs=(P(_MESH_AXES), JACOBIAN_SPEC), out_specs=JACOBIAN_SPEC
-    )(jac, out)
+        local, mesh=layout.mesh, in_specs=(P(_MESH_AXES), JACOBIAN_SPEC, REPLICATED_SPEC), out_specs=JACOBIAN_SPEC
+    )(jac, out, start)
 
 
 def _column_block_product(jac, q, part: Part):

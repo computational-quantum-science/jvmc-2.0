@@ -631,9 +631,10 @@ class TestShardedQGTOperator(unittest.TestCase):
 
     def test_redistribution_needs_no_copy_of_the_jacobian(self):
         """
-        Compiled memory of the redistribution in chunks: the output is the donated,
-        preallocated buffer (aliased, so no loop buffer next to it, which on GPU made it
-        three Jacobians), and the temporaries are a few chunks.
+        Compiled memory of one step of the redistribution: the output is the donated,
+        preallocated buffer (aliased), the temporaries are a few chunks, and the step has
+        no loop (a loop buffer of the output's size stayed next to it on GPU: three
+        Jacobians).
         """
         from jVMC_exp.solver import qgt_operator
         jac = _random_jacobian(jax.random.PRNGKey(2), 64 * MESH.size, 16 * MESH.size)
@@ -645,9 +646,11 @@ class TestShardedQGTOperator(unittest.TestCase):
                 (jac.shape[0], layout.padded), jac.dtype, sharding=layout.sharding(P(SAMPLES_AXIS, PARAMS_AXIS))
             )
             with self.subTest(mesh_shape=shape):
-                memory = qgt_operator._column_sharded_jacobian_impl.lower(
-                    jac, out, layout=layout, chunk=4
-                ).compile().memory_analysis()
+                lowered = qgt_operator._redistribution_step.lower(
+                    jac, out, jnp.int32(0), layout=layout, chunk=4
+                )
+                self.assertNotIn("while", lowered.as_text())
+                memory = lowered.compile().memory_analysis()
                 self.assertEqual(memory.alias_size_in_bytes, memory.output_size_in_bytes)
                 self.assertLessEqual(memory.temp_size_in_bytes, 4 * 4 * row_bytes)
                 self.assertLess(memory.temp_size_in_bytes, shard_bytes / 4)
@@ -858,9 +861,10 @@ class TestCholeskyQR(unittest.TestCase):
 
     def test_solve_rows_needs_no_copy_of_the_block(self):
         """
-        Compiled memory of the chunked solve: the output is the donated block, the
-        temporaries are a few chunks and at most a copy of L (a single solve of the whole
-        block copies it: two blocks and L on GPU, the r = 32000 out-of-memory error).
+        Compiled memory of one step of the chunked solve: the output is the donated
+        block, the temporaries are a chunk and at most a copy of L (a single solve of the
+        whole block copies it: two blocks and L on GPU, the r = 32000 out-of-memory error),
+        and the step has no loop (a loop buffer of the block's size on GPU).
         """
         from jVMC_exp.solver import rsvd
         n, r = 64 * MESH.size, 8
@@ -868,10 +872,50 @@ class TestCholeskyQR(unittest.TestCase):
         Y = jax.ShapeDtypeStruct((layout.padded, r), jnp.float64, sharding=layout.sharding())
         L = jax.ShapeDtypeStruct((r, r), jnp.float64, sharding=NamedSharding(MESH, P()))
         block, chunk = layout.local * r * 8, 4
-        memory = rsvd._solve_rows_impl.lower(Y, L, layout=layout, chunk=chunk).compile().memory_analysis()
+        lowered = rsvd._solve_rows_step.lower(Y, L, jnp.int32(0), layout=layout, chunk=chunk)
+        self.assertNotIn("while", lowered.as_text())
+        memory = lowered.compile().memory_analysis()
         self.assertEqual(memory.alias_size_in_bytes, memory.output_size_in_bytes)
         self.assertLessEqual(memory.temp_size_in_bytes, r * r * 8 + 4 * chunk * r * 8)
         self.assertLess(memory.temp_size_in_bytes, block / 4)
+
+    def test_gram_matrix_in_blocks(self):
+        """X^H Y in row blocks of the result and chunks of rows: real, complex, mixed, all mesh shapes."""
+        from jVMC_exp.solver import rsvd
+        n = 4 * MESH.size + 37
+        k1, k2, k3 = jax.random.split(jax.random.PRNGKey(10), 3)
+        X = jax.random.normal(k1, (n, 7)) + 1j * jax.random.normal(k2, (n, 7))
+        Y = jax.random.normal(k3, (n, 9))
+        old = jVMC_exp.global_defs.MATMUL_CHUNK_BYTES
+        try:
+            for budget in (0, 1, 3 * 9 * 16, old):
+                jVMC_exp.global_defs.update(matmul_chunk_bytes=budget)
+                for shape in _mesh_shapes():
+                    layout = ParameterLayout(parameter_mesh(shape), n)
+                    for X_, Y_ in ((X.real, Y), (X, Y), (X, X)):
+                        with self.subTest(budget=budget, mesh_shape=shape, dtypes=(str(X_.dtype), str(Y_.dtype))):
+                            G = rsvd._inner_rows(self._rows(X_, layout), self._rows(Y_, layout), layout=layout)
+                            self.assertTrue(G.sharding.is_fully_replicated)
+                            self.assertTrue(np.allclose(np.asarray(G), np.conj(np.asarray(X_)).T @ np.asarray(Y_), atol=1e-12))
+        finally:
+            jVMC_exp.global_defs.update(matmul_chunk_bytes=old)
+
+    def test_gram_matrix_step_memory(self):
+        """
+        One step of the Gram matrix: the result is the donated matrix, the temporaries are
+        bounded by the block of rows of the result and the chunks (XLA autotunes a single
+        product of the two blocks on copies of both and of the r x r result), no loop
+        over the result.
+        """
+        from jVMC_exp.solver import rsvd
+        n, r, block, rows = 64 * MESH.size, 16, 4, 8
+        layout = ParameterLayout(parameter_mesh(None), n)
+        Y = jax.ShapeDtypeStruct((layout.padded, r), jnp.float64, sharding=layout.sharding())
+        G = jax.ShapeDtypeStruct((r, r), jnp.float64, sharding=NamedSharding(MESH, P()))
+        memory = rsvd._inner_rows_step.lower(G, Y, Y, jnp.int32(0), layout=layout, block=block, rows=rows).compile().memory_analysis()
+        self.assertEqual(memory.alias_size_in_bytes, memory.output_size_in_bytes)
+        self.assertLessEqual(memory.temp_size_in_bytes, 8 * (rows * (block + r) + 4 * block * r))
+        self.assertLess(memory.temp_size_in_bytes, layout.local * r * 8)
 
     def test_cholesky_overwrites_the_gram_matrix(self):
         """The Gram matrix is donated to the factorization and the buffer is reused."""

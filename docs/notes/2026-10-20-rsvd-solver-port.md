@@ -625,3 +625,48 @@ matrix (7.6 GiB) less at the Cholesky factorization, i.e. a QR stage of roughly
 them), and the sample-sharded Jacobian stays alive during the solve (18.4 GiB, the next
 saving). The distributed eigensolve at r = 32000 needs cuSOLVERMp workspace outside the
 JAX pool: `XLA_PYTHON_CLIENT_MEM_FRACTION` of about 0.85 for that run.
+
+### 6.3 No loops over big buffers in a kernel; Gram matrix in blocks (2026-11-02)
+
+The rerun of `nc128_k32000_better_gs` with a59b7fa (memory fraction 0.85) failed again,
+in the first solve: the failing allocation was exactly one Jacobian shard plus two
+redistribution chunks (21,856,666,112 B), i.e. the loop buffer of the redistribution.
+So df51c63 did not remove it on GPU: a `fori_loop` over the chunks inside one kernel kept
+a buffer of the output's size even when the loop started from the donated output (on
+CPU it was aliased). At r = 16000 the same redistribution passed
+(`nc128_k16000_better_gs`); at r = 32000 the solver's next kernels were compiled while it
+was still queued, and XLA's GEMM autotuner allocated scratch copies of the operands and
+the result of the unchunked Gram product (two 7.36 GiB blocks and the 7.64 GiB r x r
+matrix: the "not a failure" allocation attempts in the log). The compile warning of a
+92.79 GiB executable (5 Jacobian shards + 1 chunk) appears in both runs.
+
+Now every big buffer is updated by a kernel without a loop, one dispatch per chunk:
+
+* **Redistribution**: `_redistribution_step(jac, out, start)` exchanges one chunk of
+  rows and writes it into the donated output inside the `shard_map` (a global reshape
+  of the output and an update outside the `shard_map` copied the output on CPU);
+  `_column_sharded_jacobian` dispatches it for every chunk (the last one shifted back,
+  repeating a few rows).
+* **Triangular solve**: `_solve_rows_step(Y, L, start)` solves one chunk of rows into
+  the donated `Y`; the rows that do not fill a chunk get a last, smaller step (chunks
+  must not overlap).
+* **Gram matrix**: `_inner_rows(X, Y)` is formed in blocks of rows of the result of at
+  most `MATMUL_CHUNK_BYTES`, one dispatch per block (`_inner_rows_step`) written into
+  the donated result; inside, the block is summed over chunks of the rows of `X` and
+  `Y` of the same size (a small loop carry). No product has an operand or an output
+  larger than the budget, so the autotuner's scratch is bounded too.
+
+The steps take `start` as a traced argument, so each is compiled once (twice with a
+remainder). Per solve this is about 20 redistribution steps and, per CholeskyQR pass,
+r / block Gram steps and n_local / chunk solve steps (8 each at nc 128, r = 32000, 16
+GPUs, 1 GiB budget).
+
+`tests/benchmark/jacobian_memory_check.py` compiles one step of each next to the old
+forms (redistribution as in 5019475 and df51c63, Gram matrix and solve as in a59b7fa,
+solve as in df51c63) and reports, besides XLA's memory analysis, the largest device
+memory in use while compiling (the autotuner's scratch; nothing else is allocated).
+
+Tests: `test_redistribution_needs_no_copy_of_the_jacobian` and
+`test_solve_rows_needs_no_copy_of_the_block` now also check that the step has no
+`while` loop; new `test_gram_matrix_in_blocks` (real, complex, mixed; budgets 0, one
+row, a remainder, the default; all mesh shapes) and `test_gram_matrix_step_memory`.

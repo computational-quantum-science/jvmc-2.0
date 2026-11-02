@@ -45,7 +45,7 @@ from jVMC_exp.solver.pinv import PinvSNR
 from jVMC_exp.solver.qgt_operator import (
     QGTOperator, ShardedQGTOperator, ParameterLayout, parameter_mesh,
     PARAMS_AXIS, SAMPLES_AXIS, JACOBIAN_SPEC, ROWS_SPEC,
-    _column_block_product, _qgt_product_im, transformed_product, _apply
+    _column_block_product, _qgt_product_im, transformed_product, _apply, _varying_zeros
 )
 from jVMC_exp.solver.util import diagonalize
 
@@ -462,15 +462,69 @@ def _probe_rows(key, *, layout: ParameterLayout, real_dtype, total_rank, complex
     return jax.shard_map(local, mesh=layout.mesh, in_specs=(REPLICATED_SPEC,), out_specs=ROWS_SPEC)(key)
 
 
-@partial(jax.jit, static_argnames=("layout",))
 def _inner_rows(X, Y, *, layout: ParameterLayout):
-    """``X^H Y`` for row-sharded ``X`` and ``Y``: local products, ``psum`` over the parameter groups; replicated."""
+    """
+    ``X^H Y`` for row-sharded ``X`` and ``Y``: local products, ``psum`` over the parameter
+    groups; replicated.
+
+    Formed in blocks of rows of the result of at most ``global_defs.MATMUL_CHUNK_BYTES``,
+    one dispatch per block (:func:`_inner_rows_step`) written into the preallocated
+    result in place, each summed over chunks of the rows of ``X`` and ``Y`` of the same
+    size: no product has an operand or an output larger than that. XLA autotunes a
+    product on its own copies of the operands and the output; for the single product of
+    two ``(n / P, r)`` blocks that was two blocks and an ``r x r`` matrix (22 GiB at
+    r = 32000, compiled while the Jacobian was being redistributed: the out-of-memory
+    error of the nc 128, r = 32000 run).
+    """
+    rx, ry = X.shape[1], Y.shape[1]
+    dtype = jnp.result_type(X.dtype, Y.dtype)
+    itemsize = jnp.dtype(dtype).itemsize
+    budget = global_defs.MATMUL_CHUNK_BYTES or max(rx, layout.local) * (rx + ry) * itemsize
+    block = max(1, min(rx, budget // (ry * itemsize)))
+    rows = max(1, min(layout.local, budget // ((block + ry) * itemsize)))
+
+    G = _replicated_zeros((rx, ry), dtype, layout=layout)
+    for start in range(0, rx, block):
+        G = _inner_rows_step(
+            G, X, Y, jnp.asarray(start, jnp.int32), layout=layout, block=min(block, rx - start), rows=rows
+        )
+
+    return G
+
+
+@partial(jax.jit, static_argnums=(0, 1), static_argnames=("layout",))
+def _replicated_zeros(shape, dtype, *, layout: ParameterLayout):
+    return jax.lax.with_sharding_constraint(jnp.zeros(shape, dtype), layout.sharding(REPLICATED_SPEC))
+
+
+@partial(jax.jit, static_argnames=("layout", "block", "rows"), donate_argnums=0)
+def _inner_rows_step(G, X, Y, start, *, layout: ParameterLayout, block: int, rows: int):
+    """Rows ``start, ..., start + block - 1`` of ``X^H Y`` written into ``G`` (donated, in place)."""
+    def local(g, x, y, start):
+        n_rows = x.shape[0]
+
+        def add_chunk(k, acc, size=rows):
+            xc = jax.lax.dynamic_slice(x, (jnp.asarray(k * rows, start.dtype), start), (size, block))
+            yc = jax.lax.dynamic_slice_in_dim(y, k * rows, size)
+            # Materialized: XLA would otherwise fuse the slices into the product and
+            # autotune it on the whole operands
+            xc, yc = jax.lax.optimization_barrier((xc, yc))
+            return acc + jnp.conj(xc).T @ yc
+
+        acc = _varying_zeros((block, y.shape[1]), g.dtype, like=x, axes=(PARAMS_AXIS,))
+        n_full = n_rows // rows
+        acc = jax.lax.fori_loop(0, n_full, add_chunk, acc)
+        if n_rows % rows:
+            acc = add_chunk(n_full, acc, n_rows % rows)
+
+        return jax.lax.dynamic_update_slice_in_dim(g, jax.lax.psum(acc, PARAMS_AXIS), start, axis=0)
+
     return jax.shard_map(
-        lambda x, y: jax.lax.psum(jnp.conj(x).T @ y, PARAMS_AXIS),
+        local,
         mesh=layout.mesh,
-        in_specs=(ROWS_SPEC, ROWS_SPEC),
+        in_specs=(REPLICATED_SPEC, ROWS_SPEC, ROWS_SPEC, REPLICATED_SPEC),
         out_specs=REPLICATED_SPEC,
-    )(X, Y)
+    )(G, X, Y, start)
 
 
 @partial(jax.jit, donate_argnums=0)
@@ -493,46 +547,39 @@ def _solve_rows(Y, L, *, layout: ParameterLayout):
     ``Y L^{-H}``, i.e. ``Q`` of ``Y = Q R`` with ``R = L^H``; ``Y`` is donated.
 
     The rows of a solve from the right are independent: they are solved in chunks of at
-    most ``global_defs.MATMUL_CHUNK_BYTES`` written back into ``Y``. A single solve of
-    the whole local block had XLA allocate two copies of it next to it on GPU (with a
-    copy of ``L``: 22.3 GiB at 492800 parameters and r = 32000 on 16 GPUs, the
-    out-of-memory error of that run).
+    most ``global_defs.MATMUL_CHUNK_BYTES``, one dispatch per chunk
+    (:func:`_solve_rows_step`) written back into ``Y`` in place. A single solve of the
+    whole local block had XLA allocate two copies of it next to it on GPU (with a copy
+    of ``L``: 22.3 GiB at 492800 parameters and r = 32000 on 16 GPUs), and a loop over
+    the chunks inside one kernel keeps a loop buffer of the block's size on GPU. The
+    chunks must not overlap (a row solved twice is wrong): the rows that do not fill a
+    chunk are solved in a last, smaller one.
     """
     n_rows, r = layout.local, Y.shape[1]
     budget = global_defs.MATMUL_CHUNK_BYTES or n_rows * r * Y.dtype.itemsize
     chunk = max(1, min(n_rows, budget // (r * Y.dtype.itemsize)))
+    for start in range(0, n_rows, chunk):
+        Y = _solve_rows_step(Y, L, jnp.asarray(start, jnp.int32), layout=layout, chunk=min(chunk, n_rows - start))
 
-    return _solve_rows_impl(Y, L, layout=layout, chunk=chunk)
+    return Y
 
 
 @partial(jax.jit, static_argnames=("layout", "chunk"), donate_argnums=0)
-def _solve_rows_impl(Y, L, *, layout: ParameterLayout, chunk: int):
-    def local(y, l):
-        n_rows = y.shape[0]
-
-        # Chunks must not overlap (a row solved twice is wrong), and keeping the solved
-        # rows of an overlapping chunk with a mask made XLA copy the whole block: the
-        # rows that do not fill a chunk are solved after the loop
-        def solve(k, y, size=chunk):
-            rows = jax.lax.dynamic_slice_in_dim(y, k * chunk, size)
-            solved = jax.lax.linalg.triangular_solve(
-                l, rows, left_side=False, lower=True, transpose_a=True, conjugate_a=True
-            )
-            return jax.lax.dynamic_update_slice_in_dim(y, solved, k * chunk, axis=0)
-
-        n_full = n_rows // chunk
-        y = jax.lax.fori_loop(0, n_full, solve, y)
-        if n_rows % chunk:
-            y = solve(n_full, y, n_rows % chunk)
-
-        return y
+def _solve_rows_step(Y, L, start, *, layout: ParameterLayout, chunk: int):
+    """Local rows ``start, ..., start + chunk - 1`` of ``Y L^{-H}``, written into ``Y`` (donated, in place)."""
+    def local(y, l, start):
+        rows = jax.lax.dynamic_slice_in_dim(y, start, chunk)
+        solved = jax.lax.linalg.triangular_solve(
+            l, rows, left_side=False, lower=True, transpose_a=True, conjugate_a=True
+        )
+        return jax.lax.dynamic_update_slice_in_dim(y, solved, start, axis=0)
 
     return jax.shard_map(
         local,
         mesh=layout.mesh,
-        in_specs=(ROWS_SPEC, REPLICATED_SPEC),
+        in_specs=(ROWS_SPEC, REPLICATED_SPEC, REPLICATED_SPEC),
         out_specs=ROWS_SPEC,
-    )(Y, L)
+    )(Y, L, start)
 
 
 @jax.jit

@@ -6,15 +6,24 @@ Nothing of Jacobian size is allocated: every kernel is lowered and compiled for
 abstract inputs (jax.ShapeDtypeStruct) and XLA's memory analysis of the executable is
 printed, per device:
 
-* the redistribution of the Jacobian to the 2D mesh as it is now (output preallocated
-  and donated) and as it was in 5019475 (loop buffer of its own; on GPU three
-  Jacobians, the out-of-memory errors of limits_scan_16gpu_ritz_shard);
+* the redistribution of the Jacobian to the 2D mesh: one step as it is now (one
+  dispatch per chunk, written into the donated output), the whole exchange as in
+  df51c63 / a59b7fa (a loop over the chunks in one kernel, into the donated output) and
+  as in 5019475 (a loop starting from zeros of its own); the last two kept a
+  Jacobian-sized loop buffer next to the output on GPU;
 * the force (_get_weighted_covar), the in-place normalization;
 * with --rank: one operator application on an (n, r) block and the steps of
-  CholeskyQR: the r x r Gram matrix, its Cholesky factorization (donated) and the
-  triangular solve Q = Y L^{-H} in row chunks and as in df51c63 (the whole block at
-  once; two blocks and a copy of L on GPU, the out-of-memory error of the nc128,
-  r = 32000 run).
+  CholeskyQR: the r x r Gram matrix (one step now: a block of rows of the result,
+  summed over chunks; and as in a59b7fa: one product, which XLA autotunes on copies of
+  two blocks and the r x r result, 22 GiB at r = 32000 while the Jacobian was being
+  redistributed), its Cholesky factorization (donated) and the triangular solve
+  Q = Y L^{-H} (one step now: a chunk of rows; as in a59b7fa: a loop over the chunks
+  in one kernel; as in df51c63: the whole block at once, two blocks and a copy of L on
+  GPU, the out-of-memory error of the nc128, r = 32000 run).
+
+For the old forms the whole exchange / product / solve is one executable; for the
+current ones a single step is (the result buffer is donated and updated in place,
+the steps run one after the other).
 
 "peak" is arguments + outputs - aliased + temporaries of one executable, the memory it
 needs while it runs (buffers alive outside it, e.g. the sample-sharded Jacobian during
@@ -93,6 +102,57 @@ def _redistribution_5019475(jac, *, layout, chunk):
     return jax.shard_map(local, mesh=layout.mesh, in_specs=(P(qo._MESH_AXES),), out_specs=qo.JACOBIAN_SPEC)(jac)
 
 
+@partial(jax.jit, static_argnames=("layout", "chunk"), donate_argnums=1)
+def _redistribution_df51c63(jac, out, *, layout, chunk):
+    """The redistribution of df51c63 / a59b7fa: a loop over the chunks in one kernel, into the donated output."""
+    groups = layout.groups
+
+    def local(j, out):
+        n_rows = j.shape[0]
+
+        def exchange(k, out):
+            start = jnp.minimum(k * chunk, n_rows - chunk)
+            rows = jax.lax.dynamic_slice_in_dim(j, start, chunk)
+            if layout.pad:
+                rows = jnp.pad(rows, ((0, 0), (0, layout.pad)))
+            received = jax.lax.all_to_all(rows, qo.PARAMS_AXIS, 1, 0, tiled=True)
+            for q in range(groups):
+                out = jax.lax.dynamic_update_slice_in_dim(
+                    out, jax.lax.slice_in_dim(received, q * chunk, (q + 1) * chunk), q * n_rows + start, axis=0
+                )
+            return out
+
+        return jax.lax.fori_loop(0, -(-n_rows // chunk), exchange, out)
+
+    return jax.shard_map(local, mesh=layout.mesh, in_specs=(P(qo._MESH_AXES), qo.JACOBIAN_SPEC),
+                         out_specs=qo.JACOBIAN_SPEC)(jac, out)
+
+
+@partial(jax.jit, static_argnames=("layout",))
+def _gram_a59b7fa(X, Y, *, layout):
+    """The Gram matrix of a59b7fa: one product of the two local blocks."""
+    return jax.shard_map(lambda x, y: jax.lax.psum(jnp.conj(x).T @ y, qo.PARAMS_AXIS), mesh=layout.mesh,
+                         in_specs=(qo.ROWS_SPEC, qo.ROWS_SPEC), out_specs=REPLICATED_SPEC)(X, Y)
+
+
+@partial(jax.jit, static_argnames=("layout", "chunk"), donate_argnums=0)
+def _solve_rows_a59b7fa(Y, L, *, layout, chunk):
+    """The triangular solve of a59b7fa: a loop over row chunks in one kernel, into the donated block."""
+    def local(y, l):
+        n_rows = y.shape[0]
+
+        def solve(k, y, size=chunk):
+            rows = jax.lax.dynamic_slice_in_dim(y, k * chunk, size)
+            solved = jax.lax.linalg.triangular_solve(l, rows, left_side=False, lower=True, transpose_a=True, conjugate_a=True)
+            return jax.lax.dynamic_update_slice_in_dim(y, solved, k * chunk, axis=0)
+
+        n_full = n_rows // chunk
+        y = jax.lax.fori_loop(0, n_full, solve, y)
+        return solve(n_full, y, n_rows % chunk) if n_rows % chunk else y
+
+    return jax.shard_map(local, mesh=layout.mesh, in_specs=(qo.ROWS_SPEC, REPLICATED_SPEC), out_specs=qo.ROWS_SPEC)(Y, L)
+
+
 @partial(jax.jit, static_argnames=("layout",), donate_argnums=0)
 def _solve_rows_df51c63(Y, L, *, layout):
     """The triangular solve of CholeskyQR in df51c63: the whole local block at once."""
@@ -102,17 +162,24 @@ def _solve_rows_df51c63(Y, L, *, layout):
     )(Y, L)
 
 
+def _peak_in_use():
+    """Largest device memory in use so far (GPU; NaN where the backend does not report it)."""
+    return (jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", float("nan"))
+
+
 def memory(fn, *fn_args, **fn_kwargs):
     m = fn.lower(*fn_args, **fn_kwargs).compile().memory_analysis()
     peak = m.argument_size_in_bytes + m.output_size_in_bytes - m.alias_size_in_bytes + m.temp_size_in_bytes
+    # Nothing is allocated by this script: a growing peak is the compiler's own scratch
+    # (the GEMM autotuner runs candidate kernels on copies of the operands)
     return dict(arg=m.argument_size_in_bytes, out=m.output_size_in_bytes, alias=m.alias_size_in_bytes,
-                temp=m.temp_size_in_bytes, peak=peak)
+                temp=m.temp_size_in_bytes, peak=peak, compile=_peak_in_use())
 
 
 def row(name, m, shard):
     gib = lambda b: f"{b / GIB:8.2f}"
     print(f"  {name:<34}{gib(m['arg'])}{gib(m['out'])}{gib(m['alias'])}{gib(m['temp'])}{gib(m['peak'])}"
-          f"{m['peak'] / shard:9.2f}")
+          f"{m['peak'] / shard:9.2f}{gib(m['compile'])}")
 
 
 def main():
@@ -134,7 +201,8 @@ def main():
           f"(XLA_PYTHON_CLIENT_MEM_FRACTION={os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION', 'unset: 0.75')})")
     print(f"shard sizes of {target} GPUs: {args.num_samples} samples -> {n_samples} rows here, "
           f"MATMUL_CHUNK_BYTES = {global_defs.MATMUL_CHUNK_BYTES / GIB:.2f} GiB, complex128 Jacobian")
-    print(f"  {'executable (GiB per device)':<34}{'args':>8}{'out':>8}{'alias':>8}{'temp':>8}{'peak':>8}{'peak/J':>9}")
+    print(f"  {'executable (GiB per device)':<34}{'args':>8}{'out':>8}{'alias':>8}{'temp':>8}{'peak':>8}{'peak/J':>9}{'compile':>8}")
+    print("  (compile: largest device memory in use so far while compiling, i.e. autotuner scratch; GPU only)")
 
     layout_mesh = qo.parameter_mesh((1, here))
     for n in params:
@@ -145,8 +213,10 @@ def main():
 
         chunk = qo._redistribution_chunk(jac, layout)
         out = jax.ShapeDtypeStruct((n_samples, layout.padded), dtype, sharding=layout.sharding(qo.JACOBIAN_SPEC))
-        row("redistribution (donated output)", memory(qo._column_sharded_jacobian_impl, jac, out,
-                                                       layout=layout, chunk=chunk), shard)
+        start = jnp.int32(0)
+        row("redistribution, one step (now)", memory(qo._redistribution_step, jac, out, start,
+                                                      layout=layout, chunk=chunk), shard)
+        row("redistribution as in df51c63", memory(_redistribution_df51c63, jac, out, layout=layout, chunk=chunk), shard)
         row("redistribution as in 5019475", memory(_redistribution_5019475, jac, layout=layout, chunk=chunk), shard)
 
         weights = jax.ShapeDtypeStruct((n_samples,), jnp.float64, sharding=DEVICE_SHARDING)
@@ -167,14 +237,18 @@ def main():
             row(f"operator application (r = {r})", memory(rsvd._apply_rows, col_jac, block, diag, shift, layout=layout,
                                                           apply_mode="real", has_diag=True), shard)
             gram = jax.ShapeDtypeStruct((r, r), jnp.float64, sharding=jax.sharding.NamedSharding(MESH, REPLICATED_SPEC))
-            row(f"CholeskyQR Gram matrix (r = {r})", memory(rsvd._inner_rows, block, block, layout=layout), shard)
-            row(f"CholeskyQR Cholesky, donated", memory(rsvd._cholesky, gram, 1e-12), shard)
-            r_bytes = r * 8
-            solve_chunk = max(1, min(layout.local, (global_defs.MATMUL_CHUNK_BYTES or layout.local * r_bytes) // r_bytes))
-            row(f"CholeskyQR solve, row chunks", memory(rsvd._solve_rows_impl, block, gram, layout=layout,
-                                                        chunk=solve_chunk), shard)
-            row(f"CholeskyQR solve as in df51c63", memory(_solve_rows_df51c63, block, gram, layout=layout), shard)
-
+            budget = global_defs.MATMUL_CHUNK_BYTES or layout.local * 2 * r * 8
+            gram_block = max(1, min(r, budget // (r * 8)))
+            gram_rows = max(1, min(layout.local, budget // ((gram_block + r) * 8)))
+            row(f"Gram matrix, one step (r = {r})", memory(rsvd._inner_rows_step, gram, block, block, start, layout=layout,
+                                                           block=gram_block, rows=gram_rows), shard)
+            row("Gram matrix as in a59b7fa", memory(_gram_a59b7fa, block, block, layout=layout), shard)
+            row("Cholesky, donated", memory(rsvd._cholesky, gram, 1e-12), shard)
+            solve_chunk = max(1, min(layout.local, budget // (r * 8)))
+            row("solve, one step (now)", memory(rsvd._solve_rows_step, block, gram, start, layout=layout,
+                                                chunk=solve_chunk), shard)
+            row("solve as in a59b7fa (loop)", memory(_solve_rows_a59b7fa, block, gram, layout=layout, chunk=solve_chunk), shard)
+            row("solve as in df51c63 (whole block)", memory(_solve_rows_df51c63, block, gram, layout=layout), shard)
 
 if __name__ == "__main__":
     main()
